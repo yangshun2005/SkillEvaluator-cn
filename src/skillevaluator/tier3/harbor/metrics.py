@@ -1,0 +1,804 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Canonical metric definitions for Harbor-backed SkillEvaluator evals."""
+
+from __future__ import annotations
+
+import math
+import re
+from collections.abc import Callable, Collection, Iterable, Mapping
+from typing import Any
+
+from skillevaluator.constants import DEFAULT_SCORE_POLICY, DIMENSION_MAPPING
+from skillevaluator.utils.redaction import contains_credential_value, is_sensitive_key
+
+DEFAULT_METRIC_SET = "skill-evaluator-default-v2"
+LEGACY_METRIC_SET = "skill-evaluator-default-v1"
+CUSTOM_ONLY_METRIC_SET = "custom-only"
+
+LEGACY_SCORE_POLICY = "skill-evaluator-metric-mean-v1"
+CUSTOM_SCORE_POLICY = "custom-overall-v1"
+PARTIAL_SCORE_POLICY = "legacy-partial-dimension-mean-v1"
+SUPPORTED_SCORE_POLICIES = frozenset(
+    {DEFAULT_SCORE_POLICY, LEGACY_SCORE_POLICY, CUSTOM_SCORE_POLICY, PARTIAL_SCORE_POLICY}
+)
+
+DEFAULT_METRICS = (
+    "security",
+    "skill_execution",
+    "skill_efficiency",
+    "accuracy",
+    "goal_accuracy",
+    "behavior_check",
+)
+
+LEGACY_METRICS = (
+    "skill_execution",
+    "skill_efficiency",
+    "accuracy",
+    "goal_accuracy",
+    "behavior_check",
+)
+
+METRIC_DISPLAY = {
+    "security": "Security",
+    "skill_execution": "Skill Execution",
+    "skill_efficiency": "Efficiency",
+    "accuracy": "Accuracy",
+    "goal_accuracy": "Goal Accuracy",
+    "behavior_check": "Behavior Check",
+}
+
+METRIC_DESCRIPTIONS = {
+    "security": "Trace scan for unsafe operations, secret leakage, and unauthorized access",
+    "skill_execution": "Activation, script run, workflow order, error recovery",
+    "skill_efficiency": "Routing correctness, workspace-aware skill reads, tool call productivity",
+    "accuracy": "Factual correctness (5-criterion LLM rubric)",
+    "goal_accuracy": "Did the agent achieve the user's goal?",
+    "behavior_check": "Adherence to expected workflow steps",
+}
+
+METRIC_QUESTIONS = {
+    "security": "Is the run safe?",
+    "skill_execution": "Was the target skill discovered and executed?",
+    "skill_efficiency": "Did it use the skill efficiently?",
+    "accuracy": "Was the final answer correct?",
+    "goal_accuracy": "Did it satisfy the user's goal?",
+    "behavior_check": "Did it follow the expected workflow?",
+}
+
+# Collection, deterministic judging, and publication share one canonical
+# mapping. Legacy fallbacks remain in ``DIMENSION_MAPPING`` for old artifacts,
+# but only the primary evaluators participate in newly collected scores.
+DIMENSION_DEFINITIONS = {
+    dimension: dict(zip(config["evaluators"], config["weights"], strict=True))
+    for dimension, config in DIMENSION_MAPPING.items()
+}
+
+DIMENSION_DISPLAY = {
+    "security": "Security",
+    "correctness": "Correctness",
+    "discoverability": "Discoverability",
+    "effectiveness": "Effectiveness",
+    "efficiency": "Efficiency",
+}
+
+DIMENSION_QUESTIONS = {
+    "security": "Is the run safe?",
+    "correctness": "Is the answer correct?",
+    "discoverability": "Was the right skill loaded when needed?",
+    "effectiveness": "Did the skill help complete the task?",
+    "efficiency": "Did it avoid wasted tool or skill usage?",
+}
+
+# A judged metric is "not applicable" when its dataset case has nothing to
+# judge against (no expected_output / assertions, which the legacy format calls
+# ground_truth / expected_behavior). The skill metrics are not applicable in an
+# arm that has no skill under test to discover or route to (the no-skill or
+# no-plugin baseline), and for an eval case that names no expected_skill;
+# skill_efficiency also for a negative case. The verifier records the metric as
+# ``null`` with ``details[metric].status == "not_applicable"``; N/A metrics are
+# excluded from the trial overall, the arm averages, and lift. Security never
+# becomes N/A, and an absent or non-finite metric without the explicit marker
+# stays an incomplete (unscored) reward.
+NOT_APPLICABLE_STATUS = "not_applicable"
+NOT_APPLICABLE_ELIGIBLE_METRICS = ("skill_execution", "skill_efficiency", "accuracy", "goal_accuracy", "behavior_check")
+NOT_APPLICABLE_REASONS = {
+    "skill_execution": "This arm has no skill under test installed, so there is no skill to discover or run",
+    "skill_efficiency": "This arm has no skill under test installed, so there is no skill to route to",
+    "accuracy": "No expected_output (legacy ground_truth) defined, so there is no reference answer to judge against",
+    "goal_accuracy": (
+        "No expected_output (legacy ground_truth) defined, so there is no expected outcome to judge against"
+    ),
+    "behavior_check": "No assertions (legacy expected_behavior) defined, so there is no workflow to check",
+}
+# A reason carried over from a verifier sidecar is cut to this length.
+NOT_APPLICABLE_REASON_MAX_CHARS = 512
+# With the skill under test installed, a skill metric is N/A only because of the eval case.
+WITH_SKILL_NOT_APPLICABLE_REASONS = {
+    "skill_execution": "No expected_skill defined, so the eval case names no skill to discover or run",
+    "skill_efficiency": "Negative case or no expected_skill defined, so there is no skill use to measure",
+}
+
+
+# Reporting may have only an arm-level N/A marker, without the verifier's reason.
+# A baseline that stages a matching candidate still follows the eval-case rules.
+BASELINE_NOT_APPLICABLE_REASONS = {
+    "skill_execution": ("No applicable skill is available in this arm, or the eval case names no expected_skill"),
+    "skill_efficiency": (
+        "No applicable skill is available in this arm, or the case is negative or names no expected_skill"
+    ),
+}
+
+
+def not_applicable_reason(
+    metric: str, *, with_skill: bool = False, default: str = "Not applicable to this eval case"
+) -> str:
+    """Return why *metric* can be N/A in an arm with or without the skill under test."""
+    if with_skill and metric in WITH_SKILL_NOT_APPLICABLE_REASONS:
+        return WITH_SKILL_NOT_APPLICABLE_REASONS[metric]
+    if not with_skill and metric in BASELINE_NOT_APPLICABLE_REASONS:
+        return BASELINE_NOT_APPLICABLE_REASONS[metric]
+    return NOT_APPLICABLE_REASONS.get(metric, default)
+
+
+_RESERVED_METADATA_KEYS = {
+    "custom_details",
+    "custom_metrics",
+    "details",
+    "entry_id",
+    "error",
+    "evaluation_errors",
+    "evaluation_status",
+    "has_skill",
+    "judge_contract",
+    "metric_set",
+    "metric_set_version",
+    "metrics",
+    "overall",
+    "score_policy",
+    "trajectory_detail",
+    "trajectory_source",
+}
+
+RESERVED_METRIC_NAMES = frozenset(DEFAULT_METRICS) | _RESERVED_METADATA_KEYS
+
+# Keep collection, aggregation, generated JSON, and the canonical report on one
+# explicit custom-metric envelope. The report visits at most 128 names per
+# reward; enforcing the same limit before aggregation prevents summaries and
+# paired lift artifacts from expanding past their browser-safe bounds.
+MAX_CUSTOM_METRICS = 128
+MAX_CUSTOM_METRIC_NAME_BYTES = 256
+
+_SAFE_SENSITIVE_METRIC_PREFIXES = {"auth", "secret", "token"}
+_SAFE_SENSITIVE_METRIC_SUFFIXES = {
+    "accuracy",
+    "compliance",
+    "count",
+    "coverage",
+    "efficiency",
+    "handling",
+    "leakage",
+    "precision",
+    "quality",
+    "rate",
+    "ratio",
+    "recall",
+    "safety",
+    "score",
+    "usage",
+}
+
+
+class CustomMetricContractError(ValueError):
+    """Raised when custom metrics exceed the bounded publication contract."""
+
+
+def _custom_metric_name_shape_is_valid(name: str) -> bool:
+    try:
+        encoded = name.encode("utf-8")
+    except UnicodeError:
+        return False
+    return bool(name) and name == name.strip() and name.isprintable() and len(encoded) <= MAX_CUSTOM_METRIC_NAME_BYTES
+
+
+def _is_explicit_safe_sensitive_metric_name(name: str) -> bool:
+    camel_split = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", camel_split).strip("_").lower()
+    parts = tuple(part for part in normalized.split("_") if part)
+    return (
+        len(parts) == 2 and parts[0] in _SAFE_SENSITIVE_METRIC_PREFIXES and parts[1] in _SAFE_SENSITIVE_METRIC_SUFFIXES
+    )
+
+
+def _custom_metric_name_contains_sensitive_data(name: str) -> bool:
+    return bool(
+        contains_credential_value(name)
+        or (is_sensitive_key(name) and not _is_explicit_safe_sensitive_metric_name(name))
+    )
+
+
+def custom_metric_name_is_publishable(name: object) -> bool:
+    """Return whether a custom metric name is bounded and safe to publish."""
+    text = str(name)
+    if not _custom_metric_name_shape_is_valid(text):
+        return False
+    # Credential values can themselves appear as keys. Never turn those into a
+    # visible ``<redacted>`` alias because aliases can collide. Narrow,
+    # explicitly metric-shaped names such as ``secret_handling`` remain valid.
+    return not _custom_metric_name_contains_sensitive_data(text)
+
+
+def _iter_custom_metric_candidates(reward: dict[str, Any]):
+    explicit = reward.get("custom_metrics")
+    if isinstance(explicit, dict):
+        yield from explicit.items()
+
+    metrics = reward.get("metrics")
+    if isinstance(metrics, dict):
+        yield from metrics.items()
+
+    for name, value in reward.items():
+        if str(name) in RESERVED_METRIC_NAMES or str(name).startswith("_"):
+            continue
+        yield name, value
+
+
+def custom_metric_contract_error(reward: dict[str, Any]) -> str | None:
+    """Return a fixed diagnostic when one reward exceeds the custom-metric contract."""
+    explicit = reward.get("custom_metrics")
+    if "custom_metrics" in reward and not isinstance(explicit, dict):
+        return "Custom metrics container must be a JSON object"
+    if isinstance(explicit, dict) and any(str(name) in RESERVED_METRIC_NAMES for name in explicit):
+        return "Custom metric collides with reserved SkillEvaluator metric names"
+
+    names: set[str] = set()
+    for raw_name, raw_value in _iter_custom_metric_candidates(reward):
+        name = str(raw_name)
+        if name in RESERVED_METRIC_NAMES:
+            continue
+        value = raw_value.get("score") if isinstance(raw_value, dict) else raw_value
+        if score_value(value) is None:
+            continue
+        # Secret-shaped names are deliberately omitted rather than reported or
+        # aliased. Their content must not reach diagnostics either.
+        if _custom_metric_name_contains_sensitive_data(name):
+            continue
+        if not _custom_metric_name_shape_is_valid(name):
+            return "Custom metric name exceeds the bounded publication contract"
+        names.add(name)
+        if len(names) > MAX_CUSTOM_METRICS:
+            return "Custom metric count exceeds the per reward publication limit"
+    return None
+
+
+def finite_number(value: object, *, non_negative: bool = False) -> float | None:
+    """Return *value* as a finite float, or ``None`` when it is not a usable number.
+
+    Booleans, non-numbers, NaN, infinities and integers too large for a float
+    (``json.loads`` turns any long digit string into one) are rejected, as are
+    negative values when *non_negative* is set.
+    """
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(numeric) or (non_negative and numeric < 0):
+        return None
+    return numeric
+
+
+def score_value(value: object) -> float | None:
+    """Return a finite score inside SkillEvaluator's documented 0..1 range."""
+    numeric = finite_number(value)
+    return numeric if numeric is not None and 0.0 <= numeric <= 1.0 else None
+
+
+def _has_metric_field(reward: dict[str, Any], metric: str) -> bool:
+    """Return whether a reward claims a metric, independently of score validity."""
+    if metric in reward:
+        return True
+    metrics = reward.get("metrics")
+    return isinstance(metrics, dict) and metric in metrics
+
+
+def metric_value(reward: dict[str, Any], metric: str) -> float | None:
+    """Return a numeric metric value from a reward payload, if present."""
+    val = score_value(reward.get(metric))
+    if val is not None:
+        return val
+
+    metrics = reward.get("metrics")
+    if isinstance(metrics, dict):
+        raw = metrics.get(metric)
+        if isinstance(raw, dict):
+            raw = raw.get("score")
+        numeric = score_value(raw)
+        if numeric is not None:
+            return numeric
+
+    return None
+
+
+def metric_is_not_applicable(reward: dict[str, Any], metric: str) -> bool:
+    """Return whether *reward* explicitly records *metric* as not applicable.
+
+    Only the metrics in ``NOT_APPLICABLE_ELIGIBLE_METRICS`` can be N/A, only
+    when no numeric value is present, and only with the verifier's
+    ``details[metric].status`` marker. Absence alone never means N/A.
+    """
+    if metric not in NOT_APPLICABLE_ELIGIBLE_METRICS:
+        return False
+    if reward.get(metric) is not None or metric_value(reward, metric) is not None:
+        return False
+    details = reward.get("details")
+    detail = details.get(metric) if isinstance(details, dict) else None
+    return (
+        isinstance(detail, dict)
+        and detail.get("status") == NOT_APPLICABLE_STATUS
+        and finite_number(detail.get("score")) is None
+    )
+
+
+def not_applicable_metrics(
+    rewards: list[dict[str, Any]],
+    metrics: tuple[str, ...] | list[str] | None = None,
+) -> list[str]:
+    """Return metrics that every reward records as N/A, so no reward scores them."""
+    if not rewards:
+        return []
+    if metrics is None:
+        _, metrics = metric_set_for_rewards(rewards)
+    return [
+        metric
+        for metric in metrics
+        if metric in NOT_APPLICABLE_ELIGIBLE_METRICS
+        and all(metric_is_not_applicable(reward, metric) for reward in rewards)
+    ]
+
+
+def not_applicable_list(raw: object) -> list[str]:
+    """Return the N/A-eligible metrics a stored ``not_applicable_metrics`` list names, in canonical order.
+
+    A value that is not a list or tuple, and any name that cannot be N/A, is ignored.
+    """
+    if not isinstance(raw, list | tuple):
+        return []
+    return [metric for metric in NOT_APPLICABLE_ELIGIBLE_METRICS if metric in raw]
+
+
+def not_applicable_counts(
+    rewards: list[dict[str, Any]],
+    metrics: tuple[str, ...] | list[str] | None = None,
+) -> dict[str, int]:
+    """Return how many rewards record each metric as N/A (metrics with none are omitted)."""
+    if not rewards:
+        return {}
+    if metrics is None:
+        _, metrics = metric_set_for_rewards(rewards)
+    counts: dict[str, int] = {}
+    for metric in metrics:
+        count = sum(1 for reward in rewards if metric_is_not_applicable(reward, metric))
+        if count:
+            counts[metric] = count
+    return counts
+
+
+def _bounded_reason(value: object) -> str | None:
+    """Return a non-empty reason string cut to ``NOT_APPLICABLE_REASON_MAX_CHARS``, or ``None``."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()[:NOT_APPLICABLE_REASON_MAX_CHARS]
+
+
+def recorded_not_applicable_reason(reward: dict[str, Any], metric: str) -> str | None:
+    """Return the reason *reward* records for its N/A *metric*, or ``None`` when it records none."""
+    details = reward.get("details")
+    detail = details.get(metric) if isinstance(details, dict) else None
+    if not isinstance(detail, dict) or detail.get("status") != NOT_APPLICABLE_STATUS:
+        return None
+    return _bounded_reason(detail.get("reason"))
+
+
+def shared_not_applicable_reason(rewards: list[dict[str, Any]], metric: str) -> str | None:
+    """Return the distinct reasons *rewards* record for their N/A *metric*, joined, or ``None``."""
+    reasons = [reason for reward in rewards if (reason := recorded_not_applicable_reason(reward, metric))]
+    return _bounded_reason("; ".join(dict.fromkeys(reasons)))
+
+
+def mark_not_applicable(reward: dict[str, Any], metric: str, reason: str | None = None) -> None:
+    """Record *metric* as N/A on *reward* using the verifier's marker shape.
+
+    A reason the reward already records for its N/A metric is kept. Otherwise
+    *reason*, such as the one the verifier recorded for the eval case, is used,
+    and without one the generic reason for the metric.
+    """
+    kept = recorded_not_applicable_reason(reward, metric) or _bounded_reason(reason)
+    reward[metric] = None
+    details = reward.get("details")
+    if not isinstance(details, dict):
+        details = {}
+        reward["details"] = details
+    existing = details.get(metric)
+    detail = dict(existing) if isinstance(existing, dict) else {}
+    detail.update(
+        {
+            "score": None,
+            "status": NOT_APPLICABLE_STATUS,
+            "reason": kept or NOT_APPLICABLE_REASONS.get(metric, "Not applicable to this eval case"),
+        }
+    )
+    details[metric] = detail
+
+
+def dimension_is_not_applicable(dimension: str, not_applicable: tuple[str, ...] | list[str] | set[str]) -> bool:
+    """Return whether every source metric of *dimension* is N/A."""
+    sources = DIMENSION_DEFINITIONS.get(dimension)
+    return bool(sources) and all(metric in not_applicable for metric in sources)
+
+
+def metric_set_for_reward(reward: dict[str, Any]) -> tuple[str, tuple[str, ...]]:
+    """Return the metric-set label and metric order used by a reward payload."""
+    metric_set = str(reward.get("metric_set") or reward.get("metric_set_version") or "")
+    if metric_set == DEFAULT_METRIC_SET:
+        return DEFAULT_METRIC_SET, DEFAULT_METRICS
+    if metric_set == LEGACY_METRIC_SET:
+        return LEGACY_METRIC_SET, LEGACY_METRICS
+    if metric_set:
+        # Explicit custom metric sets cannot claim SkillEvaluator's reserved
+        # canonical names. Their only standard score surface is ``overall``.
+        return CUSTOM_ONLY_METRIC_SET, ()
+
+    if _has_metric_field(reward, "security"):
+        return DEFAULT_METRIC_SET, DEFAULT_METRICS
+    if any(_has_metric_field(reward, metric) for metric in LEGACY_METRICS):
+        return LEGACY_METRIC_SET, LEGACY_METRICS
+    if score_value(reward.get("overall")) is not None:
+        return CUSTOM_ONLY_METRIC_SET, ()
+    return DEFAULT_METRIC_SET, DEFAULT_METRICS
+
+
+def trusted_observed_activation(reward: dict[str, Any]) -> str:
+    """Project collector-issued invocation evidence; never inspect trajectory or scores as proof."""
+    standard_sets = {DEFAULT_METRIC_SET, LEGACY_METRIC_SET}
+    declared = reward.get("metric_set") or reward.get("metric_set_version")
+    metric_set, metrics = metric_set_for_reward(reward)
+    if (
+        (declared and str(declared) not in standard_sets)
+        or metric_set not in standard_sets
+        or "skill_execution" not in metrics
+        or (metric_value(reward, "skill_execution") is None and not metric_is_not_applicable(reward, "skill_execution"))
+        or reward.get("invocation_evidence_source") != "trajectory"
+    ):
+        return "unknown"
+    invoked = reward.get("skill_invoked")
+    return ("invoked" if invoked else "not_invoked") if type(invoked) is bool else "unknown"
+
+
+def rewards_have_mixed_metric_contracts(rewards: object) -> bool:
+    """Return whether physical reward rows declare distinct metric contracts."""
+    if not isinstance(rewards, list):
+        return False
+    contracts = {
+        str(reward.get("metric_set") or reward.get("metric_set_version") or metric_set_for_reward(reward)[0])
+        for reward in rewards
+        if isinstance(reward, dict)
+    }
+    return len(contracts) > 1
+
+
+def metric_set_for_rewards(rewards: list[dict[str, Any]]) -> tuple[str, tuple[str, ...]]:
+    """Return the metric set for a collection, preferring the new SkillEvaluator set."""
+    declared = {str(reward.get("metric_set") or reward.get("metric_set_version") or "") for reward in rewards}
+    if DEFAULT_METRIC_SET in declared:
+        return DEFAULT_METRIC_SET, DEFAULT_METRICS
+    if LEGACY_METRIC_SET in declared:
+        return LEGACY_METRIC_SET, LEGACY_METRICS
+    undeclared = [reward for reward in rewards if not (reward.get("metric_set") or reward.get("metric_set_version"))]
+    if any(_has_metric_field(reward, "security") for reward in undeclared):
+        return DEFAULT_METRIC_SET, DEFAULT_METRICS
+    if any(any(_has_metric_field(reward, metric) for metric in LEGACY_METRICS) for reward in undeclared):
+        return LEGACY_METRIC_SET, LEGACY_METRICS
+    if any(score_value(reward.get("overall")) is not None for reward in rewards):
+        return CUSTOM_ONLY_METRIC_SET, ()
+    if any(value for value in declared):
+        return CUSTOM_ONLY_METRIC_SET, ()
+    return DEFAULT_METRIC_SET, DEFAULT_METRICS
+
+
+def average_metrics(rewards: list[dict[str, Any]]) -> tuple[dict[str, float], str, tuple[str, ...]]:
+    """Average SkillEvaluator metrics across rewards, with legacy artifact compatibility."""
+    metric_set, metrics = metric_set_for_rewards(rewards)
+    if not rewards:
+        return {}, metric_set, metrics
+    metric_sums: dict[str, float] = dict.fromkeys(metrics, 0.0)
+    metric_counts: dict[str, int] = dict.fromkeys(metrics, 0)
+
+    for reward in rewards:
+        _, reward_metrics = metric_set_for_reward(reward)
+        for metric in metrics:
+            if metric not in reward_metrics:
+                continue
+            val = metric_value(reward, metric)
+            if val is not None:
+                metric_sums[metric] += val
+                metric_counts[metric] += 1
+
+    averages: dict[str, float] = {}
+    for metric in metrics:
+        count = metric_counts[metric]
+        if count > 0:
+            averages[metric] = round(metric_sums[metric] / count, 4)
+
+    return averages, metric_set, metrics
+
+
+def score_policy_for_metrics(metrics: tuple[str, ...]) -> str:
+    """Return the versioned overall-score policy for one metric set."""
+    if metrics == DEFAULT_METRICS:
+        return DEFAULT_SCORE_POLICY
+    if metrics == LEGACY_METRICS:
+        return LEGACY_SCORE_POLICY
+    if not metrics:
+        return CUSTOM_SCORE_POLICY
+    return PARTIAL_SCORE_POLICY
+
+
+def canonical_dimension_mean(values: Iterable[object]) -> float | None:
+    """Average one complete canonical dimension set, failing closed on gaps."""
+    raw_values = tuple(values)
+    if len(raw_values) != len(DIMENSION_DEFINITIONS):
+        return None
+    numeric = tuple(finite_number(value) for value in raw_values)
+    if any(value is None or not 0.0 <= value <= 1.0 for value in numeric):
+        return None
+    return round(sum(value for value in numeric if value is not None) / len(numeric), 4)
+
+
+def overall_score_from_metrics(
+    scores: Mapping[str, object],
+    metrics: tuple[str, ...] = DEFAULT_METRICS,
+    *,
+    not_applicable: Collection[str] = (),
+) -> float | None:
+    """Aggregate one metric set using its versioned score policy.
+
+    Metrics in *not_applicable* (N/A for every attempt of the arm, so not
+    scored) are left out: an N/A metric drops out of its dimension, and a
+    dimension whose metrics are all N/A drops out of the mean. Every other
+    metric must carry a score.
+    """
+    skipped = {
+        metric
+        for metric in metrics
+        if metric in not_applicable
+        and metric in NOT_APPLICABLE_ELIGIBLE_METRICS
+        and score_value(scores.get(metric)) is None
+    }
+    applicable = tuple(metric for metric in metrics if metric not in skipped)
+    values = tuple(finite_number(scores.get(metric)) for metric in applicable)
+    if not values or any(value is None or not 0.0 <= value <= 1.0 for value in values):
+        return None
+
+    if metrics != LEGACY_METRICS and all(metric in DEFAULT_METRICS for metric in metrics):
+        dimensions = dimension_scores(dict(zip(applicable, values, strict=True)), tuple(skipped))
+        dimension_values = tuple(
+            dimensions[dimension]["score"] for dimension in DIMENSION_DEFINITIONS if dimension in dimensions
+        )
+        if metrics == DEFAULT_METRICS and not skipped:
+            return canonical_dimension_mean(dimension_values)
+        return round(sum(dimension_values) / len(dimension_values), 4) if dimension_values else None
+
+    return round(sum(value for value in values if value is not None) / len(values), 4)
+
+
+def overall_score(reward: dict[str, Any]) -> float | None:
+    """Compute pass@k/lift overall score for a reward payload.
+
+    Default rewards use the equal-weight mean of the five canonical dimensions.
+    Legacy metric sets retain their historical metric mean. Both leave out
+    metrics explicitly recorded as not applicable: an N/A metric drops out of its
+    dimension, and a dimension whose metrics are all N/A drops out of the mean.
+    Custom rewards without SkillEvaluator metrics can still pass through by
+    emitting numeric ``overall``.
+    """
+    _, metrics = metric_set_for_reward(reward)
+    persisted = score_value(reward.get("overall"))
+    policy = reward.get("score_policy")
+    policy = policy.strip() if isinstance(policy, str) and policy.strip() else None
+    if not metrics:
+        return persisted if policy in {None, CUSTOM_SCORE_POLICY} else None
+    if policy == CUSTOM_SCORE_POLICY:
+        return None
+    if policy == DEFAULT_SCORE_POLICY and metrics != DEFAULT_METRICS:
+        return None
+    if policy == PARTIAL_SCORE_POLICY and metrics in {DEFAULT_METRICS, LEGACY_METRICS}:
+        return None
+
+    scores: dict[str, float] = {}
+    not_applicable: list[str] = []
+    for metric in metrics:
+        value = metric_value(reward, metric)
+        if value is None and metric_is_not_applicable(reward, metric):
+            not_applicable.append(metric)
+            continue
+        if value is None or not 0.0 <= value <= 1.0:
+            return None
+        scores[metric] = value
+    if not scores:
+        return None
+    if policy is None:
+        current = overall_score_from_metrics(scores, metrics, not_applicable=not_applicable)
+        if persisted is not None and metrics == DEFAULT_METRICS:
+            # The historical formula: the mean of the scored metrics (N/A metrics left out).
+            historical = round(sum(scores.values()) / len(scores), 4)
+            if round(persisted, 4) == historical and historical != current:
+                return historical
+        return current
+    if policy not in SUPPORTED_SCORE_POLICIES:
+        # A new attempt using an unknown formula cannot be scored here.
+        return None
+    if policy == LEGACY_SCORE_POLICY:
+        return round(sum(scores.values()) / len(scores), 4)
+    return overall_score_from_metrics(scores, metrics, not_applicable=not_applicable)
+
+
+def score_definition(metrics: tuple[str, ...] = DEFAULT_METRICS) -> str:
+    """Human-readable definition for the SkillEvaluator overall score."""
+    if not metrics:
+        return f"overall = user-provided reward overall [{CUSTOM_SCORE_POLICY}]"
+    if metrics == DEFAULT_METRICS:
+        definition = (
+            "overall = mean(Security, Correctness, Discoverability, Effectiveness, Efficiency) "
+            f"[{DEFAULT_SCORE_POLICY}]"
+        )
+    elif metrics == LEGACY_METRICS:
+        definition = "overall = mean(" + ", ".join(metrics) + f") [{LEGACY_SCORE_POLICY}]"
+    else:
+        definition = f"overall = mean(available canonical dimensions) [{PARTIAL_SCORE_POLICY}]"
+    if any(metric in NOT_APPLICABLE_ELIGIBLE_METRICS for metric in metrics):
+        definition += ", excluding metrics that are not applicable to a case"
+    return definition
+
+
+def weighted_dimension_score(
+    value_of: Callable[[str], object],
+    config: Mapping[str, Any],
+    *,
+    active_metrics: Collection[str] | None = None,
+) -> float | None:
+    """Return one dimension's weighted evaluator mean, or ``None`` when no evaluator is scored.
+
+    *config* is a ``DIMENSION_MAPPING`` entry and *value_of* returns an
+    evaluator's score; anything other than a finite number counts as unscored.
+    Unscored evaluators and non-finite weights are skipped, so the remaining
+    weights renormalize.
+
+    The ``fallback_evaluators`` (``behavior_check`` for a legacy reward without
+    ``security``) replace the primary evaluators when none of those belongs to
+    *active_metrics* (a reward's metric set). Without *active_metrics*, they
+    replace them when no primary evaluator is scored. Both rules agree for a
+    complete reward, which scores every metric of its set that is not N/A.
+    """
+    evaluators = config.get("evaluators") or ()
+    weights = config.get("weights") or ()
+    fallback_evaluators = config.get("fallback_evaluators") or ()
+    fallback_weights = config.get("fallback_weights") or ()
+    if active_metrics is not None:
+        if fallback_evaluators and not any(evaluator in active_metrics for evaluator in evaluators):
+            return _weighted_mean(value_of, fallback_evaluators, fallback_weights)
+        return _weighted_mean(value_of, evaluators, weights)
+    score = _weighted_mean(value_of, evaluators, weights)
+    if score is None and fallback_evaluators:
+        score = _weighted_mean(value_of, fallback_evaluators, fallback_weights)
+    return score
+
+
+def _weighted_mean(
+    value_of: Callable[[str], object],
+    evaluators: Iterable[str],
+    weights: Iterable[object],
+) -> float | None:
+    numerator = 0.0
+    denominator = 0.0
+    for evaluator, weight in zip(evaluators, weights, strict=False):
+        value = finite_number(value_of(evaluator))
+        numeric_weight = finite_number(weight)
+        if value is None or numeric_weight is None:
+            continue
+        numerator += value * numeric_weight
+        denominator += numeric_weight
+    return numerator / denominator if denominator > 0 else None
+
+
+def dimension_scores(
+    scores: dict[str, float],
+    not_applicable: tuple[str, ...] | list[str] | set[str] = (),
+) -> dict[str, dict[str, Any]]:
+    """Compute report-only SkillEvaluator dimension scores from default metric scores.
+
+    Source metrics that are N/A for the whole arm (and so absent from *scores*)
+    drop out and the remaining weights are renormalized. A dimension whose
+    sources are all N/A is omitted, as is one with any other missing source.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for dimension, configured_sources in DIMENSION_DEFINITIONS.items():
+        sources = {
+            metric: weight
+            for metric, weight in configured_sources.items()
+            if not (metric in not_applicable and score_value(scores.get(metric)) is None)
+        }
+        if not sources or not all(score_value(scores.get(metric)) is not None for metric in sources):
+            continue
+        total_weight = sum(sources.values())
+        if total_weight <= 0:
+            continue
+        score = sum(float(scores[metric]) * weight for metric, weight in sources.items()) / total_weight
+        entry: dict[str, Any] = {
+            "score": round(score, 4),
+            "sources": sources,
+        }
+        skipped = [metric for metric in configured_sources if metric not in sources]
+        if skipped:
+            entry["not_applicable_sources"] = skipped
+        out[dimension] = entry
+    return out
+
+
+def extract_custom_metrics(reward: dict[str, Any]) -> dict[str, float]:
+    """Return user/custom numeric metrics that are separate from SkillEvaluator metrics."""
+    custom: dict[str, float] = {}
+
+    explicit = reward.get("custom_metrics")
+    if isinstance(explicit, dict):
+        for name, value in explicit.items():
+            name = str(name)
+            if name in RESERVED_METRIC_NAMES or not custom_metric_name_is_publishable(name):
+                continue
+            if isinstance(value, dict):
+                value = value.get("score")
+            numeric = score_value(value)
+            if numeric is not None:
+                custom[name] = numeric
+
+    metrics = reward.get("metrics")
+    if isinstance(metrics, dict):
+        for name, value in metrics.items():
+            name = str(name)
+            if name in RESERVED_METRIC_NAMES or not custom_metric_name_is_publishable(name):
+                continue
+            if isinstance(value, dict):
+                value = value.get("score")
+            numeric = score_value(value)
+            if numeric is not None:
+                custom[name] = numeric
+
+    for name, value in reward.items():
+        name = str(name)
+        if name in RESERVED_METRIC_NAMES or name.startswith("_") or not custom_metric_name_is_publishable(name):
+            continue
+        if isinstance(value, dict):
+            value = value.get("score")
+        numeric = score_value(value)
+        if numeric is not None:
+            custom[name] = numeric
+
+    return custom
+
+
+def average_custom_metrics(rewards: list[dict[str, Any]]) -> dict[str, float]:
+    """Average custom metrics across rewards inside the publication envelope."""
+    sums: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for reward in rewards:
+        if reason := custom_metric_contract_error(reward):
+            raise CustomMetricContractError(reason)
+        for name, value in extract_custom_metrics(reward).items():
+            if name not in sums and len(sums) >= MAX_CUSTOM_METRICS:
+                raise CustomMetricContractError("Custom metric union exceeds the per condition publication limit")
+            sums[name] = sums.get(name, 0.0) + value
+            counts[name] = counts.get(name, 0) + 1
+    return {name: round(sums[name] / counts[name], 4) for name in sorted(sums)}

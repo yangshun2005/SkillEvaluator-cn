@@ -1,0 +1,201 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Narrow behavior/accessibility additions to the native report presentation. */
+:root { --focus-ring:#76b900; --mobile-nav-height:0px; --tier3-nav-height:0px; }
+[hidden] { display:none!important; }
+button,input,select { font:inherit; }
+button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible,[tabindex]:focus-visible { outline:3px solid var(--focus-ring); outline-offset:3px; }
+.sr-only { position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0; }
+.skip-link { position:fixed;left:1rem;top:-5rem;z-index:1000;padding:0.75rem 1rem;background:var(--bg);color:var(--dark-text); }
+.skip-link:focus { top:0.5rem; }
+.theme-control { display:flex;align-items:center;gap:.4rem;font-size:.8rem; }
+.theme-control select { background:var(--bg);color:var(--dark-text);border:1px solid var(--border-color);border-radius:6px;padding:.35rem; }
+.nav-tabs a { text-decoration:none; }
+.nav-tabs [aria-current=location] { background:var(--secondary-color);color:white;border-color:var(--secondary-color); }
+.workspace-heading { margin:1.5rem 0; }
+.workspace-heading h2 { font-size:1.15rem; }
+.workspace-heading p,.report-breadcrumb,.hero-decision-reason,.hero-skills,.hero-score-label,.publication-reasons { font-size:.85rem;color:var(--text-secondary); }
+.hero-score-label { display:block; }
+.hero-side { text-align:right; }
+.hero-command-status,.publication-line { margin-top:.75rem; }
+.publication-label { font-size:.8rem; }
+.verdict-chip { display:inline-block;padding:.2rem .65rem;border-radius:999px;font-size:.85rem;font-weight:700; }
+.verdict-chip.pass { background:var(--badge-pass-bg);color:var(--badge-pass-tx); }
+.verdict-chip.fail { background:var(--badge-fail-bg);color:var(--badge-fail-tx); }
+.verdict-chip.warn { background:var(--badge-warn-bg);color:var(--badge-warn-tx); }
+.verdict-caption { color:var(--text-secondary); }
+.score-pass { color:var(--success-color); }.score-warn { color:var(--warning-color); }.score-fail { color:var(--danger-color); }
+.tier-card.skipped { border-left-color:var(--text-secondary); }
+.tier-card.active { outline:2px solid var(--secondary-color);outline-offset:2px; }
+.tier-empty { padding:1rem;border:1px solid var(--border-color);border-radius:8px;background:var(--bg); }
+.exec-summary { padding:1rem; }
+.exec-title { font-size:1rem; }
+.exec-verdict,.exec-reason { margin-bottom:.8rem; }
+.kpis { display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin:1rem 0; }
+.kpi dt,.kpi-sub,.kpi-legend,.fix-meta,.fix-more { color:var(--text-secondary);font-size:.8rem; }
+.kpi-value { font-size:1.25rem; }
+.fix-first { margin-top:1rem; }.fix-first ol { padding-left:1.5rem; }.fix-first li { margin:.75rem 0; }.fix-meta { display:block; }
+.fix-link,.validator-link { color:var(--secondary-color); }
+.check-id { font-size:.72rem;color:var(--text-secondary);margin-left:.35rem; }
+.report-searchbar { display:flex;flex-wrap:wrap;align-items:center;gap:.75rem;margin:1rem 0; }
+.report-searchbar input { flex:1;min-width:180px;padding:.6rem .8rem;border:1px solid var(--border-color);border-radius:8px;background:var(--bg);color:var(--dark-text); }
+.report-searchbar label,#report-search-count { font-size:.85rem; }
+.report-no-matches { padding:1rem;border:1px dashed var(--border-color);border-radius:8px; }
+.raw-output { margin-top:.75rem; }.raw-output summary { cursor:pointer;font-size:.85rem; }.raw-output pre { max-height:30rem;overflow:auto; }
+.scan-diagnostic { margin:.75rem 0;white-space:pre-wrap; }
+.quality-outcome-note,.findings-overflow-note { margin:.75rem;font-size:.85rem;color:var(--text-secondary); }
+.run-metadata { margin-top:2rem;padding:1rem;background:var(--bg);border:1px solid var(--border-color);border-radius:8px; }
+.run-metadata summary { cursor:pointer;font-weight:600; }.metadata-grid { display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem;margin-top:1rem; }
+.metadata-grid .header-meta-item { color:var(--text-secondary);opacity:1; }
+.tier2-scope-nav { display:flex;gap:1rem;margin:1rem 0; }
+.chart-description,.chart-fallback { font-size:.8rem;color:var(--text-secondary);margin:.5rem 0; }
+.t3-ds-diagnostics,.t3-reasoning-list { padding-left:1.25rem; }.t3-ds-diagnostics li { margin:.6rem 0; }
+.t3-ev-refs,.t3-ev-detail { grid-column:1/-1;overflow-wrap:anywhere;font-size:.8rem; }
+.t3-execution-errors pre { white-space:pre-wrap;overflow-wrap:anywhere; }
+pre { max-width:100%;overflow:auto; } code,td,th,p { overflow-wrap:anywhere; }
+.container,.agent-hero-title-block,.hero-side,.tab-content,.t3-page { min-width:0; }
+.t3-filter-input { min-width:0; }
+.table-scroll,.table-container,.summary-table-container,.top-issues-content,.contributor-content { max-width:100%;overflow-x:auto; }
+.t3-agent-anchor,[id^=tier3-dataset-case],.tab-content { scroll-margin-top:8rem; }
+@media(max-width:720px) {
+ .header-content,.container { padding-left:1rem;padding-right:1rem; }.header-meta,.hero-side { text-align:left;align-items:flex-start; }
+ .agent-hero-top { flex-direction:column; }.agent-hero-title { overflow-wrap:anywhere; }.tier-card { min-width:0; }.tier-cards { grid-template-columns:1fr; }
+ .chart-grid { grid-template-columns:minmax(0,1fr); }.metadata-grid { grid-template-columns:1fr; }
+ .t3-subtabs,.t3-agent-tabs { flex-wrap:wrap; }.t3-subtab,.t3-agent-tab-btn { white-space:normal; }
+ .t3-prov-grid { grid-template-columns:minmax(0,1fr)!important; }.t3-filter-input { width:100%; }
+}
+@media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto; }* { transition:none!important;animation:none!important; } }
+/* beforeprint can run before print media applies; charts need visible parents now. */
+:root[data-report-printing] .tab-content,:root[data-report-printing] .t3-page,:root[data-report-printing] .t3-agent-panel { display:block!important; }
+@media print {
+ :root,[data-theme=dark] { --light-bg:#fff;--bg:#fff;--bg-secondary:#f1f5f9;--bg-tertiary:#e2e8f0;--dark-text:#1e293b;--text-secondary:#64748b;--border-color:#e2e8f0;--primary-color:#0f4c2a;--secondary-color:#76b900;--success-color:#166534;--danger-color:#991b1b;--warning-color:#92400e;--badge-pass-bg:#dcfce7;--badge-pass-tx:#166534;--badge-warn-bg:#fef9c3;--badge-warn-tx:#854d0e;--badge-fail-bg:#fee2e2;--badge-fail-tx:#991b1b; }
+ body { background:#fff;color:#1e293b; }.main-header { display:block;position:static; }.container { max-width:none;padding:1rem; }
+ .nav-tabs,.header-controls,.report-searchbar,.skip-link,.filter-group,.view-toggle-section,#backToTop,.t3-subtabs,.t3-agent-tabs,.t3-copy-btn { display:none!important; }
+ .dedup-subtab,.tab-content,.t3-page,.t3-agent-panel,.results-view,.skill-content,.validator-content,.top-issues-content,.contributor-content { display:block!important;max-height:none!important;overflow:visible!important; }
+ .table-scroll,.table-container,.summary-table-container { overflow:visible!important; }.results-view:not(#results-by-skill),.raw-output { display:none!important; }
+ .skill-card,.validator-card,.check-finding,.summary-table tr,.t3-trial-card { display:revert!important; }
+ #t3-dataset-list > .t3-ds-card { display:revert!important; }
+ .chart-grid { display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem; }
+ .chart-card { break-inside:avoid;min-width:0;padding:1rem; }
+ .chart-card canvas { max-width:100%;max-height:260px; }
+ details { break-inside:auto; }a { color:inherit; } table { font-size:8pt; }
+}
+
+/* Long recorded agent identities wrap inside their native tab buttons. */
+.tab-content .t3-agent-tabs { min-width:0;flex-wrap:wrap; }
+.tab-content .t3-agent-tab-btn { min-width:0;max-width:100%;white-space:normal;overflow-wrap:anywhere; }
+.tab-content .t3-agent-tab-btn .t3-tab-dot,.tab-content .t3-agent-tab-btn .t3-tab-score { flex-shrink:0; }
+
+/* The native header can wrap; sticky controls and deep links clear its measured height. */
+:root { --report-header-height:0px; }
+.tab-content .t3-subtabs,.filter-group { top:var(--report-header-height); }
+.tab-content .t3-agent-anchor { scroll-margin-top:calc(var(--report-header-height) + var(--tier3-nav-height) + 20px); }
+.tab-content,.skill-card,.validator-card,[id^=tier3-dataset-case],.check-finding { scroll-margin-top:calc(var(--report-header-height) + 20px); }
+
+/* Bound the public eligibility component within the native two-column hero. */
+@media(min-width:721px) {
+ .agent-hero-title-block { flex:1 1 0; }
+ .hero-side { flex:0 1 22rem;max-width:40%;overflow-wrap:anywhere; }
+}
+
+/* Neutral pills and inactive hovered tabs retain a readable theme foreground. */
+.skill-pill,.quality-pill,.nav-tab:hover { color:var(--dark-text); }
+/* Bright native action colors need the existing dark palette foreground. */
+.nav-tab.active,.nav-tabs [aria-current=location],.view-toggle-btn.active,.filter-btn.active,.severity-filter-btn.active { color:#0c111b; }
+/* Light-theme critical/high colors are deep red; their dark-theme variants are bright. */
+.severity-filter-btn.active.critical-btn,.severity-filter-btn.active.high-btn { color:#fff; }
+[data-theme=dark] .severity-filter-btn.active.critical-btn,[data-theme=dark] .severity-filter-btn.active.high-btn { color:#0c111b; }
+/* Status chips and badges keep 4.5:1 for their small text. Tier chips use the badge colors; the rest keep their fill and take a dark or deeper-red text pair. */
+:root { --danger-solid:#b91c1c; }
+.tier-card.pass .tier-card-verdict { background:var(--badge-pass-bg);color:var(--badge-pass-tx);border:1px solid currentColor; }
+.tier-card.fail .tier-card-verdict { background:var(--badge-fail-bg);color:var(--badge-fail-tx);border:1px solid currentColor; }
+.tier-card.warn .tier-card-verdict { background:var(--badge-warn-bg);color:var(--badge-warn-tx);border:1px solid currentColor; }
+.tier-card.skipped .tier-card-verdict { color:var(--dark-text); }
+.count-badge,.t3-incomplete-badge { background:var(--danger-solid);color:#fff; }
+.count-badge.medium-count,[data-theme=dark] .count-badge.low-count { color:#0c111b; }
+.skill-pill:hover,.quality-pill:hover,.validator-collapsible.active,#backToTop { color:#0c111b; }
+#backToTop:hover { color:#fff; }
+
+/* New text links follow the theme; native lime actions need a dark foreground. */
+@media screen {
+:root { --report-link-color:#245d00; }
+[data-theme=dark] { --report-link-color:#a3e635; }
+.tab-content a:not([class]) { color:var(--report-link-color);text-decoration:underline;text-underline-offset:2px; }
+.tier-card-link,.tier-card-link:hover,.t3-harbor-link,.t3-harbor-link:hover { color:var(--report-link-color); }
+/* Detailed tables retain whole words/numbers and use their bounded scroll owner. */
+.table-scroll th,.table-scroll td { overflow-wrap:normal;word-break:normal; }
+/* Tier 1 has its own scroll owner; long finding/category/skill evidence still wraps. */
+.top-issues-table th { overflow-wrap:normal;word-break:normal; }
+.top-issues-table .quality-pill,.top-issues-table .count-badge { white-space:nowrap;flex-shrink:0; }
+}
+.tab-content .t3-link-btn { color:#0c111b; }
+
+/* Each retained baseline warning remains a separate readable notice. */
+.t3-overview-lead .tolerated-baseline { display:block; margin-top:.5rem; }
+
+/* Keep the native brand scale and align its version with the product name. */
+.header-brand-row { display:flex;align-items:baseline;flex-wrap:wrap;gap:.35rem .65rem; }
+.header-version { font-size:.85rem;font-weight:600;line-height:1.3;overflow-wrap:anywhere; }
+.tier-card-stats .tier-card-scanner-version { min-width:0;max-width:100%;overflow-wrap:anywhere; }
+/* A little more room on desktop, with the header and report edges aligned. */
+@media screen {
+ .header-content,.container { max-width:1280px; }
+}
+.tier-card-job-label,.t3-harbor-job-label { overflow-wrap:anywhere; }
+.t3-harbor-unavailable { color:var(--text-secondary);font-size:.85rem;margin:.75rem 0; }
+.t3-primary-metrics { grid-template-columns:repeat(3,minmax(0,1fr)); }
+.t3-primary-metrics .dashboard-card { padding:1rem; }
+.t3-primary-metrics .dashboard-card-value { margin:.25rem 0; }
+.t3-primary-metrics .t3-coverage-value { font-size:1.15rem; }
+.t3-quality-unavailable { padding:.75rem 1rem;margin:.75rem 0;border-left:3px solid var(--warning-color);background:var(--bg); }
+.t3-method { margin:.75rem 0;color:var(--text-secondary);font-size:.85rem; }
+.t3-method summary,.publication-reasons summary { cursor:pointer; }
+.publication-reasons ul { text-align:left;padding-left:1.25rem; }
+.tab-content .t3-scorecards-only { grid-template-columns:minmax(0,1fr); }
+.t3-scorecards-only .t3-agent-scorecard-list { grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
+#tier3-next-steps-preview { margin:1rem 0; }
+#tier3-next-steps-preview p { margin:.4rem 0; }
+#tier3-next-steps-preview .t3-link-btn { text-decoration:underline; }
+#tier3-secondary-outcomes { margin:1rem 0; }
+@media(max-width:720px) {
+ .main-header { position:static; }
+ .main-header .header-controls { gap:.5rem;flex-wrap:wrap; }
+ .main-header .theme-control select { font-size:.8rem;max-width:5.5rem;padding:.3rem; }
+ .main-header .export-btn { font-size:.75rem;padding:.35rem .5rem; }
+ .t3-primary-metrics { grid-template-columns:repeat(3,minmax(0,1fr));gap:.5rem; }
+ .t3-primary-metrics>.dashboard-card:only-child { grid-column:1/-1; }
+ .t3-primary-metrics .dashboard-card { padding:.65rem; }
+ .t3-primary-metrics .dashboard-card-value { font-size:1.5rem; }
+ .t3-primary-metrics .t3-coverage-value { font-size:1rem; }
+ .t3-primary-metrics .dashboard-card-subtitle { font-size:.75rem; }
+ .workspace-heading { margin:1rem 0; }
+}
+.tier2-scope-summary { display:flex;flex-wrap:wrap;gap:.75rem 1.5rem;margin:.75rem 0; }
+.tier2-scope-summary div { display:flex;gap:.4rem; }
+.tier2-scope-summary dt { color:var(--text-secondary); }
+.tier2-scope-summary dd { font-weight:700; }
+.t3-agent-coverage { display:flex;flex-wrap:wrap;gap:.5rem 1.5rem;margin:.75rem 0; }
+.t3-agent-coverage div { display:flex;gap:.4rem; }
+.t3-agent-coverage dt { color:var(--text-secondary); }
+.t3-summary-line,.t3-summary-links { display:flex;flex-wrap:wrap;gap:.4rem 1rem;align-items:baseline; }
+.t3-overview-lead p { margin:.5rem 0; }
+.tab-content .t3-overview-lead a { color:var(--report-link-color);text-decoration:underline;text-underline-offset:2px; }
+.t3-summary-action { margin-top:.6rem; }
+.tab-content #tier3-next-steps-preview { margin:.5rem 0 0; }
+.t3-summary-links { font-size:.85rem; }
+.t3-table-detail summary { cursor:pointer;white-space:nowrap;color:var(--report-link-color); }
+.t3-table-detail p { margin:.5rem 0; }
+.table-scroll .t3-table-detail p { overflow-wrap:normal;word-break:normal; }
+.t3-comparison-caption { text-align:left;font-size:.85rem;color:var(--text-secondary);padding:0 0 .6rem; }
+.tier2-skip-notice { background:var(--bg-secondary);border-left:3px solid var(--warning-color);border-radius:6px;padding:.75rem 1rem;margin:.75rem 0; }
+.t3-harbor-panel .t3-harbor-jobs { display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:.65rem 1rem;width:100%; }
+.t3-harbor-panel .t3-harbor-job { min-width:0; }
+.t3-harbor-panel .t3-harbor-job-label { font-size:.85rem; }
+.t3-primary-metrics { grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
+@media(max-width:720px) {
+ .tier1-statistics { grid-template-columns:repeat(2,minmax(0,1fr));gap:.6rem; }
+ .tier1-statistics .dashboard-card { min-width:0;padding:1rem; }
+ .t3-primary-metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }
+ .t3-primary-metrics [data-primary-metric=coverage] { grid-column:1/-1; }
+ .t3-harbor-panel .t3-harbor-jobs { grid-template-columns:repeat(2,minmax(0,1fr)); }
+ .t3-harbor-panel .t3-harbor-actions { flex-wrap:wrap;gap:.35rem; }
+}

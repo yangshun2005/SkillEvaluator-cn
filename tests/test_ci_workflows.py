@@ -1,0 +1,946 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import json
+import re
+import shlex
+import subprocess
+import sys
+import tomllib
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKFLOWS = ROOT / ".github" / "workflows"
+GITLEAKS_CONFIG = ROOT / ".gitleaks.toml"
+REVIEWED_NPM_COMMAND = ["npm", "ci", "--prefix", "fern", "--ignore-scripts", "--omit=optional"]
+
+REQUIRED_CI_JOBS = {
+    "test-python-312": "Tests (Python 3.12)",
+    "test-python-313": "Tests (Python 3.13)",
+    "test-python-314": "Tests (Python 3.14)",
+    "package": "Package",
+    "rhel8-security-install": "RHEL 8 security install",
+    "tier2-macos": "Tier 2 (macos-latest)",
+    "tier2-windows": "Tier 2 (windows-latest)",
+    "tier3-macos": "Tier 3 macOS contract and progress",
+    "native-windows-local-mode": "Native Windows local mode fails closed",
+}
+# Required jobs that are skipped on every pull request and run after merge.
+AFTER_MERGE_ONLY_CI_JOBS = {"tier2-macos"}
+# Required jobs that test operating-system behaviour of Tier 3. On a pull request
+# they run only when the change classifier says the change can affect them.
+TIER3_PLATFORM_CI_JOBS = {"tier3-macos", "native-windows-local-mode"}
+HEAVY_CI_JOBS = set(REQUIRED_CI_JOBS) - {"test-python-312"} - AFTER_MERGE_ONLY_CI_JOBS - TIER3_PLATFORM_CI_JOBS
+RUN_UNLESS_CANCELLED_IF = "${{ !cancelled() }}"
+FULL_LANE_IF = "${{ !cancelled() && needs.classify-changes.outputs.docs_only != 'true' }}"
+TIER3_PLATFORM_IF = (
+    "${{ !cancelled() && needs.classify-changes.outputs.docs_only != 'true'"
+    " && needs.classify-changes.outputs.tier3_platform != 'false' }}"
+)
+NOT_DOCS_ONLY_IF = "${{ needs.classify-changes.outputs.docs_only != 'true' }}"
+PULL_REQUEST_TESTS_IF = (
+    "${{ github.event_name == 'pull_request' && needs.classify-changes.outputs.docs_only != 'true' }}"
+)
+DOCS_ONLY_TESTS_IF = (
+    "${{ github.event_name == 'pull_request' && needs.classify-changes.outputs.docs_only == 'true' }}"
+)
+MAIN_COVERAGE_IF = "${{ github.event_name != 'pull_request' }}"
+AFTER_MERGE_ONLY_IF = "${{ github.event_name != 'pull_request' }}"
+PR_CONCURRENCY = {
+    "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}",
+    "cancel-in-progress": "true",
+}
+
+
+def _load(name: str) -> dict[str, Any]:
+    return yaml.load((WORKFLOWS / name).read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+
+
+def _workflow_names() -> list[str]:
+    """Every workflow on disk, so a new one is covered the day it lands."""
+    names = sorted(path.name for pattern in ("*.yml", "*.yaml") for path in WORKFLOWS.glob(pattern))
+    assert names, "no workflows found"
+    return names
+
+
+def _assert_no_path_filter(workflow: dict[str, Any], event: str = "pull_request") -> None:
+    trigger = workflow["on"][event]
+    if isinstance(trigger, dict):
+        assert "paths" not in trigger
+        assert "paths-ignore" not in trigger
+
+
+def _runs(job: dict[str, Any]) -> str:
+    return "\n".join(step.get("run", "") for step in job["steps"])
+
+
+def _all_uses(workflow: dict[str, Any]) -> list[str]:
+    """Every action reference: step-level actions and job-level reusable workflows."""
+    step_uses = [step["uses"] for job in workflow["jobs"].values() for step in job.get("steps", []) if "uses" in step]
+    job_uses = [job["uses"] for job in workflow["jobs"].values() if "uses" in job]
+    return step_uses + job_uses
+
+
+def _all_steps(workflow: dict[str, Any]) -> list[dict[str, Any]]:
+    return [step for job in workflow["jobs"].values() for step in job.get("steps", [])]
+
+
+def _action_repository(uses: str) -> str:
+    """The ``owner/repo`` half of a ``uses:`` value, folded for comparison.
+
+    GitHub resolves repository names case-insensitively, so ``Actions/Checkout``
+    runs exactly the action ``actions/checkout`` names. A guard that filters on
+    one literal spelling therefore skips a step that really does run -- which is
+    a silent hole, not a cosmetic one.
+    """
+    return uses.split("@", 1)[0].casefold()
+
+
+def _is_checkout_step(step: dict[str, Any]) -> bool:
+    """Whether ``step`` runs ``actions/checkout``, however GitHub spells it.
+
+    An unpinned ``uses: actions/checkout`` counts too: the pin guard is what
+    rejects that, and until it does the step still checks out a credentialed
+    workspace.
+    """
+    return _action_repository(step.get("uses", "")) == "actions/checkout"
+
+
+def test_ci_preserves_required_contexts_as_explicit_jobs() -> None:
+    ci = _load("ci.yml")
+
+    assert {job_id: ci["jobs"][job_id]["name"] for job_id in REQUIRED_CI_JOBS} == REQUIRED_CI_JOBS
+    assert all("matrix." not in ci["jobs"][job_id]["name"] for job_id in REQUIRED_CI_JOBS)
+    _assert_no_path_filter(ci)
+
+
+def test_ci_classifier_is_pull_request_only_and_exports_docs_only() -> None:
+    ci = _load("ci.yml")
+    classifier = ci["jobs"]["classify-changes"]
+
+    assert ci["concurrency"] == PR_CONCURRENCY
+    assert classifier["name"] == "Classify changes"
+    assert classifier["if"] == "${{ github.event_name == 'pull_request' }}"
+    assert classifier["outputs"] == {
+        "docs_only": "${{ steps.changes.outputs.docs_only }}",
+        "tier3_platform": "${{ steps.changes.outputs.tier3_platform }}",
+    }
+    assert classifier["steps"][0]["with"]["fetch-depth"] == "0"
+    assert classifier["steps"][0]["with"]["persist-credentials"] == "false"
+    assert classifier["steps"][1]["id"] == "changes"
+    classifier_run = classifier["steps"][1]["run"]
+    assert 'git show "$BASE_SHA:scripts/classify_ci_changes.py"' in classifier_run
+    assert 'python3 "$classifier"' in classifier_run
+    assert 'echo "docs_only=false" >> "$GITHUB_OUTPUT"' in classifier_run
+    assert 'echo "tier3_platform=true" >> "$GITHUB_OUTPUT"' in classifier_run
+    assert "python3 scripts/classify_ci_changes.py" not in classifier_run
+    assert classifier["steps"][1]["env"] == {
+        "BASE_SHA": "${{ github.event.pull_request.base.sha }}",
+        "HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
+    }
+
+
+def test_ci_validates_fern_on_the_required_python_312_context() -> None:
+    job = _load("ci.yml")["jobs"]["test-python-312"]
+
+    assert job["needs"] == "classify-changes"
+    assert job["if"] == RUN_UNLESS_CANCELLED_IF
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["steps"][0]["with"]["persist-credentials"] == "false"
+
+    # The docs lane runs the documentation tests, so it needs the project
+    # installed. It also scans for private integration names, because the scan
+    # reads the documentation a docs-only pull request changes.
+    both_lane_step_names = {
+        "Set up Python",
+        "Set up uv",
+        "Install dependencies",
+        "Scan OSS source boundary",
+    }
+    both_lane_steps = {step.get("name"): step for step in job["steps"] if step.get("name") in both_lane_step_names}
+    assert set(both_lane_steps) == both_lane_step_names
+    assert all("if" not in step for step in both_lane_steps.values())
+
+    full_lane_step_names = {
+        "Lint committed BENCHMARK.md fixtures for leak patterns",
+        "Lint",
+    }
+    full_lane_steps = {step.get("name"): step for step in job["steps"] if step.get("name") in full_lane_step_names}
+    assert set(full_lane_steps) == full_lane_step_names
+    assert all(step["if"] == NOT_DOCS_ONLY_IF for step in full_lane_steps.values())
+
+    step_names = [step.get("name") for step in job["steps"]]
+    # A docs-only pull request skips every other job, so this step is the only
+    # place its documentation tests run.
+    docs_tests = job["steps"][step_names.index("Run documentation tests")]
+    assert docs_tests["if"] == DOCS_ONLY_TESTS_IF
+    assert docs_tests["shell"] == "bash"
+    docs_tests_run = docs_tests["run"].splitlines()
+    assert docs_tests_run[0] == "set -euo pipefail"
+    # The selection is captured with a plain assignment so that a failing
+    # selector stops the step. pytest with no paths would run the whole suite.
+    assert 'docs_tests="$(python -m scripts.select_docs_tests)"' in docs_tests_run
+    assert 'mapfile -t docs_test_files <<< "$docs_tests"' in docs_tests_run
+    assert 'uv run pytest -q -n auto "${docs_test_files[@]}"' in docs_tests_run
+    assert "<(" not in docs_tests["run"], "a process substitution would hide a failing selector"
+    pull_request_tests = job["steps"][step_names.index("Run tests")]
+    main_tests = job["steps"][step_names.index("Run tests with coverage")]
+    # Pull requests wait on this required job, so they run it like the 3.13 and
+    # 3.14 jobs: in parallel, without a coverage report that no check reads.
+    assert pull_request_tests["if"] == PULL_REQUEST_TESTS_IF
+    assert pull_request_tests["run"] == "uv run pytest -q -n auto"
+    # Coverage is measured once per merge. It stays serial: under xdist,
+    # coverage tracing pushed the time-bound tests past their limits (#261).
+    assert main_tests["if"] == MAIN_COVERAGE_IF
+    assert main_tests["run"].split() == [
+        "uv",
+        "run",
+        "pytest",
+        "-q",
+        "--cov=skillevaluator",
+        "--cov-report=term-missing",
+        "--cov-report=xml:coverage.xml",
+    ]
+    pytest_steps = [step.get("name") for step in job["steps"] if "pytest" in step.get("run", "")]
+    assert pytest_steps == [
+        "Run documentation tests",
+        "Run tests",
+        "Run tests with coverage",
+    ], "exactly one pytest step runs per event"
+
+    node_step = next(step for step in job["steps"] if step.get("name") == "Set up Node.js for docs")
+    docs_step = next(step for step in job["steps"] if step.get("name") == "Validate Fern documentation")
+    # A failing suite must not hide a docs break, and the docs verdict should
+    # not wait for the suite.
+    assert step_names.index("Validate Fern documentation") < step_names.index("Run documentation tests")
+    assert step_names.index("Validate Fern documentation") < step_names.index("Run tests")
+    assert "if" not in node_step, "Fern validation must run for mixed and Fern dependency PRs"
+    assert len(node_step["uses"].split("@", 1)[1]) == 40
+    assert "if" not in docs_step, "Fern validation must run for mixed and Fern dependency PRs"
+    assert "npm ci --prefix fern --ignore-scripts --omit=optional" in docs_step["run"]
+    assert "./fern/node_modules/.bin/fern check" in docs_step["run"]
+    assert "GITHUB_STEP_SUMMARY" in docs_step["run"]
+    assert "platform test matrix was skipped" not in docs_step["run"]
+
+
+def test_html_parser_patch_boundary_coverage_uses_available_runner_artifacts() -> None:
+    job = _load("ci.yml")["jobs"]["html-parser-compatibility"]
+    # Floating the OS can make these historical patch interpreters unavailable,
+    # preventing the compatibility regression tests from running at all.
+    assert job["runs-on"] == "ubuntu-24.04"
+    versions = ["3.12.11", "3.13.5"]
+    setup_python = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/setup-python@"))
+    assert setup_python["with"]["python-version"].split() == versions
+    # One job runs both patch releases, each against the same two test files.
+    test_steps = [step for step in job["steps"] if "pytest" in step.get("run", "")]
+    assert len(test_steps) == len(versions)
+    for version, step in zip(versions, test_steps, strict=True):
+        assert f"uv sync --extra dev --locked --python {version}\n" in step["run"]
+        assert f"uv run --python {version} pytest -q " in step["run"]
+        assert "tests/validators/test_markdown.py" in step["run"]
+        assert "tests/test_cli_html_parser_compat.py" in step["run"]
+    # A failure on the first interpreter must not hide the result for the second.
+    assert "if" not in test_steps[0]
+    assert test_steps[1]["if"] == RUN_UNLESS_CANCELLED_IF
+
+
+def test_ci_skips_every_other_required_job_only_after_classification() -> None:
+    jobs = _load("ci.yml")["jobs"]
+
+    for job_id in HEAVY_CI_JOBS:
+        assert jobs[job_id]["needs"] == "classify-changes"
+        assert jobs[job_id]["if"] == FULL_LANE_IF
+
+
+def test_tier3_platform_jobs_run_only_for_changes_that_can_affect_them() -> None:
+    jobs = _load("ci.yml")["jobs"]
+
+    for job_id in TIER3_PLATFORM_CI_JOBS:
+        assert jobs[job_id]["name"] == REQUIRED_CI_JOBS[job_id]
+        assert jobs[job_id]["needs"] == "classify-changes"
+        # The jobs are skipped only on an explicit ``false``. A push to main,
+        # a classifier that failed, and a base branch whose classifier does not
+        # report this output all leave it empty, and the jobs run.
+        assert jobs[job_id]["if"] == TIER3_PLATFORM_IF
+
+
+def test_the_classifier_knows_every_test_file_the_tier3_platform_jobs_run() -> None:
+    """A test file added to one of the jobs must also make the job run when it changes."""
+    from scripts.classify_ci_changes import TIER3_PLATFORM_TESTS, is_tier3_platform_related
+
+    jobs = _load("ci.yml")["jobs"]
+    run_by_the_jobs = {
+        token.split("::", 1)[0]
+        for job_id in TIER3_PLATFORM_CI_JOBS
+        for token in _runs(jobs[job_id]).split()
+        if token.startswith("tests/")
+    }
+
+    assert run_by_the_jobs, "no test paths found in the Tier 3 platform jobs"
+    assert {path.decode() for path in TIER3_PLATFORM_TESTS} == run_by_the_jobs
+    assert all(is_tier3_platform_related([path.encode()]) for path in run_by_the_jobs)
+
+
+def test_tier2_runs_on_macos_after_merge_only_and_keeps_its_required_name() -> None:
+    jobs = _load("ci.yml")["jobs"]
+
+    for job_id in AFTER_MERGE_ONLY_CI_JOBS:
+        job = jobs[job_id]
+        # The job is skipped on pull requests, not removed: a skipped job still
+        # reports, so the required check of the same name does not block a merge.
+        assert job["name"] == REQUIRED_CI_JOBS[job_id]
+        assert job["if"] == AFTER_MERGE_ONLY_IF
+        # The classifier only runs on pull requests, where this job never runs.
+        assert "needs" not in job
+
+    # The one Tier 2 test that only runs on macOS keeps running on pull requests.
+    assert (
+        "tests/embedding/test_catalog.py::TestCatalogPersistence::test_catalog_io_supports_root_owned_tmp_alias"
+        in _runs(jobs["tier3-macos"])
+    )
+    assert jobs["tier3-macos"]["if"] == TIER3_PLATFORM_IF
+
+
+def test_full_lane_keeps_the_existing_commands_and_runners() -> None:
+    jobs = _load("ci.yml")["jobs"]
+
+    assert jobs["test-python-313"]["runs-on"] == "ubuntu-latest"
+    assert "uv run pytest -q" in _runs(jobs["test-python-313"])
+    assert jobs["test-python-314"]["runs-on"] == "ubuntu-latest"
+    assert "uv sync --all-extras --locked --python 3.14" in _runs(jobs["test-python-314"])
+    assert "uv run pytest -q" in _runs(jobs["test-python-314"])
+    assert jobs["tier2-macos"]["runs-on"] == "macos-latest"
+    assert jobs["tier2-windows"]["runs-on"] == "windows-latest"
+    assert "tests/embedding" in _runs(jobs["tier2-macos"])
+    assert "tests/embedding" in _runs(jobs["tier2-windows"])
+    assert "tests/test_harbor_runner_status.py" in _runs(jobs["tier2-windows"])
+    assert jobs["tier3-macos"]["runs-on"] == "macos-latest"
+    assert "tests/test_tier3_progress.py" in _runs(jobs["tier3-macos"])
+    assert jobs["native-windows-local-mode"]["runs-on"] == "windows-latest"
+    assert "tests/test_harbor_local_mode.py" in _runs(jobs["native-windows-local-mode"])
+    assert jobs["rhel8-security-install"]["container"] == "rockylinux/rockylinux:8.10"
+    assert "uv build --wheel" in _runs(jobs["rhel8-security-install"])
+    assert "twine==6.2.0" in _runs(jobs["package"])
+
+
+def test_html_parser_compatibility_keeps_old_python_versions_on_a_supported_runner() -> None:
+    job = _load("ci.yml")["jobs"]["html-parser-compatibility"]
+
+    # setup-python publishes these older patch builds for Ubuntu 24.04, not 26.04.
+    assert job["runs-on"] == "ubuntu-24.04"
+    python_step = next(step for step in job["steps"] if _action_repository(step.get("uses", "")) == "actions/setup-python")
+    assert python_step["with"]["python-version"].split() == ["3.12.11", "3.13.5"]
+
+
+def test_security_keeps_gitleaks_always_on_and_skips_only_nonessential_jobs() -> None:
+    security = _load("security.yml")
+    jobs = security["jobs"]
+
+    _assert_no_path_filter(security)
+    assert security["concurrency"] == PR_CONCURRENCY
+    assert "if" not in jobs["gitleaks"]
+    assert "needs" not in jobs["gitleaks"]
+    assert jobs["classify-changes"]["if"] == "${{ github.event_name == 'pull_request' }}"
+    assert jobs["classify-changes"]["outputs"]["docs_only"] == "${{ steps.changes.outputs.docs_only }}"
+    assert jobs["classify-changes"]["steps"][0]["with"]["persist-credentials"] == "false"
+    classifier_run = jobs["classify-changes"]["steps"][1]["run"]
+    assert 'git show "$BASE_SHA:scripts/classify_ci_changes.py"' in classifier_run
+    assert 'python3 "$classifier"' in classifier_run
+    assert 'echo "docs_only=false" >> "$GITHUB_OUTPUT"' in classifier_run
+    assert "python3 scripts/classify_ci_changes.py" not in classifier_run
+
+    dependency_if = " ".join(jobs["dependency-review"]["if"].split())
+    codeql_if = " ".join(jobs["codeql"]["if"].split())
+    for job_id in ("dependency-review", "codeql"):
+        assert jobs[job_id]["needs"] == "classify-changes"
+        assert "!cancelled()" in jobs[job_id]["if"]
+        assert "always()" not in jobs[job_id]["if"]
+        assert "needs.classify-changes.outputs.docs_only != 'true'" in jobs[job_id]["if"]
+    assert "github.event_name == 'pull_request'" in dependency_if
+    assert "github.event.repository.private == false" in dependency_if
+    assert "vars.ENABLE_GITHUB_ADVANCED_SECURITY == 'true'" in dependency_if
+    assert "github.event.repository.private == false" in codeql_if
+    assert "vars.ENABLE_GITHUB_ADVANCED_SECURITY == 'true'" in codeql_if
+
+
+def test_gitleaks_single_value_allowlists_are_exactly_scoped() -> None:
+    config = tomllib.loads(GITLEAKS_CONFIG.read_text(encoding="utf-8"))
+    allowlists = {entry["description"]: entry for entry in config["allowlists"]}
+
+    expected = {
+        "Synthetic NVIDIA Build token used by streaming redaction tests": (
+            "^Ab1Cd2Ef3Gh4Ij5Kl6Mn7Op8$",
+            r"^tests/test_harbor_local_mode\.py$",
+        ),
+        "Synthetic main-container values used by Docker isolation tests": (
+            r"^main-(persistent|task|scoped)-secret-[0-9]{5}$",
+            r"^tests/test_harbor_secure_docker_environment\.py$",
+        ),
+        "Synthetic cwsandbox API key used by Harbor environment contract tests": (
+            "^cw-key-123456$",
+            r"^tests/test_harbor_environment_contract\.py$",
+        ),
+        "Bedrock model ID that follows a credential name in SkillSpector bridge tests": (
+            r"^us\.anthropic\.claude-opus-5$",
+            r"^tests/validators/test_security\.py$",
+        ),
+        "Claude Opus 5.5 Bedrock model ID that follows a credential name in SkillSpector bridge tests": (
+            r"^us\.anthropic\.claude-opus-5-5$",
+            r"^tests/validators/test_security\.py$",
+        ),
+        "Bedrock model ID in the merge-leftover SkillSpector bridge test copy from commit e8aa35d6a": (
+            r"^us\.anthropic\.claude-opus-5$",
+            r"^tests/validators/test_security\.py\.orig$",
+        ),
+    }
+    for description, (regex, path) in expected.items():
+        entry = allowlists[description]
+        assert entry == {
+            "description": description,
+            "condition": "AND",
+            "targetRules": ["generic-api-key"],
+            "regexes": [regex],
+            "paths": [path],
+        }
+
+
+def test_gitleaks_curl_auth_allowlists_are_exactly_scoped() -> None:
+    # Fake `curl -u user:password` fixtures stay in history, so each allowlist
+    # must name one credential value and one test file for the curl rule only.
+    config = tomllib.loads(GITLEAKS_CONFIG.read_text(encoding="utf-8"))
+    entries = [entry for entry in config["allowlists"] if "curl-auth-user" in entry.get("targetRules", [])]
+
+    assert entries
+    for entry in entries:
+        assert set(entry) == {"description", "condition", "targetRules", "regexes", "paths"}
+        assert entry["condition"] == "AND"
+        assert entry["targetRules"] == ["curl-auth-user"]
+        [regex] = entry["regexes"]
+        [path] = entry["paths"]
+        assert regex.startswith("^") and regex.endswith("$")
+        assert ".*" not in regex
+        assert re.fullmatch(r"\^tests/[\w/]+\\\.py\$", path)
+
+
+def test_gitleaks_uses_event_specific_full_history_scopes() -> None:
+    job = _load("security.yml")["jobs"]["gitleaks"]
+    checkout = next(step for step in job["steps"] if _is_checkout_step(step))
+    verify = next(step for step in job["steps"] if step.get("name") == "Verify full Git checkout")
+    scan = next(step for step in job["steps"] if step.get("name") == "Scan Git history")
+
+    assert str(checkout["with"]["fetch-depth"]) == "0"
+    assert 'test "$(git rev-parse --is-shallow-repository)" = "false"' in verify["run"]
+    assert 'git rev-parse --verify "HEAD^{commit}"' in verify["run"]
+    assert (
+        "gitleaks:v8.30.0@sha256:691af3c7c5a48b16f187ce3446d5f194838f91238f27270ed36eef6359a574d9"
+        in scan["run"]
+    )
+    scan_run = scan["run"]
+    head_opts = "--full-history --diff-filter=tuxdb HEAD --"
+    audit_opts = "--full-history --all --diff-filter=tuxdb --"
+    assignments = re.findall(r'log_opts="([^"]+)"', scan_run)
+
+    assert assignments == [head_opts, audit_opts]
+    assert scan["shell"] == "bash"
+    assert "set -euo pipefail" in scan_run
+    assert 'case "$GITHUB_EVENT_NAME" in' in scan_run
+    assert re.search(
+        rf'pull_request\|push\)\s+log_opts="{re.escape(head_opts)}"\s+;;', scan_run
+    )
+    assert re.search(rf'\*\)\s+log_opts="{re.escape(audit_opts)}"\s+;;', scan_run)
+    assert '--log-opts="$log_opts"' in scan_run
+
+
+def test_dco_stays_unconditional_and_has_no_path_filter() -> None:
+    dco = _load("dco.yml")
+
+    _assert_no_path_filter(dco)
+    assert "if" not in dco["jobs"]["dco"]
+    assert "needs" not in dco["jobs"]["dco"]
+
+
+def test_non_pr_workflow_triggers_are_preserved() -> None:
+    ci = _load("ci.yml")
+    security = _load("security.yml")
+
+    assert ci["on"]["push"] == {"branches": ["main"]}
+    assert set(security["on"]) == {"pull_request", "push", "schedule", "workflow_dispatch"}
+    assert security["on"]["push"] == {"branches": ["main"]}
+    assert security["on"]["schedule"] == [{"cron": "23 7 * * 1"}]
+    assert "workflow_dispatch" in security["on"]
+
+
+def _is_local_reference(uses: str) -> bool:
+    """A same-repo composite action or reusable workflow, e.g. ``./.github/actions/x``.
+
+    GitHub always resolves these from the caller's own commit, so nothing about
+    them can float and there is no ``@ref`` syntax for one. A reference that is
+    both ``./``-prefixed and carries an ``@`` is therefore not this syntax --
+    treat it as a normal reference so it still has to satisfy the SHA-pin check.
+    """
+    return uses.startswith("./") and "@" not in uses
+
+
+def _local_reference_escapes_repo(uses: str) -> bool:
+    return ".." in Path(uses).parts
+
+
+def test_every_workflow_pins_every_action_to_a_commit() -> None:
+    for workflow_name in _workflow_names():
+        for uses in _all_uses(_load(workflow_name)):
+            if _is_local_reference(uses):
+                assert not _local_reference_escapes_repo(uses), f"{workflow_name}: {uses}"
+                continue
+            assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", uses), f"{workflow_name}: {uses}"
+
+
+def _uv_pins() -> list[tuple[str, str | None]]:
+    """Every place CI chooses a uv version, as ``(where, version)``.
+
+    ``version`` is ``None`` for a ``setup-uv`` step that names none, because that
+    step installs whatever uv is newest on the day it runs.
+    """
+    pins: list[tuple[str, str | None]] = []
+    for workflow_name in _workflow_names():
+        for step in _all_steps(_load(workflow_name)):
+            if _action_repository(step.get("uses", "")) == "astral-sh/setup-uv":
+                pins.append((f"{workflow_name}: setup-uv", step.get("with", {}).get("version")))
+    for path in [*sorted(WORKFLOWS.iterdir()), *sorted((ROOT / "ci" / "gitlab").glob("*.yml"))]:
+        if path.suffix not in {".yml", ".yaml"}:
+            continue
+        for found in re.findall(r"\buv==([^\s'\"\\]+)", path.read_text(encoding="utf-8")):
+            pins.append((f"{path.relative_to(ROOT)}: pip install", found))
+    # The hash-locked bootstrap behind the Tier 1 image and the privileged publisher.
+    requirements = ROOT / "ci" / "requirements"
+    for name in ("uv.in", "uv.txt"):
+        first = (requirements / name).read_text(encoding="utf-8").split(maxsplit=1)[0]
+        pinned = re.fullmatch(r"uv==(\S+)", first)
+        assert pinned, f"ci/requirements/{name} must start with an exact uv pin, not {first!r}"
+        pins.append((f"ci/requirements/{name}", pinned.group(1)))
+    return pins
+
+
+def _assert_one_uv_version(pins: Sequence[tuple[str, str | None]]) -> None:
+    assert pins, "no uv pins found"
+    unpinned = [where for where, version in pins if version is None]
+    assert not unpinned, f"pin uv with version:, not the latest release: {unpinned}"
+    where_by_version: dict[str | None, set[str]] = {}
+    for where, version in pins:
+        where_by_version.setdefault(version, set()).add(where)
+    assert len(where_by_version) == 1, "CI runs more than one uv version: " + "; ".join(
+        f"{version} in {sorted(places)}" for version, places in sorted(where_by_version.items())
+    )
+
+
+def test_every_ci_uv_install_uses_the_one_reviewed_version() -> None:
+    """GitHub jobs, GitLab jobs, the Tier 1 image and the publisher all run one uv.
+
+    Covers ``setup-uv`` steps (including an older action pin with no ``version:``),
+    ``pip install uv==...`` lines, and the hash-locked ``ci/requirements/uv.*``.
+    """
+    pins = _uv_pins()
+    _assert_one_uv_version(pins)
+    assert re.fullmatch(r"\d+\.\d+\.\d+", str(pins[0][1])), f"pin an exact version, not {pins[0][1]!r}"
+
+
+@pytest.mark.parametrize(
+    "pins",
+    [
+        pytest.param([("ci.yml: setup-uv", "0.13.8"), ("ci.yml: setup-uv", None)], id="unpinned-setup-uv"),
+        pytest.param([("ci.yml: setup-uv", "0.13.8"), ("ci/requirements/uv.in", "0.13.4")], id="mixed-versions"),
+        pytest.param([], id="no-pins"),
+    ],
+)
+def test_uv_version_guard_rejects_drift(pins: list[tuple[str, str | None]]) -> None:
+    with pytest.raises(AssertionError):
+        _assert_one_uv_version(pins)
+
+
+def test_every_workflow_does_not_persist_checkout_credentials() -> None:
+    checkout_steps = [
+        (workflow_name, step)
+        for workflow_name in _workflow_names()
+        for step in _all_steps(_load(workflow_name))
+        if _is_checkout_step(step)
+    ]
+    assert checkout_steps
+    for workflow_name, step in checkout_steps:
+        assert step.get("with", {}).get("persist-credentials") == "false", workflow_name
+
+
+def test_publish_docs_installs_the_fern_cli_from_the_committed_lockfile() -> None:
+    """The secret-bearing job runs a CLI whose whole tree was reviewed, not resolved.
+
+    ``npm ci`` reproduces ``fern/package-lock.json`` exactly -- every version and
+    integrity hash -- so nothing between the commit and the run can change what
+    executes next to ``FERN_TOKEN``.
+    """
+    job = _load("publish-docs.yml")["jobs"]["run"]
+    install_commands = [argv for step in job["steps"] for argv in _npm_commands(step.get("run", ""))]
+    assert install_commands == [REVIEWED_NPM_COMMAND], (
+        "publish-docs.yml must install the pinned Fern CLI with the reviewed command"
+    )
+
+    publish_step = next(step for step in job["steps"] if "fern generate" in step.get("run", ""))
+    assert "fern/node_modules/.bin/fern" in publish_step["run"], "run the installed CLI, not one from PATH"
+
+
+def test_workflows_declare_permissions_or_inherit_the_explicit_scan_caller() -> None:
+    """A job-level permissions: block overrides the workflow-level one, so check both.
+
+    The callable-only scanner inherits its explicit consumer permissions so
+    hosting can opt into OIDC without requiring that permission for basic scans.
+    All event-triggered workflows still declare their scope; no job uses write-all.
+    """
+    for workflow_name in _workflow_names():
+        workflow = _load(workflow_name)
+        if workflow_name == "evaluate-skills.yml":
+            assert set(workflow["on"]) == {"workflow_call"}
+            assert "permissions" not in workflow
+            assert all("permissions" not in job for job in workflow["jobs"].values())
+            for template in ("skill-checks.yml", "skill-checks-llm.yml"):
+                caller = yaml.load((ROOT / "ci/templates" / template).read_text(), Loader=yaml.BaseLoader)
+                assert caller["permissions"] == {"contents": "read"}
+                assert all("permissions" not in job for job in caller["jobs"].values())
+        else:
+            assert workflow.get("permissions") is not None, (
+                f"{workflow_name} inherits the repository default token scope"
+            )
+        for scope, permissions in [("workflow", workflow.get("permissions"))] + [
+            (f"job {job_id}", job["permissions"]) for job_id, job in workflow["jobs"].items() if "permissions" in job
+        ]:
+            assert permissions != "write-all", f"{workflow_name}: {scope}"
+
+
+# npm is not always the first word of a line: `cd fern && npm install`, `env npm
+# install` and `npm --prefix fern install` are all real installs that a
+# line-anchored pattern never sees. These guards therefore split each `run:`
+# block into the commands a shell would run and inspect each one's argv -- and
+# fail closed on any npm mention this parser cannot resolve to a plain
+# invocation, because a guard that silently sees nothing is worse than one that
+# is noisy.
+#
+# A mention is npm as a whole word, so `pnpm`, `npm-cache` and `--no-npm` stay
+# quiet. Inside `${...}`, though, `-`, `=`, `+`, `?` and `/` are the parameter
+# expansion operators that open a word the shell substitutes -- `${UNSET:-npm}
+# install` runs npm -- so inside the braces they delimit npm too.
+NPM_EXECUTABLE = re.compile(r"^(?:.*[/\\])?npm(?:\.cmd|\.exe|\.ps1)?$", re.IGNORECASE)
+NPM_MENTION = re.compile(
+    r"""(?:^|[\s'"`(;&|=]|\$\{[^}]*?[-=+?/])(?:[\w./\\-]*[/\\])?npm(?:\.cmd|\.exe|\.ps1)?(?=$|[\s'"`);&|}])""",
+    re.IGNORECASE,
+)
+SHELL_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+SHELL_OPERATOR = re.compile(r"&&|\|\||[;&|()]")
+SHELL_WRAPPERS = frozenset({"command", "env", "exec", "ionice", "nice", "setsid", "stdbuf", "sudo", "time"})
+SHELL_KEYWORDS = frozenset({"!", "do", "elif", "else", "if", "then", "until", "while", "{"})
+
+
+def _logical_lines(run: str) -> list[str]:
+    """``run`` split into lines, with backslash continuations joined back up."""
+    return re.sub(r"\\\n", " ", run).splitlines()
+
+
+def _shell_segments(line: str) -> list[str]:
+    """``line`` cut into command texts at every *unquoted* shell operator.
+
+    Quoting is tracked by hand rather than left to ``shlex``'s lexer, because
+    the lexer answers two questions wrongly for this job. It ends a word at any
+    ``#``, so the URL in ``curl https://host/doc#install && npm install`` would
+    swallow the install; and once a token is quoted it no longer says whether
+    that token was an operator, so an argument like ``";"`` would cut the
+    command in half. Both mistakes end with an npm command going unguarded,
+    which is the failure this parser exists to prevent.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    quote = ""
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            current.append(char)
+            quote = "" if char == quote else quote
+            index += 1
+            continue
+        if char in "'\"":
+            quote = char
+            current.append(char)
+            index += 1
+            continue
+        if char == "\\" and index + 1 < len(line):
+            current.extend(line[index : index + 2])
+            index += 2
+            continue
+        if char == "#" and (not current or current[-1].isspace() or current[-1] in "(;&|"):
+            break  # A word-initial # opens a comment: the rest of the line is not a command.
+        operator = SHELL_OPERATOR.match(line, index)
+        if operator:
+            segments.append("".join(current))
+            current = []
+            index = operator.end()
+            continue
+        current.append(char)
+        index += 1
+    if quote:
+        raise ValueError(f"unbalanced {quote} quote")
+    segments.append("".join(current))
+    return [segment for segment in segments if segment.strip()]
+
+
+def _shell_commands(line: str) -> list[list[str]]:
+    """``line`` split into the separate commands a shell would run.
+
+    Raises ``ValueError`` on a line no shell could read either, e.g. one
+    holding an unbalanced quote; the callers decide what that means.
+    """
+    return [shlex.split(segment, comments=False) for segment in _shell_segments(line)]
+
+
+def _invoked_command(command: Sequence[str]) -> list[str]:
+    """``command`` with what stands between the shell and the program removed.
+
+    Environment assignments, wrappers such as ``env``, and the keywords that
+    open a compound statement all sit in front of a command that really does
+    run, so a guard that reads only the first word misses it.
+    """
+    argv = list(command)
+    while argv and (
+        SHELL_ASSIGNMENT.match(argv[0])
+        or argv[0] in SHELL_WRAPPERS
+        or argv[0] in SHELL_KEYWORDS
+        or argv[0].startswith("-")
+    ):
+        argv = argv[1:]
+    return argv
+
+
+def _npm_commands(run: str) -> list[list[str]]:
+    """Every npm invocation in a ``run:`` block, as its argv tokens.
+
+    Anything holding the word ``npm`` that does not come out of this as a plain
+    npm invocation -- a line the lexer cannot read, an install hidden inside
+    ``bash -c "..."``, a wrapper this parser does not model -- raises instead of
+    being skipped. Guards that quietly match nothing are the bug this replaces.
+    """
+    invocations: list[list[str]] = []
+    for line in _logical_lines(run):
+        try:
+            commands = _shell_commands(line)
+        except ValueError as error:
+            assert not NPM_MENTION.search(line), f"unreadable npm command line ({error}): {line.strip()}"
+            continue
+        for command in commands:
+            argv = _invoked_command(command)
+            if argv and NPM_EXECUTABLE.match(argv[0]):
+                invocations.append(argv)
+                continue
+            assert not any(NPM_MENTION.search(token) for token in command), (
+                f"npm invocation these guards cannot classify: {line.strip()}"
+            )
+    return invocations
+
+
+def test_npm_commands_sees_invocations_that_do_not_open_the_line() -> None:
+    """The forms a line-anchored pattern silently missed."""
+    assert _npm_commands("cd fern && npm install --ignore-scripts") == [["npm", "install", "--ignore-scripts"]]
+    assert _npm_commands("env npm install") == [["npm", "install"]]
+    assert _npm_commands("npm --prefix fern install") == [["npm", "--prefix", "fern", "install"]]
+    assert _npm_commands("CI=true npm ci") == [["npm", "ci"]]
+    assert _npm_commands("./node_modules/.bin/../../bin/npm ci") == [["./node_modules/.bin/../../bin/npm", "ci"]]
+    assert _npm_commands("npm ci --ignore-scripts; npm run build") == [
+        ["npm", "ci", "--ignore-scripts"],
+        ["npm", "run", "build"],
+    ]
+
+
+def test_npm_commands_recognizes_windows_case_insensitive_executable_names() -> None:
+    assert _npm_commands("NPM install --ignore-scripts") == [["NPM", "install", "--ignore-scripts"]]
+    assert _npm_commands("NpM.CmD ci --ignore-scripts") == [["NpM.CmD", "ci", "--ignore-scripts"]]
+    assert _npm_commands("npm.ps1 ci --ignore-scripts") == [["npm.ps1", "ci", "--ignore-scripts"]]
+
+
+def test_npm_commands_reads_quoting_and_comments_the_way_a_shell_does() -> None:
+    """Where the line ends and where an argument ends are both easy to get wrong.
+
+    A ``#`` inside a URL does not open a comment, a quoted ``;`` is an argument
+    rather than a command break, and a command inside ``if``/``then`` still runs.
+    Each mistake hides a real npm invocation from the guards below.
+    """
+    assert _npm_commands("curl https://host/doc#install && npm install") == [["npm", "install"]]
+    assert _npm_commands("npm ci --ignore-scripts # installs the pinned CLI") == [["npm", "ci", "--ignore-scripts"]]
+    assert _npm_commands("if [ -d fern ]; then npm ci --ignore-scripts; fi") == [["npm", "ci", "--ignore-scripts"]]
+
+    quoted = _npm_commands("npm ci --ignore-scripts ';' --no-ignore-scripts")
+    assert quoted == [["npm", "ci", "--ignore-scripts", ";", "--no-ignore-scripts"]]
+
+
+def test_npm_commands_ignores_npm_outside_a_command() -> None:
+    assert _npm_commands("# npm install is what this step replaces") == []
+    assert _npm_commands("uv run pytest") == []
+    assert _npm_commands("echo 'no npm-cache here' > /dev/null") == []
+    assert _npm_commands('echo "${NPM_TOKEN}" "${NPM_CONFIG_CACHE:-$HOME/.npm}" ${PM:-pnpm}') == []
+
+
+def test_npm_commands_fails_closed_on_forms_it_cannot_classify() -> None:
+    """An npm this parser cannot resolve must be loud, never skipped."""
+    for run in (
+        'bash -c "npm install"',
+        "sudo -u builder npm ci --ignore-scripts",
+        "xargs npm install --ignore-scripts",
+        'NPM_BIN=npm && "$NPM_BIN" ci --ignore-scripts',
+        "$(which npm) ci --ignore-scripts",
+        "npm ci --ignore-scripts 'unbalanced",
+    ):
+        with pytest.raises(AssertionError):
+            _npm_commands(run)
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        'NPM_BIN=${UNSET:-npm}; "$NPM_BIN" install',
+        "${UNSET:-npm} install",
+        '"${UNSET:-npm}" install',
+        "${UNSET-npm} install",
+        "${UNSET:=npm} install",
+        "${UNSET=npm} install",
+        "${SET:+npm} install",
+        "${UNSET:-/usr/bin/npm} install",
+        "${PM/p/npm} install",
+    ],
+)
+def test_npm_commands_fails_closed_on_npm_chosen_by_parameter_expansion(run: str) -> None:
+    """With ``UNSET`` unset, Bash runs ``${UNSET:-npm} install`` as ``npm install``.
+
+    Which word the expansion yields depends on the runner's environment, so
+    the guard cannot classify it -- and must say so rather than see nothing.
+    """
+    with pytest.raises(AssertionError, match="cannot classify"):
+        _npm_commands(run)
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        "npm install --package-lock-only --ignore-scripts",
+        "npm ci --ignore-scripts --omit=optional",
+        "npm ci --prefix fern --ignore-scripts --omit=optional --no-omit",
+        "npm exec --yes --ignore-scripts --package-lock-only install",
+        "npm ci -- --ignore-scripts",
+        "npm ci --prefix fern --ignore-scripts --no-ignore-s --omit=optional",
+        "npm cit --prefix fern --ignore-scripts --omit=optional",
+        'NPM_BIN=${UNSET:-npm}; "$NPM_BIN" install',
+    ],
+)
+def test_unreviewed_npm_commands_fail_the_workflow_guard(
+    run: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "probe.yml").write_text(
+        yaml.safe_dump({"jobs": {"probe": {"steps": [{"run": run}]}}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(sys.modules[__name__], "WORKFLOWS", tmp_path)
+
+    with pytest.raises(AssertionError):
+        test_every_workflow_uses_only_the_reviewed_npm_command()
+
+
+def test_every_workflow_uses_only_the_reviewed_npm_command() -> None:
+    """The reviewed lockfile install is the only npm command in workflows.
+
+    npm accepts option abbreviations, aliases, and a changing command grammar.
+    An exact argv comparison keeps those forms from silently broadening what
+    runs in a workflow. Any new npm use needs explicit review here.
+    """
+    for workflow_name in _workflow_names():
+        for step in _all_steps(_load(workflow_name)):
+            for argv in _npm_commands(step.get("run", "")):
+                assert argv == REVIEWED_NPM_COMMAND, f"{workflow_name}: unreviewed npm command: {' '.join(argv)}"
+
+
+def test_the_pinned_fern_cli_version_matches_the_fern_config() -> None:
+    """The Fern config, manifest, and lockfile describe one reviewed CLI tree.
+
+    If they drift, docs may be validated or published with a different CLI or
+    additional packages that were not reviewed for the token-bearing job.
+    """
+    manifest = json.loads((ROOT / "fern" / "package.json").read_text(encoding="utf-8"))
+    fern_config = json.loads((ROOT / "fern" / "fern.config.json").read_text(encoding="utf-8"))
+    lockfile = json.loads((ROOT / "fern" / "package-lock.json").read_text(encoding="utf-8"))
+
+    declared = manifest["dependencies"]["fern-api"]
+    assert declared == fern_config["version"], "fern/package.json and fern/fern.config.json disagree"
+    assert re.fullmatch(r"\d+\.\d+\.\d+", declared), f"pin an exact version, not {declared!r}"
+    assert manifest["dependencies"] == {"fern-api": declared}, "review new direct Fern dependencies"
+    root_package = lockfile["packages"][""]
+    assert root_package["dependencies"] == manifest["dependencies"], "lockfile root is stale"
+    for dependency_group in ("devDependencies", "optionalDependencies", "peerDependencies"):
+        assert not manifest.get(dependency_group), f"review new {dependency_group} in the Fern manifest"
+        assert not root_package.get(dependency_group), f"review new {dependency_group} in the Fern lockfile"
+    assert lockfile["packages"]["node_modules/fern-api"]["version"] == declared, "lockfile is stale"
+    for path, package in lockfile["packages"].items():
+        if not path:
+            continue
+        assert package.get("resolved", "").startswith("https://registry.npmjs.org/"), path
+        assert package.get("integrity", "").startswith("sha512-"), path
+
+
+@pytest.mark.parametrize("mutation", ["extra_dependency", "root_drift", "missing_integrity"])
+def test_fern_pin_guard_rejects_unreviewed_dependency_changes(
+    mutation: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_fern = ROOT / "fern"
+    isolated_fern = tmp_path / "fern"
+    isolated_fern.mkdir()
+    for name in ("package.json", "package-lock.json", "fern.config.json"):
+        (isolated_fern / name).write_bytes((source_fern / name).read_bytes())
+
+    manifest_path = isolated_fern / "package.json"
+    lockfile_path = isolated_fern / "package-lock.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    lockfile = json.loads(lockfile_path.read_text(encoding="utf-8"))
+    if mutation == "extra_dependency":
+        manifest["dependencies"]["extra-package"] = "1.0.0"
+    elif mutation == "root_drift":
+        lockfile["packages"][""]["dependencies"]["fern-api"] = "0.0.0"
+    else:
+        del lockfile["packages"]["node_modules/fern-api"]["integrity"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    lockfile_path.write_text(json.dumps(lockfile), encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "ROOT", tmp_path)
+
+    with pytest.raises(AssertionError):
+        test_the_pinned_fern_cli_version_matches_the_fern_config()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Package smoke runs in Ubuntu Bash.")
+@pytest.mark.parametrize("command_exit", [0, 7])
+def test_package_smoke_preserves_failed_command_diagnostics(tmp_path: Path, command_exit: int) -> None:
+    package = _load("ci.yml")["jobs"]["package"]
+    step = next(step for step in package["steps"] if step.get("name", "").startswith("Install and smoke-test"))
+    helper = step["run"].split('\nwheel="', 1)[0]
+    program = (
+        "import os, sys; assert os.environ['SMOKE_TEST_FLAG'] == 'enabled'; "
+        f"print('smoke diagnostic'); print('smoke stderr', file=sys.stderr); sys.exit({command_exit})"
+    )
+    command = [sys.executable, "-c", program]
+    invocation = "SMOKE_TEST_FLAG=enabled smoke_cli 'Test command (Python 3.12)' " + shlex.join(command)
+    script = "set -e\nRUNNER_TEMP=" + shlex.quote(str(tmp_path)) + "\n" + helper + "\n" + invocation
+
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+
+    assert result.returncode == command_exit
+    assert result.stderr == ""
+    assert not list(tmp_path.glob("skillevaluator-smoke.*"))
+    if command_exit:
+        assert "Test command (Python 3.12) failed (exit 7)" in result.stdout
+        assert "smoke diagnostic" in result.stdout
+        assert "smoke stderr" in result.stdout
+    else:
+        assert result.stdout == ""

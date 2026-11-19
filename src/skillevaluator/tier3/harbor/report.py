@@ -1,0 +1,1439 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Harbor findings report — surfaces actionable insights from reward.json details.
+
+Generates a Rich panel showing what failed, why, and LLM-generated suggestions
+for skill developers.  Called after ``_display_harbor_results`` in the CLI.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+from pathlib import Path
+from typing import Any
+
+from skillevaluator.evaluation.tier3_findings import TRIAL_PASS_THRESHOLD
+from skillevaluator.evidence import evidence_ref_identity
+from skillevaluator.tier3.eval_core.llm_judge import _ACCURACY_DEDUCTION_SENTENCES, _redact_configured_credentials
+from skillevaluator.tier3.harbor import report_data
+from skillevaluator.tier3.harbor.metrics import (
+    DEFAULT_METRICS,
+    MAX_CUSTOM_METRICS,
+    METRIC_DESCRIPTIONS,
+    METRIC_DISPLAY,
+    METRIC_QUESTIONS,
+    extract_custom_metrics,
+    metric_set_for_reward,
+    metric_value,
+)
+from skillevaluator.tier3.output_provenance import write_output_file_atomically
+from skillevaluator.utils.redaction import redact_sensitive_data, redact_sensitive_text
+
+logger = logging.getLogger(__name__)
+
+DISPLAY_METRICS = DEFAULT_METRICS
+FINDING_OK_THRESHOLD = TRIAL_PASS_THRESHOLD
+FINDING_CRITICAL_THRESHOLD = 0.4
+_MAX_FINDINGS = len(DEFAULT_METRICS) + MAX_CUSTOM_METRICS
+_MAX_FINDING_REASONS = 4
+_MAX_FINDING_EVIDENCE_REFS = 3
+_MAX_SUGGESTIONS = 4
+_MAX_FINDING_TEXT_CHARS = 2048
+_EVIDENCE_REF_TEXT_LIMITS = {
+    "source": 256,
+    "json_pointer": 512,
+    "evidence_id": 512,
+    "kind": 64,
+    "path": 512,
+    "label": 256,
+    "excerpt": 512,
+}
+
+
+def _bounded_json_text(value: Any, *, max_encoded_bytes: int) -> str:
+    """Bound text by its ensure-ascii JSON representation, not Python characters."""
+    text = str(value or "")
+    if len(json.dumps(text, ensure_ascii=True).encode("utf-8")) - 2 <= max_encoded_bytes:
+        return text
+    suffix = "...<truncated>"
+    low, high = 0, len(text)
+    while low < high:
+        midpoint = (low + high + 1) // 2
+        candidate = text[:midpoint] + suffix
+        encoded_size = len(json.dumps(candidate, ensure_ascii=True).encode("utf-8")) - 2
+        if encoded_size <= max_encoded_bytes:
+            low = midpoint
+        else:
+            high = midpoint - 1
+    return text[:low] + suffix if low else suffix[:max_encoded_bytes]
+
+
+_REPORT_REASON_LIMIT = 512
+
+_METRIC_LABELS = {
+    "security": "SECURITY (unsafe operations, secret leakage, unauthorized access)",
+    "skill_execution": "SKILL EXECUTION (activation, script run, workflow order, error recovery)",
+    "skill_efficiency": "EFFICIENCY (routing, tool call productivity)",
+    "accuracy": "ACCURACY (factual correctness, 5-criterion rubric)",
+    "goal_accuracy": "GOAL ACCURACY (did agent achieve the user's goal?)",
+    "behavior_check": "BEHAVIOR CHECK (expected workflow adherence)",
+}
+
+
+def _findings_artifact_path(results_dir: Path, agent: str) -> Path | None:
+    """Return a findings path only when its parent remains inside results_dir."""
+    artifact = results_dir / agent / "findings.json"
+    try:
+        artifact.absolute().relative_to(results_dir.absolute())
+        artifact.parent.resolve().relative_to(results_dir.resolve())
+    except (OSError, RuntimeError, ValueError):
+        logger.warning("Refusing findings artifact outside results directory: %s", artifact)
+        return None
+    if artifact.parent.is_symlink():
+        logger.warning("Refusing findings artifact in symlinked agent directory: %s", artifact)
+        return None
+    return artifact
+
+
+def _remove_stale_findings_artifact(results_dir: Path, agent: str) -> None:
+    artifact = _findings_artifact_path(results_dir, agent)
+    if artifact is None:
+        return
+    try:
+        if artifact.is_symlink() or artifact.is_file():
+            artifact.unlink()
+    except OSError as e:
+        logger.warning("Failed to remove stale findings artifact %s: %s", artifact, e)
+
+
+def _load_trial_rewards(
+    results_dir: Path,
+    agent: str,
+    loaded_agents: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Load bounded, contained with-skill rewards for one agent."""
+    agents = loaded_agents if loaded_agents is not None else report_data.load_agent_data(results_dir)
+    agent_data = agents.get(agent)
+    rewards = agent_data.get("rewards") if isinstance(agent_data, dict) else None
+    return [reward for reward in rewards if isinstance(reward, dict)] if isinstance(rewards, list) else []
+
+
+def _pick_best_agent(
+    agents_data: dict[str, dict[str, Any]],
+    persisted_agents: dict[str, dict[str, Any]] | None = None,
+) -> str:
+    """Select the same best agent identity as the canonical Tier 3 report."""
+    from skillevaluator.evaluation.tier3_report import _canonical_agent_rank_from_info
+    from skillevaluator.tier3.harbor.baseline_timeouts import kept_with_failed_baseline
+
+    # Keyed by whether the agent was kept with a failed baseline, which the
+    # canonical report ranks below every agent with a complete baseline.
+    best: dict[bool, tuple[tuple[float, float], str]] = {}
+    # Agents skipped here that were not kept with a failed baseline, for
+    # example a complete agent that never activated the skill. The canonical
+    # report ranks any of them it can rank above every tolerated agent, so a
+    # tolerated agent must not stand in for them.
+    skipped_complete: list[dict[str, Any]] = []
+    scored_metric_sets: set[frozenset[str]] = set()
+    for agent in sorted(agents_data):
+        data = agents_data[agent]
+        persisted = persisted_agents.get(agent) if isinstance(persisted_agents, dict) else None
+        ranking_data = persisted if isinstance(persisted, dict) else data
+        tolerated = kept_with_failed_baseline(ranking_data)
+        if not _findings_eligible(data) or not _findings_eligible(ranking_data):
+            if not tolerated:
+                skipped_complete.append(ranking_data)
+            continue
+        standard_metrics = report_data.metrics_for_condition(ranking_data, "with_skill")
+        with_scores = ranking_data.get("with_skill")
+        if standard_metrics and (
+            not isinstance(with_scores, dict)
+            or any(metric_value(with_scores, metric) is None for metric in standard_metrics)
+        ):
+            if not tolerated:
+                skipped_complete.append(ranking_data)
+            continue
+        rank = _canonical_agent_rank_from_info(ranking_data)
+        if rank is None:
+            continue
+        # Overall scores from different standard metric sets cannot be ranked
+        # against each other. Custom-only agents rank by their grader's overall.
+        if standard_metrics:
+            scored_metric_sets.add(frozenset(standard_metrics))
+        if len(scored_metric_sets) > 1:
+            return ""
+        if tolerated not in best or rank > best[tolerated][0]:
+            best[tolerated] = (rank, agent)
+    if False in best:
+        return best[False][1]
+    # Like the canonical report, rank every complete agent before any tolerated
+    # one. When the canonical best agent is a complete agent skipped here,
+    # there are no findings to show.
+    if True not in best or any(_canonical_agent_rank_from_info(data) is not None for data in skipped_complete):
+        return ""
+    return best[True][1]
+
+
+def _kept_with_failed_baseline(
+    agent: str,
+    agents_data: dict[str, dict[str, Any]],
+    persisted_agents: dict[str, dict[str, Any]] | None,
+) -> bool:
+    """Return whether the in-memory or persisted data of ``agent`` keeps it with a failed baseline."""
+    from skillevaluator.tier3.harbor.baseline_timeouts import kept_with_failed_baseline
+
+    persisted = persisted_agents.get(agent) if isinstance(persisted_agents, dict) else None
+    return any(
+        isinstance(data, dict) and kept_with_failed_baseline(data) for data in (agents_data.get(agent), persisted)
+    )
+
+
+def _findings_eligible(agent_data: dict[str, Any]) -> bool:
+    """Return whether persisted execution truth permits quality findings."""
+    activation = agent_data.get("skill_activation")
+    if isinstance(activation, dict) and activation.get("status") == "never_activated":
+        return False
+    conditions = agent_data.get("conditions")
+    if not isinstance(conditions, dict) or "with_skill" not in conditions:
+        return agent_data.get("execution_status") == "succeeded"
+    with_skill = conditions.get("with_skill")
+    return isinstance(with_skill, dict) and with_skill.get("execution_status") == "succeeded"
+
+
+def _agent_model_for_display(
+    agent: str,
+    harbor_result: dict[str, Any],
+    agents_data: dict[str, dict[str, Any]],
+) -> str:
+    """Return the resolved user-facing model for an agent when available."""
+    run_config = harbor_result.get("run_config", {})
+    run_config_agents = run_config.get("agents", {}) if isinstance(run_config, dict) else {}
+    meta = run_config_agents.get(agent, {}) if isinstance(run_config_agents, dict) else {}
+    if isinstance(meta, dict):
+        model = str(meta.get("model") or "").strip()
+        if model:
+            return model
+
+    agent_data = agents_data.get(agent, {})
+    if isinstance(agent_data, dict):
+        model = str(agent_data.get("model") or "").strip()
+        if model:
+            return model
+    return ""
+
+
+def _agent_model_label(
+    agent: str,
+    harbor_result: dict[str, Any],
+    agents_data: dict[str, dict[str, Any]],
+) -> str:
+    model = _agent_model_for_display(agent, harbor_result, agents_data)
+    return f"{agent} / {model}" if model else agent
+
+
+def _detail_for_finding(reward: dict[str, Any], metric: str) -> Any:
+    """Return one metric's detail without copying an untrusted details map."""
+    custom_details = reward.get("custom_details")
+    if metric not in DISPLAY_METRICS and isinstance(custom_details, dict) and metric in custom_details:
+        return custom_details[metric]
+    details = reward.get("details")
+    if isinstance(details, dict) and metric in details:
+        return details[metric]
+    if isinstance(custom_details, dict):
+        return custom_details.get(metric)
+    return None
+
+
+def _finding_metric_names(rewards: list[dict[str, Any]]) -> list[str]:
+    custom_names: set[str] = set()
+    for reward in rewards:
+        for name in extract_custom_metrics(reward):
+            custom_names.add(name)
+            if len(custom_names) >= MAX_CUSTOM_METRICS:
+                break
+        if len(custom_names) >= MAX_CUSTOM_METRICS:
+            break
+    return list(DISPLAY_METRICS) + sorted(custom_names.difference(DISPLAY_METRICS))
+
+
+def _metric_score(reward: dict[str, Any], metric: str) -> float | None:
+    if metric in DISPLAY_METRICS:
+        if metric not in metric_set_for_reward(reward)[1]:
+            return None
+        return metric_value(reward, metric)
+    return extract_custom_metrics(reward).get(metric)
+
+
+def _metric_label(metric: str) -> str:
+    if metric not in DISPLAY_METRICS:
+        return f"custom: {metric}"
+    return _METRIC_LABELS.get(
+        metric,
+        f"{METRIC_DISPLAY.get(metric, metric).upper()} ({METRIC_DESCRIPTIONS.get(metric, '')})",
+    )
+
+
+def _normalize_evidence_refs(raw_refs: Any) -> list[Any]:
+    if isinstance(raw_refs, list):
+        return raw_refs
+    if isinstance(raw_refs, dict | str):
+        return [raw_refs]
+    return []
+
+
+def _extract_findings(
+    rewards: list[dict[str, Any]],
+    *,
+    canonical_scores: dict[str, Any] | None = None,
+    rewards_complete: bool = True,
+) -> list[dict[str, Any]]:
+    """Extract actionable findings from reward.json details across trials."""
+    from skillevaluator.tier3.eval_core.atif_helpers import _METRIC_EVIDENCE_REF_METRICS
+
+    findings: list[dict[str, Any]] = []
+    ref_lookup = _build_evidence_ref_lookup(rewards)
+
+    metric_names = _finding_metric_names(rewards)
+    aggregated: dict[str, list[list[dict[str, Any]]]] = {m: [] for m in metric_names}
+    logical_scores: dict[str, list[float]] = {m: [] for m in metric_names}
+    for reward_group in report_data.logical_trial_reward_groups(rewards):
+        for metric in metric_names:
+            metric_values = [score for reward in reward_group if (score := _metric_score(reward, metric)) is not None]
+            trial_details = []
+            for reward in reward_group:
+                score = _metric_score(reward, metric)
+                detail = _detail_for_finding(reward, metric)
+                if detail is not None and (metric not in DISPLAY_METRICS or score is not None):
+                    trial_details.append(
+                        {
+                            "score": score,
+                            "detail": detail,
+                            "entry_id": reward.get("entry_id", "?"),
+                            "reward": reward,
+                        }
+                    )
+            if metric_values:
+                logical_scores[metric].append(round(sum(metric_values) / len(metric_values), 4))
+            if trial_details:
+                aggregated[metric].append(trial_details)
+
+    for metric in metric_names:
+        trial_groups = aggregated[metric]
+        if not trial_groups:
+            continue
+
+        trials = [trial for trial_group in trial_groups for trial in trial_group]
+        canonical_score = _metric_score(canonical_scores or {}, metric)
+        if canonical_score is not None:
+            avg_score = canonical_score
+        elif rewards_complete and logical_scores[metric]:
+            avg_score = round(sum(logical_scores[metric]) / len(logical_scores[metric]), 4)
+        else:
+            continue
+        label = _metric_label(metric)
+
+        affected_trials = [
+            trial
+            for trial in trials
+            if trial["score"] is not None
+            and (trial["score"] >= FINDING_OK_THRESHOLD) == (avg_score >= FINDING_OK_THRESHOLD)
+        ]
+        metric_refs = []
+        for t in affected_trials:
+            d = t["detail"]
+            if isinstance(d, dict):
+                for raw_ref in _normalize_evidence_refs(d.get("evidence_refs")):
+                    if ref := _trial_evidence_ref(raw_ref, t["reward"], multi_trial=len(rewards) > 1):
+                        metric_refs.append(ref)
+        _refs = _recorded_evidence_refs(metric_refs, ref_lookup)
+
+        if avg_score >= FINDING_OK_THRESHOLD:
+            reasons = _collect_pass_reasons(metric, affected_trials)
+            findings.append(
+                {
+                    "metric": metric,
+                    "label": label,
+                    "severity": "ok",
+                    "score": avg_score,
+                    "reasons": reasons[:2],
+                    "evidence_refs": _refs[:_MAX_FINDING_EVIDENCE_REFS],
+                }
+            )
+        else:
+            reasons = _collect_fail_reasons(metric, affected_trials)
+            severity = "critical" if avg_score < FINDING_CRITICAL_THRESHOLD else "warning"
+            finding = {
+                "metric": metric,
+                "label": label,
+                "severity": severity,
+                "score": avg_score,
+                "reasons": reasons[:4],
+                "evidence_refs": _refs[:_MAX_FINDING_EVIDENCE_REFS],
+            }
+            if metric in _METRIC_EVIDENCE_REF_METRICS and not finding["evidence_refs"]:
+                finding["evidence_unavailable_reason"] = _evidence_unavailable_reason(trials)
+            findings.append(finding)
+
+    return findings
+
+
+def _render_findings_body(findings: list[dict[str, Any]]) -> Any:
+    """Render findings list into a Rich Text body (icon/label/score/question/reasons/evidence)."""
+    from rich.text import Text
+
+    from skillevaluator.utils.rich_markup import strip_terminal_controls
+
+    body = Text()
+    body.append(
+        f"  Advisory metric severity: ok ≥ {FINDING_OK_THRESHOLD:.2f} · "
+        f"warning {FINDING_CRITICAL_THRESHOLD:.2f}\u2013<{FINDING_OK_THRESHOLD:.2f} · "
+        f"critical < {FINDING_CRITICAL_THRESHOLD:.2f}. "
+        "Dimension verdicts use pass ≥ 0.50.\n\n",
+        style="dim",
+    )
+    for finding in findings:
+        if finding["severity"] == "critical":
+            icon = "⚠ CRITICAL"
+            style = "bold red"
+        elif finding["severity"] == "warning":
+            icon = "⚠ WARNING"
+            style = "bold yellow"
+        else:
+            icon = "✓"
+            style = "bold green"
+
+        body.append(f"  {icon}: ", style=style)
+        body.append(f"{strip_terminal_controls(str(finding['label']))} ", style="bold white")
+        body.append(f"{finding['score']:.2f}\n", style=style)
+        question = METRIC_QUESTIONS.get(finding["metric"])
+        if question:
+            body.append(f"     {question}\n", style="dim")
+
+        reason_style = "dim green" if finding["severity"] == "ok" else "dim"
+        for reason in finding["reasons"]:
+            body.append(f"    → {strip_terminal_controls(reason)}\n", style=reason_style)
+
+        for ref in (finding.get("evidence_refs") or [])[:3]:
+            ref_text = ref if isinstance(ref, str) else _compact_evidence_ref(ref)
+            body.append(f"      evidence: {strip_terminal_controls(ref_text)}\n", style="dim")
+        if finding["severity"] != "ok" and finding.get("evidence_unavailable_reason"):
+            body.append(
+                f"      evidence: unavailable — {strip_terminal_controls(str(finding['evidence_unavailable_reason']))}\n",
+                style="dim",
+            )
+
+        body.append("\n")
+    return body
+
+
+def _bounded_report_reason(value: Any) -> str:
+    """Coerce legacy/custom artifact values into bounded display text."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value.strip()
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError, RecursionError):
+            text = str(value)
+        text = text.strip()
+    text = redact_sensitive_text(_redact_configured_credentials(text))
+    if len(text) > _REPORT_REASON_LIMIT:
+        text = text[: _REPORT_REASON_LIMIT - 3] + "..."
+    return text
+
+
+def _dedupe_report_reasons(reasons: list[Any]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in reasons:
+        reason = _bounded_report_reason(value)
+        if not reason:
+            continue
+        key = reason[:80].lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(reason)
+    return deduped
+
+
+def _applicable_accuracy_criteria(detail: dict[str, Any]) -> dict[Any, Any]:
+    """Return accuracy verdicts minus criteria the verifier excluded from the score."""
+    criteria = detail.get("criteria")
+    if not isinstance(criteria, dict):
+        return {}
+    raw_excluded = detail.get("excluded_criteria")
+    excluded = {name for name in raw_excluded if isinstance(name, str)} if isinstance(raw_excluded, list) else set()
+    return {name: verdict for name, verdict in criteria.items() if name not in excluded}
+
+
+def _collect_fail_reasons(metric: str, trials: list[dict[str, Any]]) -> list[str]:
+    """Extract human-readable failure reasons from trial details."""
+    reasons: list[Any] = []
+
+    for trial in trials:
+        detail = trial["detail"]
+        if not isinstance(detail, dict):
+            continue
+        trial_reason_start = len(reasons)
+
+        if metric == "behavior_check":
+            results = detail.get("results")
+            for result in results if isinstance(results, list) else []:
+                if not isinstance(result, dict) or result.get("passed") is not False:
+                    continue
+                if reason := _bounded_reason_text(result.get("reason")):
+                    reasons.append(reason)
+            declarative_checks = detail.get("declarative_checks")
+            if isinstance(declarative_checks, dict) and (
+                summary := _bounded_reason_text(declarative_checks.get("summary"))
+            ):
+                reasons.append(summary)
+
+        elif metric == "accuracy":
+            criteria = _applicable_accuracy_criteria(detail)
+            for crit, passed in criteria.items():
+                if not passed:
+                    reasons.append(_accuracy_criterion_failure_reason(crit))
+            if reason := _bounded_reason_text(detail.get("reason")):
+                reasons.append(reason)
+
+        elif metric in ("goal_accuracy", "security"):
+            if reason := _bounded_reason_text(detail.get("reason")):
+                reasons.append(reason)
+            findings = detail.get("findings")
+            for finding in findings if isinstance(findings, list) else []:
+                if isinstance(finding, str):
+                    if reason := _bounded_reason_text(finding):
+                        reasons.append(reason)
+                elif isinstance(finding, dict):
+                    message = _bounded_reason_text(finding.get("message") or finding.get("type"))
+                    attribution = _bounded_reason_text(finding.get("attribution"))
+                    explanation = _bounded_reason_text(finding.get("attribution_explanation"))
+                    if attribution:
+                        message = f"{message} | Attribution: {attribution.replace('_', ' ')}"
+                    if explanation:
+                        message = f"{message}. {explanation}"
+                    if message:
+                        reasons.append(message)
+            if completeness := _bounded_reason_text(detail.get("attribution_completeness")):
+                reasons.append(completeness)
+
+        elif metric == "skill_execution":
+            for check_name, check_data in detail.items():
+                if isinstance(check_data, dict) and not check_data.get("passed", True):
+                    reason = _bounded_reason_text(check_data.get("reason")) or (
+                        f"Check `{_bounded_reason_text(str(check_name).replace('_', ' '), max_len=480)}` "
+                        "did not pass; no reason was recorded"
+                    )
+                    if check_data.get("status") == "environment_invalid":
+                        reason = "[environment] " + reason
+                    reasons.append(reason)
+                if isinstance(check_data, dict) and check_name == "error_recovery":
+                    corrections = check_data.get("corrections")
+                    for corr in corrections if isinstance(corrections, list) else []:
+                        if not isinstance(corr, dict):
+                            continue
+                        fault = _bounded_reason_text(corr.get("fault")) or "unknown"
+                        err = _bounded_reason_text(corr.get("error"), max_len=100)
+                        reasons.append(f"[environment] {err}" if fault == "environment" else f"[{fault} fault] {err}")
+
+        elif metric == "skill_efficiency":
+            for check_name, check_data in detail.items():
+                if isinstance(check_data, dict) and not check_data.get("passed", True):
+                    reason = _bounded_reason_text(check_data.get("reason")) or (
+                        f"Check `{_bounded_reason_text(str(check_name).replace('_', ' '), max_len=480)}` "
+                        "did not pass; no reason was recorded"
+                    )
+                    reasons.append(reason)
+
+        else:
+            if reason := _bounded_reason_text(detail.get("reason")):
+                reasons.append(reason)
+            findings = detail.get("findings")
+            for finding in findings if isinstance(findings, list) else []:
+                if isinstance(finding, str):
+                    if reason := _bounded_reason_text(finding):
+                        reasons.append(reason)
+                elif isinstance(finding, dict) and (
+                    reason := _bounded_reason_text(finding.get("message") or finding.get("reason"))
+                ):
+                    reasons.append(reason)
+
+        if metric in ("accuracy", "goal_accuracy") and len(reasons) > trial_reason_start:
+            reward = trial.get("reward")
+            suffix = _expected_observed_suffix(detail, reward if isinstance(reward, dict) else None)
+            if suffix:
+                reasons[-1] = f"{reasons[-1]}; {suffix}"
+
+    return _dedupe_report_reasons(reasons)
+
+
+def _collect_pass_reasons(metric: str, trials: list[dict[str, Any]]) -> list[str]:
+    """Extract concise success reasons."""
+    reasons: list[Any] = []
+    for trial in trials:
+        detail = trial["detail"]
+        if not isinstance(detail, dict):
+            continue
+
+        if metric == "behavior_check":
+            raw_results = detail.get("results")
+            results = [item for item in raw_results if isinstance(item, dict)] if isinstance(raw_results, list) else []
+            judged_results = [result for result in results if result.get("step") is not None]
+            passed_count = sum(1 for result in judged_results if result.get("passed") is True)
+            total = len(judged_results)
+            if total:
+                reasons.append(f"{passed_count}/{total} expected behaviors observed")
+            if reason := _bounded_reason_text(detail.get("reason")):
+                reasons.append(reason)
+
+        elif metric == "accuracy":
+            criteria = _applicable_accuracy_criteria(detail)
+            passed = [k for k, v in criteria.items() if v]
+            if passed:
+                reasons.append(f"Passed: {', '.join(str(item) for item in passed)[:504]}")
+            if reason := _bounded_reason_text(detail.get("reason")):
+                reasons.append(reason)
+
+        elif metric in ("goal_accuracy", "security"):
+            if reason := _bounded_reason_text(detail.get("reason")):
+                reasons.append(reason)
+            raw_findings = detail.get("findings")
+            for finding in raw_findings if isinstance(raw_findings, list) else []:
+                if not isinstance(finding, dict):
+                    continue
+                if finding.get("score_impact"):
+                    continue
+                message = _bounded_reason_text(finding.get("message"))
+                attribution = _bounded_reason_text(finding.get("attribution"))
+                if attribution:
+                    message = f"{message} | Attribution: {attribution.replace('_', ' ')}"
+                if message:
+                    reasons.append(message)
+            if completeness := _bounded_reason_text(detail.get("attribution_completeness")):
+                reasons.append(completeness)
+            if end_state := _bounded_reason_text(detail.get("end_state")):
+                reasons.append(end_state)
+
+        else:
+            if reason := _bounded_reason_text(detail.get("reason")):
+                reasons.append(reason)
+            for check_data in detail.values():
+                if (
+                    isinstance(check_data, dict)
+                    and check_data.get("passed")
+                    and check_data.get("reason")
+                    and (reason := _bounded_reason_text(check_data.get("reason")))
+                ):
+                    reasons.append(reason)
+
+    return _dedupe_report_reasons(reasons)
+
+
+def _compact_evidence_ref(ref: dict[str, Any]) -> str:
+    """Return the stable compact key for one evidence reference."""
+    return f"{ref.get('source') or ''}#{evidence_ref_identity(ref)}"
+
+
+def _bounded_reason_text(value: Any, *, max_len: int = 512) -> str:
+    """Normalize, redact, and bound evaluator explanations."""
+    return _bounded_report_reason(value)[:max_len]
+
+
+def _accuracy_criterion_failure_reason(criterion: Any) -> str:
+    key = _bounded_reason_text(str(criterion), max_len=480)
+    sentence = _ACCURACY_DEDUCTION_SENTENCES.get(key)
+    return f"{sentence} (criterion {key})" if sentence else f"Criterion {key} was not met"
+
+
+def _expected_observed_suffix(detail: dict[str, Any], reward: dict[str, Any] | None = None) -> str:
+    from skillevaluator.evaluation.tier3_findings import sanitize_grader_text
+
+    sources: list[dict[str, Any]] = [detail]
+    reward = reward if isinstance(reward, dict) else {}
+    reward_details = reward.get("details")
+    if isinstance(reward_details, dict):
+        sources.append(reward_details)
+    sources.append(reward)
+
+    def value_for(keys: tuple[str, ...]) -> Any:
+        for source in sources:
+            for key in keys:
+                if key in source and source[key] is not None:
+                    return source[key]
+        return None
+
+    expected = sanitize_grader_text(
+        _bounded_reason_text(value_for(("ground_truth", "expected_answer")), max_len=160),
+        160,
+    )
+    observed = sanitize_grader_text(_bounded_reason_text(value_for(("final_answer",)), max_len=160), 160)
+    if not expected or not observed:
+        return ""
+    return f"Expected: {expected}; observed: {observed}"
+
+
+def _evidence_unavailable_reason(trials: list[dict[str, Any]]) -> str:
+    from skillevaluator.evaluation.tier3_findings import sanitize_grader_text
+
+    for trial in trials:
+        reward = trial.get("reward")
+        if not isinstance(reward, dict):
+            continue
+        failure = sanitize_grader_text(
+            reward.get("trajectory_detail") or reward.get("error"),
+            _REPORT_REASON_LIMIT,
+        )
+        if failure:
+            return f"Trajectory evidence could not be loaded: {failure}"
+    return "No trajectory evidence was recorded for this metric"
+
+
+def _trial_evidence_ref(ref: Any, reward: dict[str, Any], *, multi_trial: bool) -> dict[str, Any] | None:
+    if not isinstance(ref, dict | str):
+        return None
+    resolved = _resolve_evidence_ref(ref, {})
+    if multi_trial:
+        scope = str(reward.get("trial_id") or reward.get("entry_id") or "")
+        if not scope or "/" in scope or "#" in scope or scope in {".", ".."}:
+            return None
+        source = str(resolved.get("source") or "")
+        if scope not in source.split("/"):
+            resolved["source"] = f"trials/{scope}/{source}"
+        bounded = _bounded_evidence_ref(resolved)
+        if bounded.get("source") != resolved.get("source"):
+            return None
+        resolved = bounded
+    return resolved
+
+
+# Fields that say what role a location plays (a ground truth that also names an
+# expected artifact, a tool call that is also a file write), not what it holds.
+_EVIDENCE_ROLE_FIELDS = frozenset({"kind", "label", "path", "status"})
+
+
+def _same_location_variants(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    """Return True when two refs cast one location and one body of text in different roles."""
+    if first.get("kind") == second.get("kind"):
+        return False
+    return all(
+        first.get(field) == second.get(field)
+        for field in _EVIDENCE_REF_TEXT_LIMITS
+        if field not in _EVIDENCE_ROLE_FIELDS
+    )
+
+
+def _build_evidence_ref_lookup(rewards: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Build a lookup from each stable compact evidence key to its full dict ref.
+
+    Iterates over every publishable metric and resolves its detail through the
+    same standard/custom precedence used by findings.  The resulting mapping lets
+    ``_generate_suggestions_structured`` resolve the compact string refs that
+    the LLM returns into the richer dict form consumed by SkillEvaluator report
+    templates (which read ``ref.kind``, ``ref.json_pointer``, ``ref.path``,
+    ``ref.excerpt``).
+
+    A key is dropped when it is claimed by more than one reward or when one
+    reward gives it conflicting content.  A single reward may cite one location
+    in several roles with the same content (for example ``ground_truth`` and
+    ``expected_artifact``, or ``tool_call`` and ``file_change``); the first one
+    seen, in metric order, is kept as the canonical reference.
+    """
+    lookup: dict[str, dict[str, Any]] = {}
+    owners: dict[str, int] = {}
+    ambiguous: set[str] = set()
+    for index, reward in enumerate(rewards):
+        for metric in _finding_metric_names([reward]):
+            metric_detail = _detail_for_finding(reward, metric)
+            if not isinstance(metric_detail, dict):
+                continue
+            for ref in _normalize_evidence_refs(metric_detail.get("evidence_refs")):
+                resolved = _trial_evidence_ref(ref, reward, multi_trial=len(rewards) > 1)
+                if resolved is None:
+                    continue
+                if resolved.get("source") or evidence_ref_identity(resolved):
+                    key = _compact_evidence_ref(resolved)
+                    if key in ambiguous:
+                        continue
+                    if key in lookup and (
+                        owners[key] != index
+                        or (lookup[key] != resolved and not _same_location_variants(lookup[key], resolved))
+                    ):
+                        ambiguous.add(key)
+                        del lookup[key]
+                    elif key not in lookup:
+                        lookup[key] = resolved
+                        owners[key] = index
+    return lookup
+
+
+def _bounded_evidence_ref(ref: dict[str, Any]) -> dict[str, str]:
+    """Project one evidence reference into the bounded report schema."""
+    bounded: dict[str, str] = {}
+    for field, limit in _EVIDENCE_REF_TEXT_LIMITS.items():
+        value = ref.get(field)
+        if value not in (None, ""):
+            bounded[field] = _bounded_json_text(value, max_encoded_bytes=limit)
+    return bounded
+
+
+def _resolve_evidence_ref(ref: Any, lookup: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Resolve a single evidence ref to a dict.
+
+    If ``ref`` is already a dict, return it unchanged.  If ``ref`` is a string
+    of the form ``"source#json_pointer"`` (or a normalized evidence identity), look it up in *lookup* and return the
+    full dict.  If the lookup misses, fall back to a minimal dict parsed from
+    the string, with ``kind`` set to ``"evidence"``.
+    """
+    if isinstance(ref, dict):
+        return _bounded_evidence_ref(ref)
+    ref_str = str(ref)[:1024]
+    if ref_str in lookup:
+        return _bounded_evidence_ref(lookup[ref_str])
+    # Parse the compact string into a minimal dict
+    if "#" in ref_str:
+        source, _, pointer = ref_str.partition("#")
+    else:
+        source, pointer = ref_str, ""
+    return _bounded_evidence_ref({"source": source, "json_pointer": pointer, "kind": "evidence"})
+
+
+def _recorded_evidence_refs(raw_refs: list[Any], lookup: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Resolve LLM-cited references, keeping only those the run recorded, once each."""
+    resolved: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for ref in raw_refs:
+        key = _compact_evidence_ref(ref) if isinstance(ref, dict) else str(ref)[:1024]
+        if key in lookup and key not in seen:
+            seen.add(key)
+            resolved.append(_resolve_evidence_ref(key, lookup))
+    return resolved
+
+
+def _generate_suggestions_structured(
+    skill_name: str,
+    findings: list[dict[str, Any]],
+    rewards: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Generate max 4 LLM-powered structured suggestion objects for skill developers.
+
+    Each object has keys: ``suggestion`` (str), ``dimension`` (metric name str),
+    ``evidence_refs`` (list of dicts with keys ``source``, ``json_pointer``,
+    ``kind``, and optionally ``path`` and ``excerpt``).
+
+    The LLM is still asked to return compact ``"source#/json_pointer"`` strings
+    (cheap, reliable).  After parsing the LLM response each string ref is
+    resolved against a lookup built from ``rewards[*]["details"][metric]["evidence_refs"]``
+    so that the richer dict fields (``kind``, ``path``, ``excerpt``) are
+    preserved.  References the run did not record are dropped, so a
+    suggestion never cites evidence that does not exist, and repeated
+    suggestions are kept once.  Callers that consume ``suggestions_v2[*].evidence_refs``
+    (including the SkillEvaluator report template) therefore always receive dicts rather
+    than plain strings.
+    """
+    failed_findings = [f for f in findings if f["severity"] in ("critical", "warning")]
+    if not failed_findings:
+        return []
+
+    summary_parts = []
+    for f in failed_findings:
+        summary_parts.append(f"- {f['label']} ({f['score']:.2f}): {'; '.join(f['reasons'][:2])}")
+    findings_summary = "\n".join(summary_parts)
+
+    behavior_failures = []
+    error_recovery_info = []
+    for reward in rewards:
+        details = reward.get("details", {})
+        if not isinstance(details, dict):
+            continue
+        behavior = details.get("behavior_check")
+        behavior_results = behavior.get("results") if isinstance(behavior, dict) else None
+        for result in behavior_results if isinstance(behavior_results, list) else []:
+            if not isinstance(result, dict) or result.get("passed") is not False:
+                continue
+            if reason := _bounded_reason_text(result.get("reason")):
+                behavior_failures.append(reason)
+        skill_execution = details.get("skill_execution")
+        error_recovery = skill_execution.get("error_recovery") if isinstance(skill_execution, dict) else None
+        corrections = error_recovery.get("corrections") if isinstance(error_recovery, dict) else None
+        for correction in corrections if isinstance(corrections, list) else []:
+            if not isinstance(correction, dict):
+                continue
+            fault = _bounded_reason_text(correction.get("fault")) or "?"
+            error = _bounded_reason_text(correction.get("error"), max_len=150)
+            error_recovery_info.append(f"[{fault}] {error}")
+
+    ref_lookup = _build_evidence_ref_lookup(rewards)
+    evidence_lines = []
+    for f in failed_findings:
+        for ref in (f.get("evidence_refs") or [])[:3]:
+            if isinstance(ref, dict) and _compact_evidence_ref(ref) in ref_lookup:
+                evidence_lines.append(
+                    f"  - [{f['metric']}] {ref.get('kind', '')} {_compact_evidence_ref(ref)}: "
+                    f"{str(ref.get('label') or ref.get('excerpt') or '')[:120]}"
+                )
+    evidence_block = "\n".join(evidence_lines) or "(no evidence refs)"
+
+    prompt = f"""You are an expert skill evaluator. A skill named "{skill_name}" was tested with an AI coding agent and received the following evaluation results:
+
+FINDINGS (metrics that scored below threshold):
+{findings_summary}
+
+FAILED BEHAVIORS:
+{chr(10).join(f"- {b}" for b in behavior_failures[:6]) or "(none)"}
+
+ERROR RECOVERY ISSUES:
+{chr(10).join(f"- {e}" for e in error_recovery_info[:4]) or "(none)"}
+
+EVIDENCE REFERENCES (cite the relevant compact reference exactly in your suggestions):
+{evidence_block}
+
+Each suggestion must cite at least one listed reference from the case or trial it addresses.
+The trials/<case-or-trial>/ prefix identifies the owner and must be included in the citation.
+
+Treat [environment] issues as evaluation setup problems, not skill defects. Recommend dependency declarations or installation in evals/environment/Dockerfile, not skill behavior changes.
+Based on these results, provide exactly 3-4 specific, actionable suggestions for the skill developer to improve their skill. Focus on:
+1. What the developer should fix in their skill (SKILL.md, scripts, config)
+2. What they should add to evals/environment/ (Dockerfile, docker-compose) if tools are missing
+3. Documentation gaps that caused agent failures
+
+Keep each suggestion to 1-2 sentences. Be concrete — reference specific files, commands, or sections.
+If the failures are purely environmental (e.g. CLI not installed in container), say so directly.
+Give distinct suggestions; do not repeat one fix in different words.
+Do not suggest loosening, removing, or rewriting an eval expectation just so the agent passes; change a case only when the evidence shows the expectation itself is wrong.
+When the evidence does not establish a cause (for example, that a different model would do better), start the suggestion with "Hypothesis:" and say how to test it.
+Cite only evidence references listed above; references the run did not record are dropped.
+
+Respond with ONLY a JSON array of objects {{"suggestion": "...", "dimension": "<metric>", "evidence_refs": ["<exact listed reference>", ...]}}, no other text."""
+
+    try:
+        from skillevaluator.tier3.eval_core.llm_judge import _extract_json, call_public_llm
+
+        content, error = call_public_llm(prompt, max_tokens=8192)
+        if error:
+            logger.warning("LLM suggestion generation failed: %s", error)
+            return [{"suggestion": s, "dimension": "", "evidence_refs": []} for s in _fallback_suggestions(findings)]
+
+        parsed = _extract_json(content) if content else None
+        if isinstance(parsed, list):
+            result: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for item in parsed[:4]:
+                if isinstance(item, dict):
+                    text = str(item.get("suggestion", ""))[:_MAX_FINDING_TEXT_CHARS]
+                    raw_refs = list(item.get("evidence_refs") or [])[:_MAX_FINDING_EVIDENCE_REFS]
+                    entry = {
+                        "suggestion": text,
+                        "dimension": str(item.get("dimension", ""))[:256],
+                        "evidence_refs": _recorded_evidence_refs(raw_refs, ref_lookup),
+                    }
+                elif isinstance(item, str):
+                    text = item[:_MAX_FINDING_TEXT_CHARS]
+                    entry = {"suggestion": text, "dimension": "", "evidence_refs": []}
+                else:
+                    continue
+                key = " ".join(text.lower().split())
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                result.append(entry)
+            if result:
+                return result
+        if isinstance(parsed, dict) and "suggestions" in parsed:
+            return [
+                {
+                    "suggestion": str(s)[:_MAX_FINDING_TEXT_CHARS],
+                    "dimension": "",
+                    "evidence_refs": [],
+                }
+                for s in parsed["suggestions"][:_MAX_SUGGESTIONS]
+            ]
+
+        return [{"suggestion": s, "dimension": "", "evidence_refs": []} for s in _fallback_suggestions(findings)]
+    except Exception as e:
+        logger.warning("LLM suggestion generation failed: %s", e)
+        return [{"suggestion": s, "dimension": "", "evidence_refs": []} for s in _fallback_suggestions(findings)]
+
+
+def _generate_suggestions(
+    skill_name: str,
+    findings: list[dict[str, Any]],
+    rewards: list[dict[str, Any]],
+) -> list[str]:
+    """Generate max 4 LLM-powered suggestions for skill developers.
+
+    Delegates to ``_generate_suggestions_structured`` and extracts the plain
+    suggestion strings for back-compatibility with callers that expect ``list[str]``.
+    """
+    return [
+        str(o.get("suggestion", ""))
+        for o in _generate_suggestions_structured(skill_name, findings, rewards)
+        if o.get("suggestion")
+    ]
+
+
+def _fallback_suggestions(findings: list[dict[str, Any]]) -> list[str]:
+    """Rule-based fallback when LLM is unavailable."""
+    suggestions: list[str] = []
+    for f in findings:
+        if f["severity"] not in ("critical", "warning"):
+            continue
+        for reason in f["reasons"][:1]:
+            r_lower = reason.lower()
+            if "not found" in r_lower or "command not found" in r_lower:
+                suggestions.append(
+                    f"Add evals/environment/Dockerfile to install missing CLI tools "
+                    f"required by the skill ({f['label']} scored {f['score']:.2f})."
+                )
+            elif "unsafe" in r_lower or "destructive" in r_lower or "secret" in r_lower:
+                if "likely skill related" in r_lower:
+                    suggestions.append(
+                        "Add explicit safety rules to SKILL.md and any skill scripts: require confirmation before "
+                        "destructive cleanup, forbid writing shell startup files, and avoid exposing secrets."
+                    )
+                elif "baseline" in r_lower or "environment" in r_lower:
+                    suggestions.append(
+                        "Review the eval prompt and sandbox permissions: the same unsafe behavior appeared in baseline, "
+                        "so this may be a prompt/environment issue rather than a skill defect."
+                    )
+                else:
+                    suggestions.append(
+                        f"Review security evidence for {f['label']} ({f['score']:.2f}) and add guardrails or custom "
+                        "grader checks for unsafe commands, sensitive files, and secret handling."
+                    )
+            elif "did not read" in r_lower or "skill.md" in r_lower:
+                suggestions.append(
+                    f"Review SKILL.md discoverability — agent failed to find or read it "
+                    f"({f['label']} scored {f['score']:.2f})."
+                )
+            elif "not achieve" in r_lower or "did not complete" in r_lower:
+                suggestions.append(
+                    f"Check that the skill's workflow can complete end-to-end in the eval environment "
+                    f"({f['label']} scored {f['score']:.2f})."
+                )
+            else:
+                suggestions.append(f"{f['label']} scored {f['score']:.2f}: {reason}")
+    return suggestions[:4]
+
+
+def _passing_skill_suggestions(
+    findings: list[dict[str, Any]],
+    rewards: list[dict[str, Any]],
+) -> list[str]:
+    """Generate improvement suggestions even when all metrics pass."""
+    suggestions: list[str] = []
+    num_trials = len(report_data.logical_trial_reward_groups(rewards))
+
+    lowest = min(findings, key=lambda f: f["score"]) if findings else None
+    if lowest and lowest["score"] < 0.95:
+        suggestions.append(
+            f"Strengthen {lowest['label'].split('(')[0].strip()} "
+            f"(scored {lowest['score']:.2f}) — review the reasons above and "
+            f"refine expected_behavior or ground_truth in evals.json to better "
+            f"match what agents actually do."
+        )
+
+    suggestions.append(
+        "Add evals/environment/Dockerfile if the skill depends on CLI tools, "
+        "databases, or APIs — this ensures consistent results across agents "
+        "and CI environments."
+    )
+
+    if num_trials < 4:
+        suggestions.append(
+            f"Expand evals.json with more test cases (currently {num_trials}). "
+            "Write task requests and observable outcomes in <skill-dir>/evals/EVAL.md, then preview "
+            "'skillevaluator create-eval-dataset <skill-dir> --full --force --dry-run'. "
+            "Merge reviewed drafts into evals.json, keep existing cases, and add negative controls."
+        )
+
+    suggestions.append(
+        "Run with additional agents ('skillevaluator evaluate <skill> --agents "
+        "claude-code,codex,opencode --env-mode docker') to verify the skill works across "
+        "different coding agents."
+    )
+
+    return suggestions[:4]
+
+
+def _harbor_viewer_evidence_links(rewards: list[dict[str, Any]]) -> list[str]:
+    links: list[str] = []
+    for reward in _prioritized_evidence_rewards(rewards):
+        harbor_viewer = reward.get("harbor_viewer")
+        if not isinstance(harbor_viewer, dict):
+            continue
+        evidence_urls = harbor_viewer.get("evidence_urls")
+        if isinstance(evidence_urls, list):
+            for item in evidence_urls:
+                if isinstance(item, dict) and item.get("url"):
+                    links.append(str(item["url"])[:_MAX_FINDING_TEXT_CHARS])
+        trial_url = harbor_viewer.get("trial_url")
+        if trial_url:
+            links.append(str(trial_url)[:_MAX_FINDING_TEXT_CHARS])
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for link in links:
+        if link in seen:
+            continue
+        seen.add(link)
+        deduped.append(link)
+    return deduped
+
+
+def _prioritized_evidence_rewards(rewards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    failing = [reward for reward in rewards if _reward_has_failing_signal(reward)]
+    passing = [reward for reward in rewards if reward not in failing]
+    return [*failing, *passing]
+
+
+def _reward_has_failing_signal(reward: dict[str, Any]) -> bool:
+    for metric in DISPLAY_METRICS:
+        value = _metric_score(reward, metric)
+        if value is not None and value < FINDING_OK_THRESHOLD:
+            return True
+    details = reward.get("details")
+    if not isinstance(details, dict):
+        return False
+    for detail in details.values():
+        if not isinstance(detail, dict):
+            continue
+        score = detail.get("score")
+        numeric_score = extract_custom_metrics({"detail_score": score}).get("detail_score")
+        if numeric_score is not None and numeric_score < FINDING_OK_THRESHOLD:
+            return True
+        results = detail.get("results")
+        if isinstance(results, list) and any(
+            isinstance(item, dict) and item.get("passed") is False for item in results
+        ):
+            return True
+    return False
+
+
+def add_evidence_links_to_suggestions(
+    suggestions: list[str],
+    rewards: list[dict[str, Any]],
+) -> list[str]:
+    """Append Harbor viewer evidence links to report suggestions when available."""
+    links = _harbor_viewer_evidence_links(rewards)
+    if not suggestions or not links:
+        return suggestions
+
+    linked: list[str] = []
+    for index, suggestion in enumerate(suggestions):
+        text = str(suggestion).rstrip()
+        if "Evidence:" in text or "http://" in text or "https://" in text:
+            linked.append(text)
+            continue
+        punctuation = "" if text.endswith((".", "!", "?")) else "."
+        linked.append(f"{text}{punctuation} Evidence: {links[min(index, len(links) - 1)]}"[:_MAX_FINDING_TEXT_CHARS])
+    return linked
+
+
+def _bounded_findings_payload(
+    *,
+    skill_name: str,
+    agent: str,
+    findings: list[dict[str, Any]],
+    suggestions: list[str],
+    suggestion_mode: str,
+    suggestions_v2: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Project a findings artifact into a fixed, browser-loadable schema."""
+    from skillevaluator.tier3.eval_core.atif_helpers import _METRIC_EVIDENCE_REF_METRICS
+
+    bounded_findings: list[dict[str, Any]] = []
+    for finding in findings[:_MAX_FINDINGS]:
+        if not isinstance(finding, dict):
+            continue
+        score = finding.get("score")
+        try:
+            score_is_finite = (
+                isinstance(score, int | float) and not isinstance(score, bool) and math.isfinite(float(score))
+            )
+        except (OverflowError, ValueError):
+            score_is_finite = False
+        if not score_is_finite:
+            continue
+        raw_reasons = finding.get("reasons")
+        raw_refs = finding.get("evidence_refs")
+        bounded_findings.append(
+            {
+                "metric": _bounded_json_text(finding.get("metric"), max_encoded_bytes=256),
+                "label": _bounded_json_text(finding.get("label"), max_encoded_bytes=512),
+                "severity": _bounded_json_text(finding.get("severity"), max_encoded_bytes=64),
+                "score": float(score),
+                "reasons": [
+                    _bounded_json_text(reason, max_encoded_bytes=512)
+                    for reason in (raw_reasons if isinstance(raw_reasons, list) else [])[:_MAX_FINDING_REASONS]
+                ],
+                "evidence_refs": [
+                    _bounded_evidence_ref(ref)
+                    for ref in (raw_refs if isinstance(raw_refs, list) else [])[:_MAX_FINDING_EVIDENCE_REFS]
+                    if isinstance(ref, dict)
+                ],
+            }
+        )
+        if (
+            bounded_findings[-1]["severity"] != "ok"
+            and bounded_findings[-1]["metric"] in _METRIC_EVIDENCE_REF_METRICS
+            and not bounded_findings[-1]["evidence_refs"]
+        ):
+            unavailable_reason = finding.get("evidence_unavailable_reason") or (
+                "No trajectory evidence was recorded for this metric"
+            )
+            bounded_findings[-1]["evidence_unavailable_reason"] = _bounded_json_text(
+                unavailable_reason,
+                max_encoded_bytes=512,
+            )
+
+    bounded_v2: list[dict[str, Any]] = []
+    for suggestion in (suggestions_v2 or [])[:_MAX_SUGGESTIONS]:
+        if not isinstance(suggestion, dict):
+            continue
+        raw_refs = suggestion.get("evidence_refs")
+        bounded = {
+            "suggestion": _bounded_json_text(suggestion.get("suggestion"), max_encoded_bytes=4096),
+            "dimension": _bounded_json_text(suggestion.get("dimension"), max_encoded_bytes=256),
+            "evidence_refs": [
+                _bounded_evidence_ref(ref)
+                for ref in (raw_refs if isinstance(raw_refs, list) else [])[:_MAX_FINDING_EVIDENCE_REFS]
+                if isinstance(ref, dict)
+            ],
+        }
+        if suggestion.get("trial_id") not in (None, ""):
+            bounded["trial_id"] = _bounded_json_text(suggestion["trial_id"], max_encoded_bytes=512)
+        bounded_v2.append(bounded)
+
+    return {
+        "skill_name": _bounded_json_text(skill_name, max_encoded_bytes=512),
+        "agent": _bounded_json_text(agent, max_encoded_bytes=512),
+        "suggestion_mode": _bounded_json_text(suggestion_mode, max_encoded_bytes=64),
+        "severity_thresholds": {
+            "ok_at_or_above": FINDING_OK_THRESHOLD,
+            "critical_below": FINDING_CRITICAL_THRESHOLD,
+            "scale": "advisory_metric",
+        },
+        "findings": bounded_findings,
+        "findings_total": len(findings),
+        "findings_shown": len(bounded_findings),
+        "findings_truncated": len(bounded_findings) < len(findings),
+        "suggestions": [
+            _bounded_json_text(suggestion, max_encoded_bytes=4096) for suggestion in suggestions[:_MAX_SUGGESTIONS]
+        ],
+        "suggestions_v2": bounded_v2,
+    }
+
+
+def _write_findings_artifact(
+    *,
+    results_dir: Path,
+    skill_name: str,
+    agent: str,
+    findings: list[dict[str, Any]],
+    suggestions: list[str],
+    suggestion_mode: str,
+    suggestions_v2: list[dict[str, Any]] | None = None,
+) -> Path | None:
+    artifact = _findings_artifact_path(results_dir, agent)
+    if artifact is None:
+        return None
+    payload = _bounded_findings_payload(
+        skill_name=skill_name,
+        agent=agent,
+        findings=findings,
+        suggestions=suggestions,
+        suggestion_mode=suggestion_mode,
+        suggestions_v2=suggestions_v2,
+    )
+    try:
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        safe_payload = redact_sensitive_data(payload, max_str_len=_MAX_FINDING_TEXT_CHARS)
+        encoded = json.dumps(
+            safe_payload,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        if len(encoded) > report_data._MAX_JSON_BYTES:
+            for finding in safe_payload.get("findings", []):
+                if isinstance(finding, dict):
+                    finding["evidence_refs"] = []
+            for suggestion in safe_payload.get("suggestions_v2", []):
+                if isinstance(suggestion, dict):
+                    suggestion["evidence_refs"] = []
+            safe_payload["evidence_refs_omitted"] = True
+            safe_payload["evidence_refs_omitted_reason"] = "findings artifact size limit"
+            encoded = json.dumps(
+                safe_payload,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("utf-8")
+        if len(encoded) > report_data._MAX_JSON_BYTES:
+            raise ValueError("bounded findings artifact exceeds report loader limit")
+        write_output_file_atomically(artifact, encoded)
+    except (OSError, TypeError, ValueError) as e:
+        logger.debug("Failed to write findings artifact %s: %s", artifact, e)
+        return None
+    return artifact
+
+
+def display_findings_report(
+    harbor_result: dict[str, Any],
+    skill_name: str,
+    harbor_agents: list[str],
+    results_dir: Path,
+) -> set[str]:
+    """Display the findings report panel after the score table.
+
+    Return the atomic feedback messages printed in the detailed panel. The
+    caller uses these to suppress only matching compact feedback items while
+    preserving payload-only conclusions and recommendations.
+    """
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+
+    from skillevaluator.reporting.terminal_styles import AMBER, FAINT
+    from skillevaluator.utils.rich_markup import escape_markup, strip_terminal_controls
+
+    console = Console(emoji=False)
+
+    agents_data = harbor_result.get("agents", {})
+    report_agents = list(dict.fromkeys([*harbor_agents, *agents_data.keys()]))
+    for agent in report_agents:
+        _remove_stale_findings_artifact(results_dir, agent)
+
+    loaded_agents = report_data.load_agent_data(results_dir)
+    if len(harbor_agents) > 1:
+        best_agent = _pick_best_agent(agents_data, loaded_agents)
+        if best_agent:
+            best_agent_label = _agent_model_label(best_agent, harbor_result, agents_data)
+            console.print(
+                f"  [dim]Findings from best performing agent/model combination for your skill:[/dim] "
+                f"[bold]{escape_markup(best_agent_label)}[/bold]"
+            )
+            console.print()
+    else:
+        best_agent = harbor_agents[0] if harbor_agents else ""
+        # The terminal summary drops never-activated agents before it calls
+        # here, so an agent kept with a failed baseline can be the only one
+        # left. Rank it against every agent, as the canonical report does, so
+        # it never stands in for a complete agent ranked above it.
+        if (
+            best_agent
+            and len(agents_data) > 1
+            and _kept_with_failed_baseline(best_agent, agents_data, loaded_agents)
+            and _pick_best_agent(agents_data, loaded_agents) != best_agent
+        ):
+            best_agent = ""
+
+    if (
+        not best_agent
+        or best_agent not in agents_data
+        or not isinstance(agents_data[best_agent], dict)
+        or not _findings_eligible(agents_data[best_agent])
+    ):
+        return set()
+
+    agent_reports: dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
+    for agent in report_agents:
+        agent_data = agents_data.get(agent)
+        if not isinstance(agent_data, dict) or not _findings_eligible(agent_data):
+            continue
+        rewards_for_agent = _load_trial_rewards(results_dir, agent, loaded_agents)
+        if not rewards_for_agent:
+            continue
+        loaded_agent = loaded_agents.get(agent)
+        if isinstance(loaded_agent, dict) and not _findings_eligible(loaded_agent):
+            continue
+        canonical_scores: dict[str, Any] = {}
+        rewards_complete = True
+        if isinstance(loaded_agent, dict):
+            for score_key in ("with_skill", "custom_with_skill"):
+                scores = loaded_agent.get(score_key)
+                if isinstance(scores, dict):
+                    canonical_scores.update(scores)
+            rewards_complete = loaded_agent.get("rewards_complete") is not False
+        findings_for_agent = _extract_findings(
+            rewards_for_agent,
+            canonical_scores=canonical_scores,
+            rewards_complete=rewards_complete,
+        )
+        if findings_for_agent:
+            agent_reports[agent] = (findings_for_agent, rewards_for_agent)
+
+    if best_agent not in agent_reports:
+        return set()
+
+    findings, rewards = agent_reports[best_agent]
+    body = _render_findings_body(findings)
+    rendered_messages = {
+        str(message).strip()
+        for finding in findings
+        for message in (
+            finding.get("label"),
+            METRIC_QUESTIONS.get(str(finding.get("metric") or "")),
+            *(finding.get("reasons") or []),
+        )
+        if str(message or "").strip()
+    }
+
+    structured = _generate_suggestions_structured(skill_name, findings, rewards)
+    suggestions = [s["suggestion"] for s in structured]
+    suggestion_mode = "remediation" if suggestions else "passing_next_steps"
+
+    if suggestions:
+        rendered_messages.update(str(suggestion).strip() for suggestion in suggestions if str(suggestion).strip())
+        suggestions = add_evidence_links_to_suggestions(suggestions, rewards)
+        body.append("  \U0001f4a1 SUGGESTIONS\n", style=f"bold {AMBER}")
+        for i, suggestion in enumerate(suggestions, 1):
+            body.append(f"    {i}. ", style=AMBER)
+            body.append(f"{strip_terminal_controls(str(suggestion))}\n")
+    else:
+        body.append("  \U0001f4a1 NEXT STEPS\n", style="bold")
+        suggestions = _passing_skill_suggestions(findings, rewards)
+        rendered_messages.update(str(suggestion).strip() for suggestion in suggestions if str(suggestion).strip())
+        suggestions = add_evidence_links_to_suggestions(suggestions, rewards)
+        for i, suggestion in enumerate(suggestions, 1):
+            body.append(f"    {i}. ", style=AMBER)
+            body.append(f"{strip_terminal_controls(str(suggestion))}\n")
+    rendered_messages.update(str(suggestion).strip() for suggestion in suggestions if str(suggestion).strip())
+
+    for agent, (agent_findings, _agent_rewards) in agent_reports.items():
+        is_best_agent = agent == best_agent
+        agent_suggestions = suggestions if is_best_agent else []
+        agent_suggestion_mode = suggestion_mode if is_best_agent else "not_generated"
+        agent_suggestions_v2 = structured if is_best_agent else []
+        _write_findings_artifact(
+            results_dir=results_dir,
+            skill_name=skill_name,
+            agent=agent,
+            findings=agent_findings,
+            suggestions=agent_suggestions,
+            suggestion_mode=agent_suggestion_mode,
+            suggestions_v2=agent_suggestions_v2,
+        )
+
+    panel_agent_label = _agent_model_label(best_agent, harbor_result, agents_data)
+    console.print(
+        Panel(
+            body,
+            # Panel parses a str title with emoji enabled whatever the console says.
+            title=Text.from_markup(
+                f"[bold]{escape_markup(f'{skill_name} / {panel_agent_label}')} \u2014 Findings[/bold]",
+                emoji=False,
+            ),
+            border_style=FAINT,
+            padding=(1, 1),
+        )
+    )
+    console.print()
+    return rendered_messages

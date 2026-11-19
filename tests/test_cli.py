@@ -1,0 +1,1509 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import builtins
+import contextlib
+import json
+from pathlib import Path
+
+import click
+import pytest
+from click.testing import CliRunner
+
+from skillevaluator.cli import cli
+from skillevaluator.cli_help import render_help
+from skillevaluator.models.result import Finding, Severity, ValidationResult
+from skillevaluator.tier3.harbor.runner import format_harbor_view_command
+from skillevaluator.validators.code_risk import CodeRiskValidator
+from skillevaluator.validators.secrets import SecretsValidator
+
+
+def test_top_level_help_lists_primary_commands() -> None:
+    result = CliRunner().invoke(cli, ["--help"])
+    removed_command = "convert" + "-benchmark"
+    tier3_result = CliRunner().invoke(cli, ["tier3", "--help"])
+
+    assert result.exit_code == 0
+    assert tier3_result.exit_code == 0
+    assert "validate" in result.output
+    assert "create-eval-dataset" in result.output
+    # `evaluate` is intentionally hidden at top level: `tier3 evaluate` is the
+    # advertised spelling (the top-level alias keeps working for scripts).
+    assert "\n  evaluate" not in result.output
+    assert "evaluate" in tier3_result.output
+    assert "tier1" in result.output
+    assert "tier2" in result.output
+    assert "tier3" in result.output
+    assert removed_command not in result.output
+    assert removed_command not in tier3_result.output
+
+
+def test_top_level_help_shows_branded_header() -> None:
+    result = CliRunner().invoke(cli, ["--help"])
+
+    assert result.exit_code == 0
+    assert "SKILLEVALUATOR: SkillEvaluator" in result.output
+    assert "https://docs.nvidia.com/skills/skillevaluator/" in result.output
+    # Plain text under a non-TTY runner so the output stays greppable.
+    assert "\x1b[" not in result.output
+
+
+@pytest.mark.parametrize(("min_score", "expected_exit_code"), [(None, 0), (90, 1)])
+def test_quickstart_quality_check_matches_documented_result(
+    tmp_path: Path,
+    min_score: int | None,
+    expected_exit_code: int,
+) -> None:
+    """Keep the bundled first-run result and its threshold behavior reproducible."""
+    skill = Path(__file__).resolve().parents[1] / "src/skillevaluator/tier3/reference_skills/text-analyzer"
+    reports = tmp_path / "reports"
+    args = ["quality-check", str(skill), "-r", "cli", "-r", "json", "-o", str(reports)]
+    if min_score is not None:
+        args.extend(["--min-score", str(min_score)])
+
+    result = CliRunner().invoke(cli, args)
+
+    assert result.exit_code == expected_exit_code, result.output
+    payload = json.loads((reports / "skillevaluator-quality.json").read_text(encoding="utf-8"))
+    assert len(payload["results"]) == 1
+    quality_result = payload["results"][0]
+    assert quality_result["quality"]["overall_score"] == 88.8
+    assert quality_result["quality"]["grade"] == "B"
+    assert len(quality_result["findings"]) == 5
+    assert payload["overall_passed"] is (expected_exit_code == 0)
+    assert payload["publication_status"] == ("incomplete" if expected_exit_code == 0 else "fail")
+    assert "88.8/100" in result.output
+
+
+def test_top_level_help_groups_commands_by_workflow() -> None:
+    result = CliRunner().invoke(cli, ["--help"])
+
+    assert result.exit_code == 0
+    headings = (
+        "Tier workflows:",
+        "Core workflows:",
+        "Repository CI:",
+        "Tier 1 · Static and security:",
+        "Tier 2 · Deduplication:",
+        "Tier 3 · Live evaluation:",
+    )
+    positions = [result.output.index(heading) for heading in headings]
+    assert positions == sorted(positions)
+
+    core = result.output.split("Core workflows:", 1)[1].split("Repository CI:", 1)[0]
+    assert all(command in core for command in ("validate", "health-check", "doctor", "models", "dashboard"))
+    repository_ci = result.output.split("Repository CI:", 1)[1].split("Tier 1 · Static and security:", 1)[0]
+    assert any(line.split() and line.split()[0] == "ci" for line in repository_ci.splitlines())
+    tier3 = result.output.split("Tier 3 · Live evaluation:", 1)[1]
+    assert all(command in tier3 for command in ("create-eval-dataset", "compare", "view", "harbor-view"))
+    assert "Other commands:" not in result.output
+
+
+def test_help_emits_color_when_enabled() -> None:
+    ctx = click.Context(cli, info_name="skillevaluator", color=True)
+    colored = render_help(cli, ctx, width=80)
+    plain = render_help(cli, click.Context(cli, info_name="skillevaluator", color=False), width=80)
+
+    assert "\x1b[" in colored
+    assert "\x1b[" not in plain
+    # No trailing whitespace in the rendered help (parity with Click).
+    assert all(line == line.rstrip() for line in plain.splitlines())
+
+
+def test_tier_alias_help() -> None:
+    runner = CliRunner()
+
+    for tier in ("tier1", "tier2", "tier3"):
+        result = runner.invoke(cli, [tier, "--help"])
+        assert result.exit_code == 0
+
+
+def test_similarity_help_exposes_catalog_workflow_and_hides_legacy_cache_names() -> None:
+    result = CliRunner().invoke(cli, ["similarity-check", "--help"])
+
+    assert result.exit_code == 0
+    assert "--catalog" in result.output
+    assert "--save-catalog" in result.output
+    assert "--cache" not in result.output
+    assert "--save-cache" not in result.output
+
+
+def test_similarity_cli_rejects_nonfinite_and_out_of_range_thresholds(tmp_path: Path) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: sample\ndescription: Sample skill\n---\n")
+    runner = CliRunner()
+
+    for value in ("nan", "inf", "-0.1", "1.1"):
+        result = runner.invoke(cli, ["similarity-check", str(skill), "--threshold", value])
+        assert result.exit_code == 2
+        assert "finite and within [0, 1]" in result.output
+
+
+def test_similarity_cli_rejects_catalog_build_and_query_together(tmp_path: Path) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: sample\ndescription: Sample skill\n---\n")
+    catalog = tmp_path / "catalog.json"
+    catalog.write_text("{}")
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "similarity-check",
+            str(skill),
+            "--catalog",
+            str(catalog),
+            "--save-catalog",
+            str(tmp_path / "new.json"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "cannot be used together" in result.output
+
+
+def test_similarity_cli_handles_pinned_openclaw_compatibility_layout(tmp_path: Path, monkeypatch) -> None:
+    collection = tmp_path / "skills"
+    autoreview = collection / "autoreview"
+    autoreview.mkdir(parents=True)
+    (autoreview / "SKILL.md").write_text(
+        "---\nname: autoreview\ndescription: Review changes with multiple agents\n---\n"
+    )
+    (autoreview / "AGENTS.md").write_text("# Shared agent instructions\n")
+    try:
+        (autoreview / "CLAUDE.md").symlink_to("AGENTS.md")
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    second = collection / "second-skill"
+    second.mkdir()
+    (second / "SKILL.md").write_text("---\nname: second-skill\ndescription: Exercise an unrelated workflow\n---\n")
+
+    embedded_texts: list[str] = []
+
+    def embed_without_network(_self, texts: list[str]) -> list[list[float]]:
+        embedded_texts.extend(texts)
+        return [[1.0, float(index)] for index, _text in enumerate(texts)]
+
+    monkeypatch.setattr("skillevaluator.embedding.client.EmbeddingClient.embed", embed_without_network)
+
+    result = CliRunner().invoke(cli, ["similarity-check", str(collection), "--type", "skill"])
+
+    assert result.exit_code == 0, result.output
+    assert "Passed required checks" in result.output
+    assert sorted(embedded_texts) == [
+        "autoreview: Review changes with multiple agents",
+        "second-skill: Exercise an unrelated workflow",
+    ]
+
+
+def test_tier2_clis_scan_contained_agent_directory_alias_once(tmp_path: Path, monkeypatch) -> None:
+    collection = tmp_path / "skills"
+    skill = collection / "agent-alias"
+    canonical = skill / ".claude"
+    canonical.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: agent-alias\ndescription: Share one canonical directory across coding agents\n---\n\n"
+        "# Agent Alias\n\nRead the canonical agent directory before changing any project files in this skill.\n"
+    )
+    (canonical / "shared.md").write_text(
+        "# Shared context\n\nSHARED_CANARY: use these same instructions for every coding agent that loads this skill.\n"
+    )
+    try:
+        (skill / ".agents").symlink_to(canonical.name, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    second = collection / "second-skill"
+    second.mkdir()
+    (second / "SKILL.md").write_text("---\nname: second-skill\ndescription: Exercise an unrelated workflow\n---\n")
+
+    embedded_texts: list[str] = []
+
+    def embed_orthogonally(_self, texts: list[str]) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for text in texts:
+            vector = [0.0] * 64
+            vector[len(embedded_texts)] = 1.0
+            embedded_texts.append(text)
+            vectors.append(vector)
+        return vectors
+
+    monkeypatch.setattr("skillevaluator.embedding.client.EmbeddingClient.embed", embed_orthogonally)
+
+    similarity = CliRunner().invoke(cli, ["similarity-check", str(collection), "--type", "skill"])
+    context = CliRunner().invoke(cli, ["context-optimization-check", str(skill), "--threshold", "1.0"])
+
+    assert similarity.exit_code == 0, similarity.output
+    assert context.exit_code == 0, context.output
+    assert "symbolic link or reparse point" not in click.unstyle(context.output)
+    assert sum("SHARED_CANARY" in text for text in embedded_texts) == 1
+
+
+@pytest.mark.parametrize(
+    ("command", "runner_path"),
+    [
+        pytest.param("similarity-check", "skillevaluator.tier2.commands.run_similarity_check", id="similarity"),
+        pytest.param(
+            "context-optimization-check",
+            "skillevaluator.tier2.commands.run_context_optimization_check",
+            id="context",
+        ),
+        pytest.param("dedup-scan", "skillevaluator.tier2.commands.run_dedup_scan", id="dedup-alias"),
+    ],
+)
+def test_tier2_commands_reject_unresolved_root_symlinks(
+    tmp_path: Path,
+    monkeypatch,
+    command: str,
+    runner_path: str,
+) -> None:
+    target = tmp_path / "real-skill"
+    target.mkdir()
+    linked_target = tmp_path / "linked-skill"
+    try:
+        linked_target.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Directory symlinks are unavailable: {exc}")
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("Tier 2 runner must not receive a linked root")
+
+    monkeypatch.setattr(runner_path, must_not_run)
+
+    result = CliRunner().invoke(cli, [command, str(linked_target)])
+
+    assert result.exit_code == 2, result.output
+    assert "symlink or reparse point" in result.output
+    assert str(target) not in result.output
+
+
+def test_validate_rejects_linked_root_before_default_tier2_run(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "real-skill"
+    target.mkdir()
+    (target / "SKILL.md").write_text(
+        "---\nname: sample\ndescription: Sample skill\n---\n",
+        encoding="utf-8",
+    )
+    linked_target = tmp_path / "linked-skill"
+    try:
+        linked_target.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Directory symlinks are unavailable: {exc}")
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("Validation must not receive a linked root when Tier 2 is enabled")
+
+    monkeypatch.setattr("skillevaluator.cli.run_validation", must_not_run)
+
+    result = CliRunner().invoke(cli, ["validate", str(linked_target)])
+
+    assert result.exit_code == 2, result.output
+    assert "symlink or reparse point" in result.output
+    assert str(target) not in result.output
+
+
+def test_validate_preserves_linked_root_support_when_tier2_is_disabled(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "real-skill"
+    target.mkdir()
+    (target / "SKILL.md").write_text(
+        "---\nname: real-skill\ndescription: Validate the Tier 1-only linked-root compatibility path.\n---\n",
+        encoding="utf-8",
+    )
+    linked_target = tmp_path / "linked-skill"
+    try:
+        linked_target.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Directory symlinks are unavailable: {exc}")
+
+    observed_targets: list[Path] = []
+
+    def record_validation(path: Path, **_kwargs) -> list[ValidationResult]:
+        observed_targets.append(path)
+        return [ValidationResult(validator_name="schema", passed=True)]
+
+    monkeypatch.setattr("skillevaluator.cli.run_validation", record_validation)
+
+    result = CliRunner().invoke(
+        cli,
+        ["validate", "--no-tier3", str(linked_target), "--no-dedup", "--checks", "schema"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "symlink or reparse point" not in result.output
+    assert observed_targets == [target.resolve()]
+
+
+@pytest.mark.parametrize(
+    ("extension", "report_formats"),
+    [
+        (".json", "json,html,markdown"),
+        (".html", "json,html,markdown"),
+        (".md", "json,html,markdown"),
+        (".sarif.json", "sarif"),
+        (".junit.xml", "junit"),
+    ],
+)
+def test_similarity_cli_rejects_catalog_collision_with_every_selected_report(
+    tmp_path: Path,
+    monkeypatch,
+    extension: str,
+    report_formats: str,
+) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    catalog = reports / f"skillevaluator-similarity{extension}"
+    catalog.write_text("catalog must survive", encoding="utf-8")
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("Similarity must not run when its catalog would be overwritten")
+
+    monkeypatch.setattr("skillevaluator.tier2.commands.run_similarity_check", must_not_run)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "similarity-check",
+            str(skill),
+            "--save-catalog",
+            str(catalog),
+            "-r",
+            report_formats,
+            "-o",
+            str(reports),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "catalog" in result.output.lower()
+    assert "report" in result.output.lower()
+    assert catalog.read_text(encoding="utf-8") == "catalog must survive"
+
+
+def test_similarity_cli_rejects_catalog_collision_through_output_directory_symlink(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    reports = tmp_path / "real-reports"
+    reports.mkdir()
+    reports_alias = tmp_path / "reports-alias"
+    try:
+        reports_alias.symlink_to(reports, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Directory symlinks are unavailable: {exc}")
+    catalog = reports / "skillevaluator-similarity.json"
+    catalog.write_text("catalog must survive", encoding="utf-8")
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("Similarity must not run when resolved output paths collide")
+
+    monkeypatch.setattr("skillevaluator.tier2.commands.run_similarity_check", must_not_run)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "similarity-check",
+            str(skill),
+            "--save-catalog",
+            str(catalog),
+            "-r",
+            "json",
+            "-o",
+            str(reports_alias),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert catalog.read_text(encoding="utf-8") == "catalog must survive"
+
+
+def test_similarity_cli_rejects_query_catalog_collision_with_generated_report(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    catalog = reports / "skillevaluator-similarity.json"
+    catalog.write_text("existing catalog must survive", encoding="utf-8")
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("Similarity must not run when its input catalog would be overwritten")
+
+    monkeypatch.setattr("skillevaluator.tier2.commands.run_similarity_check", must_not_run)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "similarity-check",
+            str(skill),
+            "--catalog",
+            str(catalog),
+            "-r",
+            "json",
+            "-o",
+            str(reports),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "catalog" in result.output.lower()
+    assert "report" in result.output.lower()
+    assert catalog.read_text(encoding="utf-8") == "existing catalog must survive"
+
+
+def test_similarity_cli_allows_catalog_name_when_only_cli_report_is_selected(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    reports = tmp_path / "reports"
+    catalog = reports / "skillevaluator-similarity.json"
+    called = False
+
+    def run_without_file_report(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return [ValidationResult(validator_name="Similarity Check")]
+
+    monkeypatch.setattr("skillevaluator.tier2.commands.run_similarity_check", run_without_file_report)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "similarity-check",
+            str(skill),
+            "--save-catalog",
+            str(catalog),
+            "-r",
+            "cli",
+            "-o",
+            str(reports),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert called
+
+
+def test_similarity_cli_reports_unsafe_output_path_without_traceback(tmp_path: Path, monkeypatch) -> None:
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    reports = tmp_path / "reports"
+    reports.symlink_to(external, target_is_directory=True)
+    monkeypatch.setattr(
+        "skillevaluator.tier2.commands.run_similarity_check",
+        lambda *_args, **_kwargs: [ValidationResult(validator_name="Similarity Check")],
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["similarity-check", str(skill), "-r", "json", "-o", str(reports)],
+    )
+
+    assert result.exit_code == 1
+    assert "Unsafe report output path" in result.output
+    assert "Traceback" not in result.output
+    assert list(external.iterdir()) == []
+
+
+def _tier2_result_with_host_paths(target: Path) -> list[ValidationResult]:
+    absolute_manifest = str(target / "SKILL.md")
+    result = ValidationResult(
+        validator_name="Tier 2 path safety",
+        validator_description=f"Validation for {target}",
+    )
+    result.add_success(
+        "collection",
+        f"Collected {absolute_manifest}",
+        path=absolute_manifest,
+        nested={"paths": [absolute_manifest]},
+    )
+    result.add_finding(
+        Finding(
+            category="CONTENT_DEDUP",
+            severity=Severity.HIGH,
+            check_name="path_leak",
+            message=f"Unsafe content at {absolute_manifest}",
+            file_path=absolute_manifest,
+            line_content=f"read from {absolute_manifest}",
+            suggestion=f"Review {target}",
+            metadata={"target": str(target), "nested": {"manifest": absolute_manifest}},
+        )
+    )
+    result.add_warning(f"Warning for {absolute_manifest}")
+    result.add_message(f"Message for {target}")
+    result.metadata["target"] = str(target)
+    return [result]
+
+
+@pytest.mark.parametrize(
+    ("command", "runner_path", "basename"),
+    [
+        pytest.param(
+            "similarity-check",
+            "skillevaluator.tier2.commands.run_similarity_check",
+            "skillevaluator-similarity",
+            id="similarity",
+        ),
+        pytest.param(
+            "context-optimization-check",
+            "skillevaluator.tier2.commands.run_context_optimization_check",
+            "skillevaluator-context",
+            id="context",
+        ),
+        pytest.param(
+            "dedup-scan",
+            "skillevaluator.tier2.commands.run_dedup_scan",
+            "skillevaluator-dedup",
+            id="dedup-alias",
+        ),
+    ],
+)
+def test_tier2_commands_redact_absolute_target_paths_from_all_reports(
+    tmp_path: Path,
+    monkeypatch,
+    command: str,
+    runner_path: str,
+    basename: str,
+) -> None:
+    target = tmp_path / "external-skill"
+    target.mkdir()
+    reports = tmp_path / "reports"
+    monkeypatch.setattr(runner_path, lambda *_args, **_kwargs: _tier2_result_with_host_paths(target))
+
+    result = CliRunner().invoke(
+        cli,
+        [command, str(target), "-r", "cli,json,html,markdown", "-o", str(reports)],
+    )
+
+    assert result.exit_code == 1, result.output
+    rendered = [result.output]
+    for extension in (".json", ".html", ".md"):
+        report_path = reports / f"{basename}{extension}"
+        assert report_path.is_file()
+        rendered.append(report_path.read_text(encoding="utf-8"))
+    for output in rendered:
+        assert str(target) not in output
+        assert str(target / "SKILL.md") not in output
+        assert target.name in output
+
+
+def test_tier3_validate_help() -> None:
+    result = CliRunner().invoke(cli, ["tier3", "validate", "--help"])
+
+    assert result.exit_code == 0
+    assert "--harbor-contract" in result.output
+
+
+@pytest.mark.parametrize("args", [["doctor", "--help"], ["tier3", "doctor", "--help"]])
+def test_doctor_verify_models_help_describes_live_catalog_probe(args: list[str]) -> None:
+    result = CliRunner().invoke(cli, args, terminal_width=240)
+
+    assert result.exit_code == 0
+    assert "--verify-models" in result.output
+    normalized_output = " ".join(result.output.split()).lower()
+    assert "catalog reachability" in normalized_output
+    assert "authenticated" not in normalized_output
+
+
+@pytest.fixture
+def doctor_calls(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    """Record each tier's doctor call instead of probing scanners, providers or backends."""
+    import skillevaluator.doctor as readiness
+    from skillevaluator.tier3 import commands as tier3_commands
+
+    calls: list[dict] = []
+    monkeypatch.setattr(readiness, "doctor", lambda **options: calls.append(options) or 0)
+    monkeypatch.setattr(tier3_commands, "doctor", lambda **options: calls.append({"tier": "3", **options}) or 0)
+    return calls
+
+
+@pytest.mark.parametrize("command", ["doctor", "health-check"])
+def test_doctor_without_tier_keeps_checking_only_live_evaluation(doctor_calls, command) -> None:
+    result = CliRunner().invoke(cli, [command, "-a", "codex", "--env-mode", "docker"])
+
+    assert result.exit_code == 0, result.output
+    assert doctor_calls == [
+        {
+            "tier": "3",
+            "agents": "codex",
+            "env_mode": "docker",
+            "environment_kwarg": (),
+            "verify_models": False,
+            "agent_model": (),
+            "environment_kwargs": {},
+            "backend": "harbor",
+        }
+    ]
+
+
+@pytest.mark.parametrize("command", ["doctor", "health-check"])
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (["--tier", "1"], {"tier": "1", "checks": None, "verify_models": False, "timeout": 60.0}),
+        (
+            ["--tier", "1", "--checks", "security,deps", "--timeout", "4"],
+            {"tier": "1", "checks": "security,deps", "verify_models": False, "timeout": 4.0},
+        ),
+        (["--tier", "2"], {"tier": "2", "checks": None, "verify_models": False, "timeout": 60.0}),
+    ],
+)
+def test_doctor_routes_lower_tiers_without_live_evaluation(doctor_calls, command, args, expected) -> None:
+    result = CliRunner().invoke(cli, [command, *args])
+
+    assert result.exit_code == 0, result.output
+    assert doctor_calls == [expected]
+
+
+@pytest.mark.parametrize(("args", "timeout"), [([], 60.0), (["--timeout", "5"], 5.0)])
+def test_doctor_verify_models_reaches_tier2_live_probes(doctor_calls, args, timeout) -> None:
+    result = CliRunner().invoke(cli, ["doctor", "--tier", "2", "--verify-models", *args])
+
+    assert result.exit_code == 0, result.output
+    assert doctor_calls == [{"tier": "2", "checks": None, "verify_models": True, "timeout": timeout}]
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (["doctor", "--tier", "2", "--timeout", "5"], "--timeout does not apply to --tier 2 without --verify-models."),
+        (["health-check", "--tier", "2", "--timeout", "5"], "--timeout does not apply to --tier 2."),
+    ],
+)
+def test_doctor_timeout_needs_a_live_tier2_request(doctor_calls, args, message) -> None:
+    result = CliRunner().invoke(cli, args)
+
+    assert result.exit_code == 2, result.output
+    assert message in " ".join(result.output.split())
+    assert doctor_calls == []
+
+
+@pytest.mark.parametrize("command", ["doctor", "health-check"])
+def test_doctor_timeout_still_bounds_tier1_under_tier_all(doctor_calls, command) -> None:
+    result = CliRunner().invoke(cli, [command, "--tier", "all", "--timeout", "5", "--env-mode", "local"])
+
+    assert result.exit_code == 0, result.output
+    assert [(call["tier"], call.get("timeout")) for call in doctor_calls] == [("1", 5.0), ("2", 5.0), ("3", None)]
+
+
+def test_health_check_timeout_help_covers_only_tier1() -> None:
+    result = CliRunner().invoke(cli, ["health-check", "--help"])
+
+    assert result.exit_code == 0, result.output
+    normalized = " ".join(result.output.split())
+    assert "Seconds allowed for each Tier 1 scanner probe." in normalized
+    assert "live request" not in normalized
+
+
+@pytest.mark.parametrize("command", ["doctor", "health-check"])
+def test_doctor_all_checks_every_tier_after_a_failure(monkeypatch, command) -> None:
+    import skillevaluator.doctor as readiness
+    from skillevaluator.tier3 import commands as tier3_commands
+
+    tiers: list[str] = []
+    monkeypatch.setattr(readiness, "doctor", lambda **options: tiers.append(options["tier"]) or 1)
+    monkeypatch.setattr(tier3_commands, "doctor", lambda **_options: tiers.append("3") or 0)
+
+    result = CliRunner().invoke(cli, [command, "--tier", "all", "--checks", "pii", "--env-mode", "local"])
+
+    assert result.exit_code == 1, result.output
+    assert tiers == ["1", "2", "3"]
+
+
+def _fail_tier3_commands_import(monkeypatch, *, missing: str) -> None:
+    real_import = builtins.__import__
+
+    def _import(name, *args, **kwargs):
+        if name == "skillevaluator.tier3.commands":
+            raise ModuleNotFoundError(f"No module named '{missing}'", name=missing)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _import)
+
+
+@pytest.mark.parametrize("args", [["doctor"], ["doctor", "--tier", "3"], ["tier3", "doctor"]])
+def test_doctor_without_the_tier3_extra_names_the_missing_extra(monkeypatch, args) -> None:
+    _fail_tier3_commands_import(monkeypatch, missing="harbor")
+
+    result = CliRunner().invoke(cli, args)
+
+    assert result.exit_code == 1
+    assert not isinstance(result.exception, ImportError)
+    assert "Install skillevaluator[tier3]" in result.output
+
+
+@pytest.mark.parametrize("command", ["doctor", "health-check"])
+def test_doctor_all_without_the_tier3_extra_still_checks_lower_tiers(monkeypatch, command) -> None:
+    import skillevaluator.doctor as readiness
+
+    tiers: list[str] = []
+    monkeypatch.setattr(readiness, "doctor", lambda **options: tiers.append(options["tier"]) or 0)
+    _fail_tier3_commands_import(monkeypatch, missing="harbor")
+
+    result = CliRunner().invoke(cli, [command, "--tier", "all"])
+
+    assert result.exit_code == 1, result.output
+    assert tiers == ["1", "2"]
+    assert "Install skillevaluator[tier3]" in result.output
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ImportError("cannot import name 'GKEExecStreamClosedError'", name="harbor.environments.gke"),
+        ModuleNotFoundError("No module named 'harbor.missing'", name="harbor.missing"),
+    ],
+)
+def test_doctor_preserves_an_installed_dependency_import_failure(monkeypatch, error) -> None:
+    real_import = builtins.__import__
+
+    def broken_import(name, *args, **kwargs):
+        if name == "skillevaluator.tier3.commands":
+            raise error
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", broken_import)
+    result = CliRunner().invoke(cli, ["doctor"])
+
+    assert result.exception is error
+    assert "dependencies are not installed" not in result.output
+
+
+def test_doctor_keeps_an_unrelated_import_error(monkeypatch) -> None:
+    _fail_tier3_commands_import(monkeypatch, missing="skillevaluator.tier3.missing")
+
+    result = CliRunner().invoke(cli, ["doctor", "--tier", "3"])
+
+    assert isinstance(result.exception, ModuleNotFoundError)
+    assert result.exception.name == "skillevaluator.tier3.missing"
+    assert "Install skillevaluator[tier3]" not in result.output
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["doctor", "--tier", "4"],
+        ["doctor", "--checks", "schema"],
+        ["doctor", "--timeout", "5"],
+        ["doctor", "--tier", "1", "--checks", "unknown"],
+        ["doctor", "--tier", "all", "--checks", "unknown"],
+        ["doctor", "--tier", "2", "--checks", "schema"],
+        ["doctor", "--tier", "1", "--verify-models"],
+        ["doctor", "--tier", "1", "--agents", "codex"],
+        ["doctor", "--tier", "1", "--env-mode", "docker"],
+        ["doctor", "--tier", "2", "--ek", "region=us"],
+        ["doctor", "--tier", "2", "--agent-model", "codex=gpt"],
+        ["doctor", "--tier", "1", "--timeout", "0"],
+        ["doctor", "--tier", "1", "--timeout", "-1"],
+        ["doctor", "--tier", "1", "--timeout", "nan"],
+        ["doctor", "--tier", "1", "--timeout", "inf"],
+        ["doctor", "--tier", "1", "--checks", "code", "--timeout", "1e300"],
+        ["doctor", "--tier", "1", "--timeout", "3601"],
+        ["doctor", "--tier", "2", "--timeout", "5"],
+        ["doctor", "--tier", "3", "--timeout", "5"],
+        ["health-check", "--tier", "2", "--timeout", "5"],
+        ["doctor", "--tier", "all", "--ek", "malformed"],
+        ["health-check", "--tier", "2", "--verify-models"],
+        ["health-check", "--tier", "1", "-a", "codex"],
+        ["tier3", "doctor", "--tier", "1"],
+        ["tier3", "doctor", "--checks", "schema"],
+        ["tier3", "doctor", "--timeout", "5"],
+    ],
+)
+def test_doctor_rejects_options_for_unselected_tiers_before_any_probe(doctor_calls, args) -> None:
+    result = CliRunner().invoke(cli, args)
+
+    assert result.exit_code == 2, result.output
+    assert doctor_calls == []
+
+
+@pytest.mark.parametrize("command", ["doctor", "health-check"])
+def test_documented_readiness_examples_are_valid(doctor_calls, command) -> None:
+    import shlex
+
+    reference = (Path(__file__).parents[1] / "docs" / "cli-reference.mdx").read_text(encoding="utf-8")
+    section = reference.split(f"\n## {command}\n", 1)[1].split("\n## ", 1)[0]
+    examples = [line for line in section.splitlines() if line.startswith(f"skillevaluator {command}")]
+
+    assert len(examples) >= 2
+    for example in examples:
+        result = CliRunner().invoke(cli, shlex.split(example, comments=True)[1:])
+        assert result.exit_code == 0, f"{example}\n{result.output}"
+
+
+def test_tier3_doctor_stays_live_evaluation_only(doctor_calls) -> None:
+    result = CliRunner().invoke(cli, ["tier3", "doctor", "-a", "codex", "--verify-models"])
+
+    assert result.exit_code == 0, result.output
+    assert [call["tier"] for call in doctor_calls] == ["3"]
+    assert doctor_calls[0]["verify_models"] is True
+
+
+def test_removed_benchmark_authoring_command_is_unavailable() -> None:
+    removed_command = "convert" + "-benchmark"
+
+    for args in ([removed_command, "--help"], ["tier3", removed_command, "--help"]):
+        result = CliRunner().invoke(cli, args)
+        assert result.exit_code == 2
+        assert f"No such command '{removed_command}'" in result.output
+
+
+def test_live_eval_help_uses_skill_evaluator_runtime_and_grading_names() -> None:
+    runner = CliRunner()
+
+    evaluate = runner.invoke(cli, ["evaluate", "--help"])
+    assert evaluate.exit_code == 0
+    assert "e2b" in evaluate.output
+    assert "modal" in evaluate.output
+    assert "default_plus_custom" in evaluate.output
+    assert "harbor-environment" not in evaluate.output
+    assert "k8s-sandbox" not in evaluate.output
+    assert "local" in evaluate.output
+    assert "--autopilot" in evaluate.output
+    assert "--progress [auto|rich|plain|off]" in evaluate.output
+
+    grader = runner.invoke(cli, ["init-custom-grader", "--help"])
+    assert grader.exit_code == 0
+    assert "default_plus_custom" in grader.output
+
+
+def test_live_eval_progress_is_presentation_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skillevaluator.evaluation import EvaluationService
+    from skillevaluator.tier3.harbor.progress import PlainProgressReporter
+
+    captured: dict[str, object] = {}
+
+    def _fake_evaluate(self, options, *, progress_reporter=None):
+        captured["options"] = options
+        captured["reporter"] = progress_reporter
+        return {"execution_status": "succeeded", "execution_errors": []}
+
+    monkeypatch.setattr(EvaluationService, "evaluate", _fake_evaluate, raising=True)
+    result = CliRunner().invoke(
+        cli,
+        ["evaluate", str(Path(__file__).parent / "fixtures" / "skills" / "simple"), "--progress", "plain"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert isinstance(captured["reporter"], PlainProgressReporter)
+    assert "progress" not in captured["options"].engine_kwargs()
+
+
+@pytest.mark.parametrize("command", [("evaluate",), ("tier3", "evaluate")])
+@pytest.mark.parametrize(("interval_args", "expected"), [((), 60.0), (("--progress-interval", "12.5"), 12.5)])
+def test_live_eval_progress_interval_configures_reporter(
+    monkeypatch: pytest.MonkeyPatch,
+    command: tuple[str, ...],
+    interval_args: tuple[str, ...],
+    expected: float,
+) -> None:
+    from skillevaluator.evaluation import EvaluationService
+    from skillevaluator.tier3.harbor.progress import PlainProgressReporter
+
+    captured: dict[str, object] = {}
+
+    def _fake_evaluate(self, options, *, progress_reporter=None):
+        captured["options"] = options
+        captured["reporter"] = progress_reporter
+        return {"execution_status": "succeeded", "execution_errors": []}
+
+    monkeypatch.setattr(EvaluationService, "evaluate", _fake_evaluate, raising=True)
+    result = CliRunner().invoke(
+        cli,
+        [
+            *command,
+            str(Path(__file__).parent / "fixtures" / "skills" / "simple"),
+            "--progress",
+            "plain",
+            *interval_args,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert isinstance(captured["reporter"], PlainProgressReporter)
+    assert captured["reporter"]._refresh_interval == expected
+    assert "progress_interval" not in captured["options"].engine_kwargs()
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "0.01", "86401", "-1"])
+def test_live_eval_rejects_invalid_progress_interval(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    from skillevaluator.evaluation import EvaluationService
+
+    def _unexpected_evaluate(self, options, *, progress_reporter=None):
+        raise AssertionError("evaluation must not start with an invalid progress interval")
+
+    monkeypatch.setattr(EvaluationService, "evaluate", _unexpected_evaluate, raising=True)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "evaluate",
+            str(Path(__file__).parent / "fixtures" / "skills" / "simple"),
+            "--progress-interval",
+            value,
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "Invalid value for '--progress-interval'" in result.output
+    assert "must be finite and within [0.05, 86400] seconds" in result.output
+
+
+_EVALUATED_REPOSITORY = "NVIDIA/NVFlare"
+_EVALUATED_COMMIT = "2263a2ebdab903e87f7e7c0a001d22c3a926a9cf"
+_EVALUATOR_CONTAINER = "ghcr.io/nvidia/skillevaluator@sha256:" + "0117bc2e" * 8
+
+
+def test_standalone_evaluate_forwards_the_evaluated_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The standalone producer records the identity instead of persisting null.
+
+    ``tier3 evaluate`` writes its own ``run_config.json``, so an identity the
+    operator supplied has to reach the engine here just as it does through
+    ``validate``.
+    """
+    from skillevaluator.evaluation import EvaluationService
+
+    captured: dict[str, object] = {}
+
+    def _fake_evaluate(self, options, *, progress_reporter=None):
+        captured["options"] = options
+        return {"execution_status": "succeeded", "execution_errors": []}
+
+    monkeypatch.setattr(EvaluationService, "evaluate", _fake_evaluate, raising=True)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "evaluate",
+            str(Path(__file__).parent / "fixtures" / "skills" / "simple"),
+            "--progress",
+            "plain",
+            "--evaluated-source-repository",
+            _EVALUATED_REPOSITORY,
+            "--evaluated-source-revision",
+            _EVALUATED_COMMIT,
+            "--evaluator-container-revision",
+            _EVALUATOR_CONTAINER,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["options"].engine_kwargs()["evaluated_source"] == {
+        "repository": _EVALUATED_REPOSITORY,
+        "commit": _EVALUATED_COMMIT,
+        "evaluator_container_revision": _EVALUATOR_CONTAINER,
+    }
+
+
+@pytest.mark.parametrize("command", [["evaluate"], ["tier3", "evaluate"]])
+def test_evaluate_without_the_tier3_extra_names_the_missing_extra(monkeypatch: pytest.MonkeyPatch, command) -> None:
+    from skillevaluator.evaluation import EvaluationService
+
+    def _missing_harbor(self, options, *, progress_reporter=None):
+        raise ModuleNotFoundError("No module named 'harbor'", name="harbor")
+
+    monkeypatch.setattr(EvaluationService, "evaluate", _missing_harbor, raising=True)
+    result = CliRunner().invoke(
+        cli, [*command, str(Path(__file__).parent / "fixtures" / "skills" / "simple"), "--progress", "plain"]
+    )
+
+    assert result.exit_code == 1
+    assert "Install skillevaluator[tier3]" in result.output
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ImportError("cannot import name 'GKEExecStreamClosedError'", name="harbor.environments.gke"),
+        ModuleNotFoundError("No module named 'harbor.missing'", name="harbor.missing"),
+    ],
+)
+def test_evaluate_preserves_an_installed_dependency_import_failure(monkeypatch, error) -> None:
+    from skillevaluator.evaluation import EvaluationService
+
+    def broken_evaluate(self, options, *, progress_reporter=None):
+        raise error
+
+    monkeypatch.setattr(EvaluationService, "evaluate", broken_evaluate)
+    result = CliRunner().invoke(
+        cli, ["evaluate", str(Path(__file__).parent / "fixtures" / "skills" / "simple"), "--progress", "off"]
+    )
+
+    assert result.exit_code == 1
+    assert str(error) in result.output
+    assert "dependencies are not installed" not in result.output
+
+
+@pytest.mark.parametrize("env_mode", ["docker", "local"])
+def test_evaluate_autopilot_without_tier3_extra_names_it_before_generation(monkeypatch, tmp_path, env_mode) -> None:
+    skill = tmp_path / "demo"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: demo\ndescription: Use for testing diagnostics.\n---\n# Demo\n")
+    monkeypatch.setenv("SKILL_EVAL_LLM_PROVIDER", "nv_build")
+    monkeypatch.setenv("NVIDIA_API_KEY", "placeholder-for-offline-import-test")
+    real_import = builtins.__import__
+
+    def missing_workflow(name, *args, **kwargs):
+        if name == "skillevaluator.tier3.workflow":
+            raise ModuleNotFoundError("No module named 'harbor'", name="harbor")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_workflow)
+    result = CliRunner().invoke(
+        cli, ["tier3", "evaluate", str(skill), "--autopilot", "--env-mode", env_mode, "--progress", "off"]
+    )
+
+    assert result.exit_code == 1
+    assert "Install skillevaluator[tier3]" in result.output
+    assert not (skill / "evals").exists()
+
+
+def test_evaluate_keeps_an_unrelated_import_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skillevaluator.evaluation import EvaluationService
+
+    def _broken_import(self, options, *, progress_reporter=None):
+        raise ModuleNotFoundError("No module named 'skillevaluator.tier3.missing'", name="skillevaluator.tier3.missing")
+
+    monkeypatch.setattr(EvaluationService, "evaluate", _broken_import, raising=True)
+    result = CliRunner().invoke(
+        cli, ["evaluate", str(Path(__file__).parent / "fixtures" / "skills" / "simple"), "--progress", "plain"]
+    )
+
+    assert result.exit_code == 1
+    assert "No module named 'skillevaluator.tier3.missing'" in result.output
+    assert "Install skillevaluator[tier3]" not in result.output
+
+
+def test_standalone_evaluate_refuses_a_non_canonical_revision(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Refusing at the boundary beats a card that says the field was never recorded."""
+    from skillevaluator.evaluation import EvaluationService
+
+    def _unreachable(self, options, *, progress_reporter=None):
+        raise AssertionError("the engine must not run on a non-canonical identity")
+
+    monkeypatch.setattr(EvaluationService, "evaluate", _unreachable, raising=True)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "evaluate",
+            str(Path(__file__).parent / "fixtures" / "skills" / "simple"),
+            "--progress",
+            "plain",
+            "--evaluated-source-revision",
+            _EVALUATED_COMMIT[:7],
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "expected" in result.output
+
+
+def test_tier3_evaluate_help_lists_the_provenance_options() -> None:
+    result = CliRunner().invoke(cli, ["tier3", "evaluate", "--help"])
+
+    assert result.exit_code == 0
+    assert "--evaluated-source-repository" in result.output
+    assert "--evaluated-source-revision" in result.output
+    assert "--evaluator-container-revision" in result.output
+
+
+def test_harbor_view_command_uses_the_skillevaluator_wrapper() -> None:
+    command = format_harbor_view_command("/tmp/jobs")
+
+    assert command == "skillevaluator tier3 harbor-view /tmp/jobs"
+
+
+def test_harbor_view_command_shell_quotes_paths() -> None:
+    command = format_harbor_view_command("/tmp/jobs with spaces")
+
+    assert command == "skillevaluator tier3 harbor-view '/tmp/jobs with spaces'"
+
+
+def test_harbor_view_is_available_as_a_top_level_command(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from skillevaluator.tier3 import commands
+
+    captured: list[Path] = []
+    monkeypatch.setattr(commands, "harbor_view", lambda jobs_dir: captured.append(jobs_dir) or 0)
+
+    result = CliRunner().invoke(cli, ["harbor-view", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert captured == [tmp_path]
+
+
+def test_validate_help_is_detailed() -> None:
+    result = CliRunner().invoke(cli, ["validate", "-h"])
+
+    assert result.exit_code == 0
+    # Grouped Tier 3 options under their own heading.
+    assert "Tier 3 · Live Agent Evaluation:" in result.output
+    # Sectioned epilog (parity with skill-evaluator validate -h).
+    for section in ("Content types", "Report formats", "Tiers:", "LLM analysis", "Examples:"):
+        assert section in result.output
+    # Example commands are present.
+    assert "skillevaluator validate ./my-skill" in result.output
+
+
+def test_tier1_validate_alias_shows_only_tier1_options() -> None:
+    result = CliRunner().invoke(cli, ["tier1", "validate", "-h"])
+
+    assert result.exit_code == 0
+    assert "--checks" in result.output
+    assert "--no-llm" in result.output
+    assert "--agents" not in result.output
+    assert "--dedup" not in result.output
+
+
+def test_validate_code_integrity_reports_only_static_test_evidence(tmp_path: Path, monkeypatch) -> None:
+    skill = tmp_path / "untrusted-skill"
+    tests_dir = skill / "tests"
+    tests_dir.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\n"
+        "name: untrusted-skill\n"
+        "description: Exercise the static test-discovery boundary.\n"
+        "---\n"
+        "\n"
+        "# Untrusted skill\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SEC001_TEST_SECRET", "must-not-be-read")
+    markers = {name: tmp_path / f"{name}-executed" for name in ("pytest-module", "conftest", "plugin", "test-module")}
+    (skill / "pytest.py").write_text(
+        f"from pathlib import Path\nPath({str(markers['pytest-module'])!r}).write_text('executed', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    (skill / "conftest.py").write_text(
+        "import os\n"
+        "import socket\n"
+        "from pathlib import Path\n"
+        "pytest_plugins = ('target_plugin',)\n"
+        "try:\n"
+        "    socket.create_connection(('127.0.0.1', 9), timeout=0.01)\n"
+        "except OSError:\n"
+        "    pass\n"
+        f"Path({str(markers['conftest'])!r}).write_text(os.environ['SEC001_TEST_SECRET'], encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    (skill / "target_plugin.py").write_text(
+        f"from pathlib import Path\nPath({str(markers['plugin'])!r}).write_text('executed', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    (tests_dir / "test_payload.py").write_text(
+        f"from pathlib import Path\nPath({str(markers['test-module'])!r}).write_text('executed', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    (tests_dir / "malformed_test.py").write_bytes(b"\xff\xfe\x00")
+
+    outside_test = tmp_path / "outside_test.py"
+    outside_test.write_text("raise RuntimeError('must not load')\n", encoding="utf-8")
+    with contextlib.suppress(OSError):
+        (tests_dir / "test_symlink.py").symlink_to(outside_test)
+
+    # Keep this test focused on the real HygieneValidator boundary; scanner
+    # integrations have their own execution and status-contract coverage.
+    monkeypatch.setattr(CodeRiskValidator, "validate", lambda _self, _path: ValidationResult())
+    monkeypatch.setattr(SecretsValidator, "validate", lambda _self, _path: ValidationResult())
+
+    reports = tmp_path / "reports"
+    result = CliRunner().invoke(
+        cli,
+        [
+            "validate",
+            "--no-tier3",
+            str(skill),
+            "--verbose",
+            "--checks",
+            "code-integrity",
+            "--no-dedup",
+            "-r",
+            "cli,json,markdown,html",
+            "-o",
+            str(reports),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert not [marker for marker in markers.values() if marker.exists()]
+    assert "Tests passed" not in result.output
+    assert "test coverage" not in result.output.lower()
+    normalized_output = " ".join(result.output.lower().split())
+    assert "target tests were not" in normalized_output
+    assert "executed and coverage was not measured" in normalized_output
+
+    report_paths = list(reports.glob("skillevaluator-output-*"))
+    assert len(report_paths) == 3
+    benchmark_path = reports / "BENCHMARK.md"
+    assert benchmark_path.is_file()
+    benchmark = benchmark_path.read_text(encoding="utf-8")
+    assert "# Skill Benchmark: untrusted-skill" in benchmark
+    assert "- Skill: `untrusted-skill`" in benchmark
+    data = json.loads(next(reports.glob("skillevaluator-output-*.json")).read_text(encoding="utf-8"))
+    hygiene = next(item for item in data["results"] if item["validator"] == "Code Integrity & Hygiene")
+    detail = next(item for item in hygiene["success_details"] if item["check"] == "test_discovery")
+    assert detail["metadata"] == {
+        "test_count": 2,
+        "execution_performed": False,
+        "coverage_measured": False,
+        "patterns": ["test_*.py", "*_test.py"],
+    }
+
+    for report in [*report_paths, benchmark_path]:
+        content = report.read_text(encoding="utf-8")
+        assert "target tests were not executed" in content.lower()
+        assert "coverage was not measured" in content.lower()
+        assert "Tests passed" not in content
+        assert "coverage_percent" not in content
+        assert "test_coverage" not in content
+
+
+def _medium_pii_skill(tmp_path: Path) -> Path:
+    skill = tmp_path / "pii-skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text(
+        "---\n"
+        "name: pii-skill\n"
+        "description: Exercise PII verification status handling.\n"
+        "---\n\n"
+        "# PII example\n\n"
+        "Contact Alice at 415-555-0123.\n"
+        "Contact Bob at 212-555-0199.\n",
+        encoding="utf-8",
+    )
+    return skill
+
+
+def test_pii_scan_requested_llm_verification_without_verdicts_is_incomplete(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "skillevaluator.inference.FindingVerifier.verify",
+        lambda _self, _findings, _skill_path: {},
+    )
+    reports = tmp_path / "reports"
+    skill = _medium_pii_skill(tmp_path)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "pii-scan",
+            str(skill),
+            "--llm-verify",
+            "-r",
+            "cli,json",
+            "-o",
+            str(reports),
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "INCOMPLETE" in result.output
+    payload = json.loads((reports / "skillevaluator-pii.json").read_text(encoding="utf-8"))
+    assert payload["overall_status"] == "incomplete"
+    assert payload["incomplete_scans"] == ["llm-verification"]
+    pii_result = payload["results"][0]
+    assert pii_result["status"] == "incomplete"
+    assert pii_result["incomplete_scans"] == ["llm-verification"]
+    assert pii_result["findings"]
+
+
+def test_pii_scan_without_llm_verification_preserves_static_behavior(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("LLM verification must not run without --llm-verify")
+
+    monkeypatch.setattr("skillevaluator.inference.FindingVerifier.verify", fail_if_called)
+    reports = tmp_path / "reports"
+    skill = _medium_pii_skill(tmp_path)
+
+    result = CliRunner().invoke(
+        cli,
+        ["pii-scan", str(skill), "-r", "json", "-o", str(reports)],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads((reports / "skillevaluator-pii.json").read_text(encoding="utf-8"))
+    assert payload["overall_status"] == "passed"
+    assert payload["incomplete_scans"] == []
+    assert payload["results"][0]["findings"]
+
+
+def test_pii_scan_partial_llm_verification_is_incomplete(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "skillevaluator.inference.FindingVerifier.verify",
+        lambda _self, _findings, _skill_path: {
+            0: {
+                "verdict": "true_positive",
+                "confidence": "high",
+                "reasoning": "The first phone number is personal data.",
+            }
+        },
+    )
+    reports = tmp_path / "reports"
+    skill = _medium_pii_skill(tmp_path)
+
+    result = CliRunner().invoke(
+        cli,
+        ["pii-scan", str(skill), "--llm-verify", "-r", "json", "-o", str(reports)],
+    )
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads((reports / "skillevaluator-pii.json").read_text(encoding="utf-8"))
+    assert payload["overall_status"] == "incomplete"
+    assert payload["incomplete_scans"] == ["llm-verification"]
+    findings = payload["results"][0]["findings"]
+    assert len(findings) == 2
+    assert findings[0]["metadata"]["llm_verdict"] == "true_positive"
+    assert "llm_verdict" not in findings[1]["metadata"]
+
+
+@pytest.mark.parametrize(
+    "malformed_verdict",
+    [
+        pytest.param(
+            {
+                "verdict": "invented_verdict",
+                "confidence": "high",
+                "reasoning": "This is not a supported verdict.",
+            },
+            id="unknown-verdict",
+        ),
+        pytest.param(
+            {
+                "verdict": [],
+                "confidence": "high",
+                "reasoning": "The verdict has the wrong type.",
+            },
+            id="non-string-verdict",
+        ),
+    ],
+)
+def test_pii_scan_malformed_llm_verdict_is_incomplete(
+    tmp_path: Path,
+    monkeypatch,
+    malformed_verdict: dict,
+) -> None:
+    monkeypatch.setattr(
+        "skillevaluator.inference.FindingVerifier.verify",
+        lambda _self, _findings, _skill_path: {
+            0: {
+                "verdict": "true_positive",
+                "confidence": "high",
+                "reasoning": "The first phone number is personal data.",
+            },
+            1: malformed_verdict,
+        },
+    )
+    reports = tmp_path / "reports"
+    skill = _medium_pii_skill(tmp_path)
+
+    result = CliRunner().invoke(
+        cli,
+        ["pii-scan", str(skill), "--llm-verify", "-r", "json", "-o", str(reports)],
+    )
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads((reports / "skillevaluator-pii.json").read_text(encoding="utf-8"))
+    assert payload["overall_status"] == "incomplete"
+    assert payload["incomplete_scans"] == ["llm-verification"]
+    findings = payload["results"][0]["findings"]
+    assert findings[0]["metadata"]["llm_verdict"] == "true_positive"
+    assert "llm_verdict" not in findings[1]["metadata"]
+
+
+@pytest.mark.parametrize("command_prefix", [["doctor"], ["tier3", "evaluate"], ["evaluate"]])
+def test_cli_environment_kwargs_malformed_syntax_exits_code_2_without_traceback(
+    tmp_path: Path,
+    command_prefix: list[str],
+) -> None:
+    """Verify malformed --ek arguments produce clean Click BadParameter exit code 2 without tracebacks."""
+    runner = CliRunner()
+    args = [*command_prefix, "--ek", "malformed_no_equal"]
+    if "evaluate" in command_prefix:
+        args.append(str(tmp_path))
+    result = runner.invoke(cli, args)
+    assert result.exit_code == 2
+    assert "Invalid value for '--ek'" in result.output
+    assert "KEY=VALUE" in result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize(
+    "sensitive_arg",
+    [
+        "authorization=secret_token",
+        "service_account_key=my_key",
+        "private_key=secret",
+    ],
+)
+@pytest.mark.parametrize("command_prefix", [["doctor"], ["tier3", "evaluate"]])
+def test_cli_environment_kwargs_sensitive_credential_exits_code_2_without_traceback(
+    tmp_path: Path,
+    command_prefix: list[str],
+    sensitive_arg: str,
+) -> None:
+    """Verify credential keys passed to --ek produce clean Click BadParameter exit code 2."""
+    runner = CliRunner()
+    args = [*command_prefix, "--ek", sensitive_arg]
+    if "evaluate" in command_prefix:
+        args.append(str(tmp_path))
+    result = runner.invoke(cli, args)
+    assert result.exit_code == 2
+    assert "Invalid value for '--ek'" in result.output
+    assert "Sensitive key or value detected" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_validate_junit_reports_scanner_crash_as_error(tmp_path: Path, monkeypatch) -> None:
+    import xml.etree.ElementTree as ET
+
+    skill = tmp_path / "demo"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: Exercise the JUnit mapping for a scanner that did not complete.\n---\n",
+        encoding="utf-8",
+    )
+    reports = tmp_path / "reports"
+
+    def crashed_scan(_path: Path, **_kwargs) -> list[ValidationResult]:
+        result = ValidationResult(validator_name="Code Risk", validator_description="Code risk")
+        result.add_error("Bandit did not return valid JSON; scan did not complete")
+        result.mark_scan_incomplete("bandit")
+        return [result]
+
+    monkeypatch.setattr("skillevaluator.cli.run_validation", crashed_scan)
+
+    result = CliRunner().invoke(
+        cli,
+        ["validate", "--no-tier3", str(skill), "--no-dedup", "--checks", "schema", "-r", "junit", "-o", str(reports)],
+    )
+
+    assert result.exit_code != 0, result.output
+    (report,) = reports.rglob("*.junit.xml")
+    root = ET.fromstring(report.read_text(encoding="utf-8"))
+    errors = {case.attrib["name"]: case.find("error") for case in root.iter("testcase")}
+    assert errors["error"] is not None
+    assert errors["error"].attrib["type"] == "execution"
+    assert errors["incomplete/bandit"] is not None
+    assert errors["incomplete/bandit"].attrib["type"] == "incomplete"
+    assert int(root.attrib["errors"]) == 2
+    assert int(root.attrib["failures"]) == 0

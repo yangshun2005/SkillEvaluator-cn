@@ -1,0 +1,940 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""LLM-as-Judge Rubric Evaluator for skill quality.
+
+Ported from SkillEvaluator QualitativeSkillEvaluator. Sends the full SKILL.md
+content to an LLM judge that scores it against 9 qualitative criteria
+covering description clarity, instruction quality, trigger simulation,
+workflow completeness, and error handling.
+
+Uses the shared public-provider LLM client. Synchronous, consistent with
+other SkillEvaluator validators.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import posixpath
+import re
+import stat
+from collections import Counter, deque
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+from urllib.parse import unquote, urlsplit
+
+from skillevaluator.constants import (
+    EXECUTABLE_SCRIPT_PATTERNS,
+    RUBRIC_CRITERIA,
+    RUBRIC_MAX_TOKENS,
+    RUBRIC_MIN_SCORE,
+    RUBRIC_REASONING_EFFORT,
+    RUBRIC_REASONING_MAX_TOKENS,
+    RUBRIC_REASONING_MODEL_MARKERS,
+    SKILL_MANIFEST_VARIANTS,
+)
+from skillevaluator.inference.client import LLMClient
+from skillevaluator.inference.diagnostics import llm_failure_diagnostic, safe_llm_labels
+from skillevaluator.logging_config import get_logger
+from skillevaluator.models.result import Finding, Severity, ValidationResult
+from skillevaluator.utils.redaction import redact_sensitive_text
+from skillevaluator.utils.rich_markup import strip_terminal_controls
+from skillevaluator.utils.secure_fs import SecureRoot
+from skillevaluator.validators.base import ValidatorBase
+from skillevaluator.validators.markdown import markdown_link_targets, normalized_local_path
+
+logger = get_logger(__name__)
+
+_IMPORTANCE_WEIGHTS = {"high": 3, "medium": 2, "low": 1}
+_CRITERION_PASS_SCORE = 7
+_MAX_SKILL_CONTENT_BYTES = 1024 * 1024
+# Optional previews are summaries, so each one stays small and may be truncated. Required linked
+# guidance is not a preview: it is bounded only by the whole supplement budget below, and a
+# document that does not fit stops the evaluation instead of reaching the judge in part.
+_MAX_SUPPLEMENTARY_FILE_BYTES = 3000
+# A real linked guide graph runs to tens of kilobytes, so the stock budget matches the mebibyte
+# already allowed for the manifest itself. The budget bounds how many bytes are collected, never
+# which paths may be read: every reference is still confined to the skill's own declared root by
+# the secure reader below.
+_DEFAULT_SUPPLEMENTARY_TOTAL_BYTES = 1024 * 1024
+_MAX_CONFIGURED_SUPPLEMENTARY_TOTAL_BYTES = 8 * 1024 * 1024
+_SUPPLEMENTARY_TOTAL_BYTES_ENV = "SKILLEVALUATOR_RUBRIC_SUPPLEMENT_BYTES"
+_MAX_LINKED_MARKDOWN_FILES = 256
+# A rejected judge reply's problem text kept in the log line and retry note.
+# 500 characters hold every missing and some unexpected criterion ids.
+_MAX_RETRY_PROBLEM_CHARS = 500
+
+
+class _UnsafeRubricInputError(ValueError):
+    """Raised when rubric input is unsafe or cannot be read within its limit."""
+
+
+def _read_bounded_rubric_file(
+    path: Path,
+    *,
+    skill_root: Path,
+    max_bytes: int,
+    truncate: bool,
+) -> tuple[str, int]:
+    """Read a contained regular file without following its final symlink."""
+    try:
+        resolved_root = skill_root.resolve(strict=True)
+        if path.is_symlink():
+            raise _UnsafeRubricInputError(f"symlinked rubric input is not allowed: {path}")
+        path_mode = path.lstat().st_mode
+        resolved_path = path.resolve(strict=True)
+    except _UnsafeRubricInputError:
+        raise
+    except OSError as exc:
+        raise _UnsafeRubricInputError(f"could not inspect rubric input {path}: {exc}") from exc
+
+    if not stat.S_ISREG(path_mode):
+        raise _UnsafeRubricInputError(f"rubric input must be a regular file: {path}")
+    if not resolved_path.is_relative_to(resolved_root):
+        raise _UnsafeRubricInputError(f"rubric input resolves outside the skill root: {path}")
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise _UnsafeRubricInputError(f"rubric input must be a regular file: {path}")
+            payload = handle.read(max_bytes + 1)
+    except _UnsafeRubricInputError:
+        raise
+    except OSError as exc:
+        raise _UnsafeRubricInputError(f"could not read rubric input {path}: {exc}") from exc
+
+    was_truncated = len(payload) > max_bytes
+    if was_truncated and not truncate:
+        raise _UnsafeRubricInputError(f"rubric input exceeds the maximum size of {max_bytes} bytes: {path}")
+    bounded = payload[:max_bytes]
+    try:
+        text = bounded.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        if not (was_truncated and exc.end == len(bounded)):
+            raise _UnsafeRubricInputError(f"rubric input is not valid UTF-8: {path}") from exc
+        text = bounded[: exc.start].decode("utf-8")
+    if was_truncated:
+        text += "\n... [truncated]"
+    return text, len(bounded)
+
+
+def _normalize_rubric_checks(checks: Any, criteria: list[dict] | None = None) -> tuple[list[dict], str | None]:
+    """Validate criterion evidence and return it in rubric-schema order.
+
+    The judge is authoritative only for each criterion's bounded score, pass
+    flag, and notes. Criterion identity/order and description come from the
+    local rubric schema so duplicate, missing, or invented criteria cannot
+    influence the aggregate. ``criteria`` defaults to ``RUBRIC_CRITERIA``.
+    """
+    criteria = RUBRIC_CRITERIA if criteria is None else criteria
+    if not isinstance(checks, list):
+        return [], "LLM judge returned invalid rubric evidence: checks must be a list"
+    if not checks:
+        return (
+            [],
+            f"LLM judge returned incomplete rubric evidence: expected {len(criteria)} criteria, received 0",
+        )
+
+    returned_ids: list[str] = []
+    for index, check in enumerate(checks):
+        if not isinstance(check, dict):
+            return [], f"LLM judge returned invalid rubric evidence: criterion at index {index} must be an object"
+        criterion_id = check.get("id")
+        if not isinstance(criterion_id, str) or not criterion_id:
+            return [], f"LLM judge returned invalid rubric evidence: criterion at index {index} must have a string id"
+        returned_ids.append(criterion_id)
+
+    expected_ids = [criterion["id"] for criterion in criteria]
+    expected_id_set = set(expected_ids)
+    id_counts = Counter(returned_ids)
+    duplicates = sorted(criterion_id for criterion_id, count in id_counts.items() if count > 1)
+    missing = [criterion_id for criterion_id in expected_ids if criterion_id not in id_counts]
+    unexpected = sorted(criterion_id for criterion_id in id_counts if criterion_id not in expected_id_set)
+    identity_errors: list[str] = []
+    if missing:
+        identity_errors.append(f"missing criterion ids: {', '.join(missing)}")
+    if duplicates:
+        identity_errors.append(f"duplicate criterion ids: {', '.join(duplicates)}")
+    if unexpected:
+        identity_errors.append(f"unexpected criterion ids: {', '.join(unexpected)}")
+    if identity_errors:
+        return [], f"LLM judge returned invalid rubric evidence: {'; '.join(identity_errors)}"
+
+    checks_by_id = {check["id"]: check for check in checks}
+    normalized: list[dict] = []
+    for criterion in criteria:
+        criterion_id = criterion["id"]
+        check = checks_by_id[criterion_id]
+        score = check.get("score")
+        if (
+            not isinstance(score, int | float)
+            or isinstance(score, bool)
+            or (isinstance(score, float) and not math.isfinite(score))
+            or not 0 <= score <= 10
+        ):
+            return (
+                [],
+                f"LLM judge returned invalid rubric evidence: criterion {criterion_id} score must be a finite number between 0 and 10",
+            )
+        judge_pass = check.get("pass")
+        if not isinstance(judge_pass, bool):
+            return (
+                [],
+                f"LLM judge returned invalid rubric evidence: criterion {criterion_id} pass must be a boolean",
+            )
+        notes = check.get("notes", "")
+        normalized.append(
+            {
+                "id": criterion_id,
+                "criterion": criterion["criterion"],
+                "importance": criterion["importance"],
+                "pass": score >= _CRITERION_PASS_SCORE,
+                "judge_pass": judge_pass,
+                "score": score,
+                "notes": notes if isinstance(notes, str) else str(notes),
+            }
+        )
+
+    return normalized, None
+
+
+def _aggregate_rubric_score(checks: list[dict]) -> float:
+    """Return a local 0-100 score using schema importance weights.
+
+    High, medium, and low importance criteria carry weights 3, 2, and 1.
+    The result is rounded to one decimal only after the weighted mean is
+    scaled from the criterion 0-10 range to the public 0-100 range.
+    """
+    weighted_score = sum(check["score"] * _IMPORTANCE_WEIGHTS[check["importance"]] for check in checks)
+    total_weight = sum(_IMPORTANCE_WEIGHTS[check["importance"]] for check in checks)
+    return round(weighted_score / total_weight * 10, 1)
+
+
+def _rubric_report_problem(report: Any, criteria: list[dict]) -> str | None:
+    """Return why a parsed judge reply cannot be scored against ``criteria``, or ``None`` when it can."""
+    if not isinstance(report, dict):
+        return "LLM judge returned invalid rubric evidence: response must be an object"
+    _checks, problem = _normalize_rubric_checks(report.get("checks"), criteria)
+    return problem
+
+
+def _bounded_problem(problem: str) -> str:
+    """Make a rejection reason safe for logs, retry notes and failure reports.
+
+    The reason quotes the judge's own text, such as an invented criterion id,
+    which has no length limit.
+    """
+    problem = strip_terminal_controls(redact_sensitive_text(problem))
+    problem = " ".join("".join(char if char.isprintable() else " " for char in problem).split())
+    if len(problem) <= _MAX_RETRY_PROBLEM_CHARS:
+        return problem
+    return f"{problem[:_MAX_RETRY_PROBLEM_CHARS]} ... [truncated]"
+
+
+class _UnavailableRubricReport(dict):
+    """Internal marker distinguishing transport fallback from model evidence."""
+
+
+_RUBRIC_CHECK_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "string"},
+        "criterion": {"type": "string"},
+        "pass": {"type": "boolean"},
+        "score": {"type": "integer"},
+        "notes": {"type": "string"},
+    },
+    "required": ["id", "criterion", "pass", "score", "notes"],
+    "additionalProperties": False,
+}
+RUBRIC_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "overall_pass": {"type": "boolean"},
+        "score": {"type": "integer"},
+        "summary": {"type": "string"},
+        "checks": {"type": "array", "items": _RUBRIC_CHECK_JSON_SCHEMA},
+    },
+    "required": ["overall_pass", "score", "summary", "checks"],
+    "additionalProperties": False,
+}
+
+
+class RubricJudge(LLMClient):
+    """LLM judge that scores a skill against qualitative criteria."""
+
+    default_max_tokens: int | None = RUBRIC_MAX_TOKENS
+    # A reasoning model burns the whole completion budget on hidden reasoning
+    # before emitting visible JSON, so the default cap truncates the answer
+    # mid-object. LLMClient raises the budget per request when the resolved
+    # model is in one of these families, unless max_tokens was explicit.
+    reasoning_max_tokens: int | None = RUBRIC_REASONING_MAX_TOKENS
+    reasoning_model_markers: tuple[str, ...] = RUBRIC_REASONING_MODEL_MARKERS
+    default_reasoning_effort: str | None = RUBRIC_REASONING_EFFORT
+    response_schema: dict[str, Any] | None = RUBRIC_JSON_SCHEMA
+    schema_name: str = "rubric_evaluation"
+    # Times the last process() call asked the judge: 1, or 2 after a rejected
+    # reply; 0 when the first request failed, so no reply came back.
+    last_attempts: int = 0
+
+    _SYSTEM_PROMPT = (
+        "You are evaluating an AI Agent Skill documentation file (SKILL.md).\n"
+        "Score each criterion 0-10 (0=fails completely, 10=exceeds expectations).\n\n"
+        "IMPORTANT: Respond with ONLY a JSON object. No markdown, no explanation, "
+        "no preamble. Keep 'notes' values concise (1-2 sentences max). "
+        "Output nothing except valid JSON.\n\n"
+        "Response format:\n"
+        "{\n"
+        '  "overall_pass": <boolean>,\n'
+        '  "score": <integer 0-100>,\n'
+        '  "summary": "<1-2 sentence assessment>",\n'
+        '  "checks": [\n'
+        "    {\n"
+        '      "id": "<criterion id>",\n'
+        '      "criterion": "<description>",\n'
+        f'      "pass": <boolean; true exactly when score >= {_CRITERION_PASS_SCORE}>,\n'
+        '      "score": <integer 0-10>,\n'
+        '      "notes": "<1-2 sentence observation>"\n'
+        "    }\n"
+        "  ]\n"
+        "}\n"
+    )
+
+    def get_system_prompt(self) -> str:
+        return self._SYSTEM_PROMPT
+
+    def create_user_prompt(self, **kwargs: Any) -> str:
+        skill_name: str = kwargs["skill_name"]
+        skill_content: str = kwargs["skill_content"]
+        criteria: list[dict] = kwargs.get("criteria", RUBRIC_CRITERIA)
+        supplementary: dict | None = kwargs.get("supplementary_content")
+
+        criteria_text = "\n".join(
+            f"  {i + 1}. [{c['id']}] {c['criterion']} (Importance: {c['importance']})" for i, c in enumerate(criteria)
+        )
+
+        extra = ""
+        if supplementary:
+            scripts = supplementary.get("scripts", {})
+            references = supplementary.get("references", {})
+            linked_markdown = supplementary.get("linked_markdown", {})
+            if scripts or references or linked_markdown:
+                extra += "Supplementary Skill Content:\n"
+                if linked_markdown:
+                    extra += "\nLinked Markdown (paths relative to skill root):\n"
+                    for name, content in linked_markdown.items():
+                        extra += f"--- {name} ---\n{content}\n\n"
+                if scripts:
+                    extra += "\nScripts (from scripts/ and tools/ directories):\n"
+                    for name, content in scripts.items():
+                        extra += f"--- {name} ---\n{content}\n\n"
+                if references:
+                    extra += "\nReferences (from references/ directory):\n"
+                    for name, content in references.items():
+                        extra += f"--- {name} ---\n{content}\n\n"
+
+        return (
+            f"Skill Name: {skill_name}\n\n"
+            f"SKILL.md Content:\n{skill_content}\n\n"
+            f"{extra}"
+            f"Evaluation Criteria:\n{criteria_text}\n\n"
+            f"For each criterion, evaluate whether the skill meets the requirement.\n"
+            f"Score each criterion 0-10 (0=fails completely, 10=exceeds expectations).\n"
+            f"Set each criterion pass flag to true exactly when its score is at least {_CRITERION_PASS_SCORE}.\n"
+        )
+
+    def parse_response(self, response_text: str, **_kwargs: Any) -> dict:
+        return _extract_json(response_text)
+
+    def process(self, **kwargs: Any) -> Any:
+        """Ask the judge, and ask once more, naming the problem, if its reply cannot be scored.
+
+        A reply that ``json`` cannot parse (any ``ValueError`` or
+        ``RecursionError`` from :func:`_extract_json`), or whose ``checks``
+        miss, repeat or invent a criterion of ``criteria``
+        (``RUBRIC_CRITERIA`` unless given) or break a criterion's score or
+        pass flag, gets one more request: the same
+        prompts plus the problem, cut to ``_MAX_RETRY_PROBLEM_CHARS``. The
+        second reply is returned as parsed, so the validator still fails
+        closed when it is invalid too. A provider error that the client's own
+        transient-error retries do not clear (a failed request, a refusal or
+        a truncated reply) is not asked again: as in :meth:`LLMClient.process`,
+        ``last_failure`` records it and the fallback is returned. A truncated
+        reply is never salvaged. ``last_attempts`` counts the times the judge
+        was asked, not the client's retries, and stays 0 when the first
+        request fails.
+        """
+        self.last_failure = None
+        self.last_attempts = 0
+        try:
+            system_prompt = self.get_system_prompt()
+            user_prompt = self.create_user_prompt(**kwargs)
+            raw = self._request_rubric(system_prompt, user_prompt)
+            self.last_attempts = 1
+            try:
+                report = self.parse_response(raw, **kwargs)
+            except (ValueError, RecursionError) as exc:
+                # json.JSONDecodeError is a ValueError. json.loads also raises a
+                # plain ValueError (an integer past the digit limit) or a
+                # RecursionError (nesting too deep) for a reply it cannot parse.
+                problem = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc) or type(exc).__name__
+            else:
+                problem = _rubric_report_problem(report, kwargs.get("criteria", RUBRIC_CRITERIA))
+                if problem is None:
+                    return report
+            problem = _bounded_problem(problem)
+            logger.warning("Rubric judge reply rejected (%s) - asking once more", problem)
+            retry_prompt = (
+                f"{user_prompt}\nYOUR PREVIOUS REPLY WAS REJECTED: {problem}. "
+                "Reply again with ONLY one JSON object in the shape described above.\n"
+            )
+            self.last_attempts = 2
+            return self.parse_response(self._request_rubric(system_prompt, retry_prompt), **kwargs)
+        except NotImplementedError:
+            raise
+        except Exception as exc:
+            self.last_failure = llm_failure_diagnostic(exc)
+            logger.warning("LLM call failed (%s) - using fallback response", self.last_failure)
+            return self.get_fallback_response(**kwargs)
+
+    def _request_rubric(self, system_prompt: str, user_prompt: str) -> str:
+        return self.completions(
+            system_prompt,
+            user_prompt,
+            response_schema=self.response_schema,
+            schema_name=self.schema_name,
+        )
+
+    def get_fallback_response(self, **_kwargs: Any) -> dict:
+        return _UnavailableRubricReport(
+            {
+                "overall_pass": False,
+                "score": 0,
+                "summary": "LLM judge unavailable — rubric evaluation skipped",
+                "checks": [],
+            }
+        )
+
+
+def _extract_json(content: str) -> dict:
+    """Extract JSON from LLM response, handling code fences and truncation."""
+    content = content.strip().lstrip("\ufeff")
+    if not content:
+        msg = "Empty response"
+        raise json.JSONDecodeError(msg, content, 0)
+
+    json_match = re.search(r"```(?:json)?\s*(\{.+\})\s*```", content, re.DOTALL)
+    if json_match:
+        try:
+            return json.loads(json_match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    first_brace = content.find("{")
+    last_brace = content.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        try:
+            return json.loads(content[first_brace : last_brace + 1])
+        except json.JSONDecodeError:
+            pass
+
+    msg = f"Could not extract valid JSON from LLM response ({len(content)} chars)"
+    raise json.JSONDecodeError(msg, content[:200], 0)
+
+
+def supplementary_total_bytes(environ: Mapping[str, str] | None = None) -> int:
+    """Return the configured supplement budget, which never widens the declared root.
+
+    The operator may raise or lower how many bytes of skill-owned guidance are collected. A
+    reference is still read only from the skill's own root, so a larger budget never reaches a
+    path a smaller one could not.
+    """
+    source = os.environ if environ is None else environ
+    raw = source.get(_SUPPLEMENTARY_TOTAL_BYTES_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_SUPPLEMENTARY_TOTAL_BYTES
+    try:
+        budget: int | None = int(raw)
+    except ValueError:
+        budget = None
+    if budget is None or budget <= 0:
+        logger.warning(
+            "Ignoring %s=%r: expected a positive integer number of bytes; using %s",
+            _SUPPLEMENTARY_TOTAL_BYTES_ENV,
+            raw,
+            _DEFAULT_SUPPLEMENTARY_TOTAL_BYTES,
+        )
+        return _DEFAULT_SUPPLEMENTARY_TOTAL_BYTES
+    if budget > _MAX_CONFIGURED_SUPPLEMENTARY_TOTAL_BYTES:
+        logger.warning(
+            "Capping %s=%r at %s bytes",
+            _SUPPLEMENTARY_TOTAL_BYTES_ENV,
+            raw,
+            _MAX_CONFIGURED_SUPPLEMENTARY_TOTAL_BYTES,
+        )
+        return _MAX_CONFIGURED_SUPPLEMENTARY_TOTAL_BYTES
+    return budget
+
+
+def _collect_supplementary_content(
+    skill_path: Path,
+    max_bytes_per_file: int = _MAX_SUPPLEMENTARY_FILE_BYTES,
+    max_total_bytes: int | None = None,
+    *,
+    manifest: Path | None = None,
+    skill_content: str | None = None,
+) -> dict[str, dict[str, str]]:
+    """Collect complete linked Markdown before optional bounded previews."""
+    result: dict[str, dict[str, str]] = {"scripts": {}, "references": {}}
+    if max_total_bytes is None:
+        max_total_bytes = supplementary_total_bytes()
+    total = 0
+    try:
+        resolved_root = skill_path.resolve(strict=True)
+    except OSError as exc:
+        raise _UnsafeRubricInputError(f"could not resolve skill root {skill_path}: {exc}") from exc
+
+    if manifest is None:
+        manifest = next(
+            (skill_path / name for name in SKILL_MANIFEST_VARIANTS if os.path.lexists(skill_path / name)), None
+        )
+    linked: dict[str, str] = {}
+    if manifest is not None:
+        if skill_content is None:
+            skill_content, _ = _read_bounded_rubric_file(
+                manifest, skill_root=skill_path, max_bytes=_MAX_SKILL_CONTENT_BYTES, truncate=False
+            )
+        pending = deque([(manifest.relative_to(skill_path).as_posix(), skill_content)])
+        seen = {pending[0][0]}
+        try:
+            manifest_stat = manifest.lstat()
+            # Path-stat identities are comparable on Windows; the secure reader's
+            # returned CRT fstat identity is not. Cached bytes only choose a read
+            # bound: every alias still passes the secure no-follow reader.
+            seen_payloads = (
+                {(manifest_stat.st_dev, manifest_stat.st_ino): skill_content.encode("utf-8")}
+                if manifest_stat.st_ino
+                else {}
+            )
+            with SecureRoot(resolved_root) as reader:
+                while pending:
+                    source, content = pending.popleft()
+                    for href in markdown_link_targets(content):
+                        try:
+                            destination = unquote(urlsplit(href).path).replace("\\", "/")
+                        except ValueError:
+                            continue
+                        if posixpath.splitext(destination)[1].lower() not in {".md", ".markdown"}:
+                            continue
+                        local = normalized_local_path(href, reject_anchors=True)
+                        if local is None:
+                            continue
+                        relative = posixpath.normpath(posixpath.join(posixpath.dirname(source), local))
+                        if relative == ".." or relative.startswith("../"):
+                            raise _UnsafeRubricInputError(f"linked Markdown escapes the skill root: {relative}")
+                        if relative in seen:
+                            continue
+                        if len(seen) - 1 >= _MAX_LINKED_MARKDOWN_FILES:
+                            raise _UnsafeRubricInputError(
+                                f"linked Markdown exceeds the maximum of {_MAX_LINKED_MARKDOWN_FILES} documents"
+                            )
+                        metadata = (resolved_root / relative).lstat()
+                        identity = (metadata.st_dev, metadata.st_ino)
+                        cached = seen_payloads.get(identity) if metadata.st_ino else None
+                        # Required guidance is never truncated, so the only bound is what is left of
+                        # the supplement budget: a document that does not fit stops the collection.
+                        read_limit = len(cached) if cached is not None else max_total_bytes - total
+                        payload, _ = reader.read_bytes(Path(relative), read_limit, expected=metadata)
+                        seen.add(relative)
+                        if cached is not None:
+                            if payload != cached:
+                                raise _UnsafeRubricInputError(f"linked Markdown changed while collecting: {relative}")
+                            continue
+                        text = payload.decode("utf-8")
+                        linked[relative] = text
+                        if metadata.st_ino:
+                            seen_payloads[identity] = payload
+                        total += len(payload)
+                        pending.append((relative, text))
+        except _UnsafeRubricInputError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise _UnsafeRubricInputError(f"could not collect complete linked Markdown: {exc}") from exc
+        if linked:
+            result["linked_markdown"] = linked
+
+    # ``tools/`` is the agentskills.io name for ``scripts/``; its files are listed
+    # under their directory so they cannot collide with a script of the same name.
+    for subdir, bucket, exts in [
+        ("scripts", "scripts", EXECUTABLE_SCRIPT_PATTERNS),
+        ("tools", "scripts", EXECUTABLE_SCRIPT_PATTERNS),
+        ("references", "references", ("*.md",)),
+    ]:
+        d = skill_path / subdir
+        if not os.path.lexists(d):
+            continue
+        try:
+            if d.is_symlink():
+                raise _UnsafeRubricInputError(f"symlinked supplementary directory is not allowed: {d}")
+            if not stat.S_ISDIR(d.lstat().st_mode):
+                raise _UnsafeRubricInputError(f"supplementary path must be a directory: {d}")
+            if not d.resolve(strict=True).is_relative_to(resolved_root):
+                raise _UnsafeRubricInputError(f"supplementary directory resolves outside the skill root: {d}")
+        except _UnsafeRubricInputError:
+            raise
+        except OSError as exc:
+            raise _UnsafeRubricInputError(f"could not inspect supplementary directory {d}: {exc}") from exc
+        for ext in exts:
+            for f in sorted(d.glob(ext)):
+                if f.relative_to(skill_path).as_posix() in linked:
+                    continue
+                if total >= max_total_bytes:
+                    break
+                read_limit = min(max_bytes_per_file, max_total_bytes - total)
+                text, bytes_read = _read_bounded_rubric_file(
+                    f,
+                    skill_root=skill_path,
+                    max_bytes=read_limit,
+                    truncate=True,
+                )
+                result[bucket][f.name if subdir != "tools" else f"tools/{f.name}"] = text
+                total += bytes_read
+
+    return result
+
+
+class RubricEvalValidator(ValidatorBase):
+    """LLM-as-Judge rubric evaluation for skill quality.
+
+    Sends the full SKILL.md to an LLM that scores it against 9 qualitative
+    criteria. Produces a 0-100 score with per-criterion breakdown.
+
+    Requires a configured public LLM provider.
+    """
+
+    def __init__(self, min_score: int = RUBRIC_MIN_SCORE, model: str | None = None) -> None:
+        self.min_score = min_score
+        self._judge = RubricJudge(model=model) if model else RubricJudge()
+
+    @property
+    def name(self) -> str:
+        return "LLM Rubric Evaluation"
+
+    @property
+    def description(self) -> str:
+        return (
+            "LLM-as-Judge qualitative evaluation across 9 criteria "
+            "(description clarity, instruction quality, trigger simulation, etc.)"
+        )
+
+    def validate(self, skill_path: Path) -> ValidationResult:
+        if self._is_skill_directory(skill_path):
+            return self._validate_single_skill(skill_path)
+        return self._validate_folder(skill_path)
+
+    def _validate_folder(self, root: Path) -> ValidationResult:
+        skill_dirs = self._find_all_skills(root)
+        if not skill_dirs:
+            result = ValidationResult(
+                validator_name="RUBRIC_EVAL",
+                validator_description=self.description,
+            )
+            result.add_finding(
+                Finding(
+                    category="RUBRIC_EVAL",
+                    severity=Severity.HIGH,
+                    check_name="skill_discovery",
+                    message="No skills found in target directory",
+                    file_path=str(root),
+                )
+            )
+            result.metadata["rubric_eval"] = {
+                "execution_status": "failed",
+                "overall_score": None,
+                "overall_pass": False,
+                "summary": "No skills found in target directory",
+                "checks": [],
+            }
+            return result
+
+        result = ValidationResult(
+            validator_name="RUBRIC_EVAL",
+            validator_description=self.description,
+        )
+        all_rubric: list[dict] = []
+        for skill_dir in skill_dirs:
+            sub = self._validate_single_skill(skill_dir)
+            result.merge_with_prefix(sub, skill_dir.name)
+            if sub.metadata.get("rubric_eval", {}).get("execution_status") == "succeeded":
+                all_rubric.append(sub.metadata["rubric_eval"])
+
+        if len(all_rubric) == len(skill_dirs):
+            avg_score = sum(r["overall_score"] for r in all_rubric) / len(all_rubric)
+            all_pass = all(r["overall_pass"] for r in all_rubric)
+            all_checks: list[dict] = [check for rubric in all_rubric for check in rubric.get("checks", [])]
+
+            result.metadata["rubric_eval"] = {
+                "execution_status": "succeeded",
+                "overall_score": round(avg_score, 1),
+                "overall_pass": all_pass and result.passed,
+                "summary": f"Average across {len(all_rubric)} skills",
+                "skill_count": len(all_rubric),
+                "checks": all_checks,
+            }
+        else:
+            failed_count = len(skill_dirs) - len(all_rubric)
+            result.metadata["rubric_eval"] = {
+                "execution_status": "failed",
+                "overall_score": None,
+                "overall_pass": False,
+                "summary": f"Rubric judging failed for {failed_count} of {len(skill_dirs)} skills",
+                "skill_count": len(skill_dirs),
+                "successful_skill_count": len(all_rubric),
+                "checks": [],
+            }
+        result.metadata["rubric_eval_all"] = all_rubric
+
+        return result
+
+    def _judge_labels(self) -> dict[str, str]:
+        """Name the provider and model that gave the score, when the judge answered.
+
+        On the native Anthropic API the model can be the server-side fallback,
+        which scores differently from the configured model.
+        """
+        if self._judge.model_used is None:
+            return {}
+        provider, model = safe_llm_labels(self._judge.provider, self._judge.model_used)
+        return {"llm_provider": provider, "llm_model_used": model}
+
+    def _judge_attempts(self) -> dict[str, int]:
+        """Count the times the judge was asked for this skill, once a first reply came back."""
+        attempts = self._judge.last_attempts
+        return {"judge_attempts": attempts} if attempts else {}
+
+    @staticmethod
+    def _record_judge_failure(
+        result: ValidationResult,
+        *,
+        report: Any,
+        skill_path: Path,
+        manifest: Path,
+        message: str,
+        check_name: str,
+        suggestion: str,
+        judge_attempts: dict[str, int] | None = None,
+    ) -> ValidationResult:
+        judge_report = report if isinstance(report, dict) else {}
+        result.metadata["rubric_eval"] = {
+            "execution_status": "failed",
+            "overall_score": None,
+            "overall_pass": False,
+            "summary": message,
+            "judge_summary": judge_report.get("summary"),
+            "judge_score": judge_report.get("score"),
+            "judge_overall_pass": judge_report.get("overall_pass"),
+            "skill_name": skill_path.name,
+            "checks": [],
+            **(judge_attempts or {}),
+        }
+        result.add_finding(
+            Finding(
+                category="RUBRIC_EVAL",
+                severity=Severity.HIGH,
+                check_name=check_name,
+                message=message,
+                file_path=str(manifest),
+                suggestion=suggestion,
+                metadata=dict(judge_attempts or {}),
+            )
+        )
+        return result
+
+    def _validate_single_skill(self, skill_path: Path) -> ValidationResult:
+        result = ValidationResult(
+            validator_name="RUBRIC_EVAL",
+            validator_description=self.description,
+        )
+
+        manifest = self._find_skill_manifest(skill_path)
+        if not manifest:
+            result.add_finding(
+                Finding(
+                    category="RUBRIC_EVAL",
+                    severity=Severity.HIGH,
+                    check_name="skill_manifest",
+                    message="SKILL.md not found",
+                    file_path=str(skill_path),
+                )
+            )
+            result.metadata["rubric_eval"] = {
+                "execution_status": "failed",
+                "overall_score": None,
+                "overall_pass": False,
+                "summary": "SKILL.md not found",
+                "skill_name": skill_path.name,
+                "checks": [],
+            }
+            return result
+
+        try:
+            content, _ = _read_bounded_rubric_file(
+                manifest,
+                skill_root=skill_path,
+                max_bytes=_MAX_SKILL_CONTENT_BYTES,
+                truncate=False,
+            )
+            supplementary = _collect_supplementary_content(skill_path, manifest=manifest, skill_content=content)
+        except _UnsafeRubricInputError as exc:
+            return self._record_judge_failure(
+                result,
+                report=None,
+                skill_path=skill_path,
+                manifest=manifest,
+                message=f"Unsafe rubric input: {exc}",
+                check_name="unsafe_skill_input",
+                suggestion="Provide complete linked guidance in contained regular UTF-8 files within the rubric input limits",
+            )
+
+        from rich.console import Console
+        from rich.status import Status
+        from rich.text import Text
+
+        from skillevaluator.utils.rich_markup import escape_markup
+
+        # Status parses a str with emoji enabled whatever the console says.
+        status_text = Text.from_markup(
+            f"[bold cyan]Evaluating {escape_markup(skill_path.name)} with LLM judge...[/bold cyan]", emoji=False
+        )
+        with Status(status_text, console=Console(emoji=False), spinner="dots"):
+            report = self._judge.process(
+                skill_name=skill_path.name,
+                skill_content=content,
+                supplementary_content=supplementary,
+            )
+        judge_attempts = self._judge_attempts()
+
+        if not isinstance(report, dict):
+            return self._record_judge_failure(
+                result,
+                report=report,
+                skill_path=skill_path,
+                manifest=manifest,
+                message="LLM judge returned invalid rubric evidence: response must be an object",
+                check_name="llm_invalid_response",
+                suggestion="Retry rubric evaluation; the judge response was malformed",
+                judge_attempts=judge_attempts,
+            )
+
+        if isinstance(report, _UnavailableRubricReport):
+            cause = f": {self._judge.last_failure}" if self._judge.last_failure else ""
+            return self._record_judge_failure(
+                result,
+                report=report,
+                skill_path=skill_path,
+                manifest=manifest,
+                message=f"LLM judge unavailable; rubric evaluation did not run{cause}",
+                check_name="llm_unavailable",
+                suggestion="Configure a public LLM provider to enable LLM rubric evaluation",
+                judge_attempts=judge_attempts,
+            )
+
+        checks, validation_error = _normalize_rubric_checks(report.get("checks"))
+        if validation_error:
+            return self._record_judge_failure(
+                result,
+                report=report,
+                skill_path=skill_path,
+                manifest=manifest,
+                message=_bounded_problem(validation_error),
+                check_name="llm_invalid_response",
+                suggestion="Retry rubric evaluation; the judge response did not contain valid complete criterion evidence",
+                judge_attempts=judge_attempts,
+            )
+
+        overall_score = _aggregate_rubric_score(checks)
+        overall_pass = overall_score >= self.min_score and all(check["pass"] for check in checks)
+
+        for check in checks:
+            check_score = check["score"]
+            check_pass = check["pass"]
+            severity = Severity.LOW if check_pass else Severity.MEDIUM
+
+            result.add_finding(
+                Finding(
+                    category="RUBRIC_EVAL",
+                    severity=severity,
+                    check_name=f"rubric_{check.get('id', 'unknown')}",
+                    message=f"[{check_score}/10] {check.get('criterion', '')}",
+                    file_path=str(manifest),
+                    suggestion=check.get("notes", ""),
+                    metadata={
+                        "score": check_score,
+                        "pass": check_pass,
+                        "judge_pass": check["judge_pass"],
+                        "id": check.get("id", ""),
+                    },
+                )
+            )
+
+        failed_criteria = [check["id"] for check in checks if not check["pass"]]
+        if not overall_pass:
+            reasons: list[str] = []
+            if overall_score < self.min_score:
+                reasons.append(f"score {overall_score}/100 is below the required {self.min_score}/100")
+            if failed_criteria:
+                reasons.append(f"criteria below {_CRITERION_PASS_SCORE}/10: {', '.join(failed_criteria)}")
+            result.add_finding(
+                Finding(
+                    category="RUBRIC_EVAL",
+                    severity=Severity.HIGH,
+                    check_name="rubric_overall",
+                    message=f"Rubric evaluation failed: {'; '.join(reasons)}",
+                    file_path=str(manifest),
+                    suggestion="Address the failed rubric criteria and rerun the evaluation",
+                    metadata={
+                        "overall_score": overall_score,
+                        "min_score": self.min_score,
+                        "failed_criteria": failed_criteria,
+                    },
+                )
+            )
+
+        judge_labels = self._judge_labels()
+        result.metadata["rubric_eval"] = {
+            "execution_status": "succeeded",
+            "overall_score": overall_score,
+            "overall_pass": overall_pass,
+            "summary": report.get("summary", ""),
+            "judge_score": report.get("score"),
+            "judge_overall_pass": report.get("overall_pass"),
+            "skill_name": skill_path.name,
+            "checks": checks,
+            "aggregation": {
+                "method": "importance_weighted_mean",
+                "importance_weights": dict(_IMPORTANCE_WEIGHTS),
+                "min_score": self.min_score,
+                "criterion_pass_score": _CRITERION_PASS_SCORE,
+                "requires_all_criteria_pass": True,
+            },
+            **judge_labels,
+            **judge_attempts,
+        }
+
+        # The success detail also names the model and counts the times the
+        # judge was asked, so each skill of a folder run keeps its own.
+        result.add_success(
+            check_name="rubric_eval",
+            message=f"LLM Rubric Score: {overall_score}/100",
+            overall_score=overall_score,
+            overall_pass=overall_pass,
+            **judge_labels,
+            **judge_attempts,
+        )
+
+        return result

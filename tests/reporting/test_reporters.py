@@ -1,0 +1,3191 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for all reporters in the reporting module."""
+
+import copy
+import json
+import os
+import re
+import tempfile
+from pathlib import Path, PureWindowsPath
+from urllib.parse import unquote, urlsplit
+
+import pytest
+
+from skillevaluator.evaluation.tier3_report import (
+    advisory_skip_result,
+    agent_eval_result_from_run,
+    build_agent_eval_payload,
+    render_agent_eval_html_report,
+)
+from skillevaluator.models import Finding, Severity, ValidationResult
+from skillevaluator.publication_evidence import stamp_publication_evidence
+from skillevaluator.reporting import (
+    BenchmarkReporter,
+    CLIReporter,
+    HTMLReporter,
+    JSONReporter,
+    MarkdownReporter,
+    SARIFReporter,
+)
+from skillevaluator.reporting.sarif_reporter import _file_uri, _normalize_artifact_uri
+from skillevaluator.reporting.summary_copy import SKILL_LIFT_DEFINITION
+from skillevaluator.tier1.commands import emit_reports
+
+_SKILLSPECTOR_2_12_LLM_PROVENANCE = Path(__file__).parents[1] / "fixtures" / "skillspector-2.12.0-llm-provenance.json"
+
+_PUBLICATION_TARGET = {
+    "skill_name": "demo",
+    "skill_digest": "sha256:" + "c" * 64,
+    "skill_digest_algorithm": "skill-evaluator-source-tree/2",
+}
+
+
+def _bind_publication_target(result: ValidationResult, *, skill_name: str = "demo") -> None:
+    fixture_producers = {
+        "SCHEMA": (1, "schema"),
+        "Code Integrity & Hygiene": (1, "code-integrity"),
+    }
+    target = {**_PUBLICATION_TARGET, "skill_name": skill_name}
+    result.metadata["publication_target"] = dict(target)
+    if "publication_evidence" not in result.metadata and result.validator_name in fixture_producers:
+        tier, check_id = fixture_producers[result.validator_name]
+        stamp_publication_evidence([result], tier=tier, check_id=check_id)
+    payload = result.metadata.get("agent_eval")
+    if isinstance(payload, dict):
+        payload["publication_target"] = dict(target)
+        summary = payload.setdefault("summary", {})
+        if isinstance(summary, dict):
+            summary["publication_target"] = dict(target)
+
+
+def _api_key_line() -> str:
+    """Build a representative API-key finding without embedding it in source."""
+    return "API" + '_KEY = "' + "sk" + "-live-" + "abc123" + '"'
+
+
+def _html_report_data(output: str) -> dict:
+    match = re.search(r'<script id="report-data" type="application/json">(.*?)</script>', output, re.DOTALL)
+    assert match is not None
+    return json.loads(match.group(1))
+
+
+def _html_tab(output: str, tab_id: str) -> str:
+    marker = f'id="tab-{tab_id}"'
+    start = output.index(marker)
+    next_tab = output.find('id="tab-', start + len(marker))
+    report_data = output.find('id="report-data"', start + len(marker))
+    candidates = [position for position in (next_tab, report_data) if position >= 0]
+    end = min(candidates) if candidates else len(output)
+    return output[start:end]
+
+
+def _failed_result(validator_name: str, *, severity: Severity | None = Severity.HIGH) -> ValidationResult:
+    result = ValidationResult(validator_name=validator_name, validator_description="test failure")
+    if severity is None:
+        result.add_error("validator failed without a structured finding")
+    else:
+        result.add_finding(
+            Finding(
+                category="TEST",
+                severity=severity,
+                check_name="test-failure",
+                message="test failure",
+                file_path="SKILL.md",
+            )
+        )
+    return result
+
+
+def _similarity_result(*, severity: Severity = Severity.MEDIUM) -> ValidationResult:
+    result = ValidationResult(
+        validator_name="Similarity Check",
+        validator_description="Detect duplicate content via embedding similarity",
+    )
+    result.add_finding(
+        Finding(
+            category="SIMILARITY",
+            severity=severity,
+            check_name="SIMILAR",
+            message="same-name similarity match",
+            file_path="team-a/shared-skill",
+            metadata={
+                "entry_a": "shared-skill",
+                "entry_b": "shared-skill",
+                "path_a": "team-a/shared-skill",
+                "path_b": "team-b/shared-skill",
+            },
+        )
+    )
+    return result
+
+
+@pytest.fixture
+def success_result() -> ValidationResult:
+    """Create a passing validation result."""
+    result = ValidationResult(
+        validator_name="SCHEMA",
+        validator_description="Schema & Repository Governance",
+    )
+    result.add_success("manifest_found", "Found SKILL.md in skill directory")
+    result.add_success("frontmatter_valid", "Parsed successfully", name="test-skill")
+    result.add_success("structure_valid", "Valid structure: skills/test-skill/")
+    result.summary.files_scanned = 3
+    return result
+
+
+@pytest.fixture
+def failure_result() -> ValidationResult:
+    """Create a failing validation result."""
+    result = ValidationResult(
+        validator_name="SECRETS",
+        validator_description="Hardcoded Secrets Detection",
+    )
+    result.summary.files_scanned = 42
+
+    aws_key = "AKIA" + "IOSFODNN7EXAMPLE"
+    # Add findings using new-style Finding objects
+    result.add_finding(
+        Finding(
+            category="SECRET",
+            severity=Severity.CRITICAL,
+            check_name="aws-access-key-id",
+            message="AWS Access Key ID detected",
+            file_path="config/settings.py",
+            line_number=15,
+            line_content=f'AWS_KEY = "{aws_key}"',
+            suggestion="Remove hardcoded key. Use environment variables.",
+        )
+    )
+    result.add_finding(
+        Finding(
+            category="SECRET",
+            severity=Severity.HIGH,
+            check_name="generic-api-key",
+            message="Generic API key pattern detected",
+            file_path="src/api.py",
+            line_number=8,
+            line_content=_api_key_line(),
+            suggestion="Move API key to secrets vault.",
+        )
+    )
+    return result
+
+
+@pytest.fixture
+def mixed_results(success_result: ValidationResult, failure_result: ValidationResult) -> list[ValidationResult]:
+    """Create a list with both passing and failing results."""
+    return [success_result, failure_result]
+
+
+class TestCLIReporter:
+    """Tests for CLIReporter."""
+
+    def test_render_success(self, success_result: ValidationResult) -> None:
+        """Test rendering a successful validation."""
+        reporter = CLIReporter()
+        output = reporter.render(success_result)
+
+        assert "SCHEMA" in output
+        assert "Validation passed" in output
+        assert "manifest_found" in output
+        assert "frontmatter_valid" in output
+
+    def test_render_failure(self, failure_result: ValidationResult) -> None:
+        """Test rendering a failed validation."""
+        reporter = CLIReporter()
+        output = reporter.render(failure_result)
+
+        assert "SECRETS" in output
+        assert "Validation failed" in output
+        assert "AWS Access Key ID detected" in output
+        assert "aws-access-key-id" in output
+
+    def test_render_all_marks_skipped_live_eval_as_advisory(self) -> None:
+        result = ValidationResult(validator_name="AGENT_EVAL", validator_description="Live evaluation")
+        result.add_warning("A public LLM provider is required for live evaluation.")
+        result.metadata["agent_eval"] = {
+            "execution_status": "skipped",
+            "verdict": "neutral",
+            "provenance": {
+                "advisory": True,
+                "reason": "skipped",
+                "message": "A public LLM provider is required for live evaluation.",
+            },
+        }
+
+        output = CLIReporter().render_all([result])
+
+        assert "SKIP" in output
+        assert "Passed required checks" in output
+        assert "1 skipped" in output
+
+    @pytest.mark.parametrize(
+        ("baseline", "lift", "expected_baseline", "expected_lift"),
+        [
+            (0.6, None, "0.60", "NO SCORE"),
+            (None, None, "NO SCORE", "NO SCORE"),
+            (0.6, 0.2, "0.60", "+0.20"),
+            (0.9, -0.1, "0.90", "-0.10"),
+        ],
+    )
+    def test_render_agent_eval_with_unavailable_comparison(
+        self,
+        baseline: float | None,
+        lift: float | None,
+        expected_baseline: str,
+        expected_lift: str,
+    ) -> None:
+        result = ValidationResult(validator_name="AGENT_EVAL", validator_description="Live evaluation")
+        result.metadata["agent_eval"] = {
+            "evaluators": {"goal_accuracy": {"with_skill": 0.8, "baseline": baseline, "lift": lift}},
+        }
+
+        output = CLIReporter().render(result)
+        plain_output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+        row = next(line for line in plain_output.splitlines() if "Goal Accuracy" in line)
+
+        assert [cell.strip() for cell in row.split("│")[1:-1]] == [
+            "Goal Accuracy",
+            "0.80",
+            expected_baseline,
+            expected_lift,
+        ]
+
+    @pytest.mark.parametrize(("with_skill", "expected_with_skill"), [(None, "NO SCORE"), (0.0, "0.00"), (0.95, "0.95")])
+    @pytest.mark.parametrize(("baseline", "expected_baseline"), [(None, "NO SCORE"), (0.0, "0.00"), (0.95, "0.95")])
+    @pytest.mark.parametrize(("lift", "expected_lift"), [(None, "NO SCORE"), (0.0, "+0.00"), (0.95, "+0.95")])
+    def test_render_agent_eval_score_availability(
+        self, with_skill, expected_with_skill, baseline, expected_baseline, lift, expected_lift
+    ) -> None:
+        result = ValidationResult(validator_name="AGENT_EVAL")
+        result.metadata["agent_eval"] = {
+            "evaluators": {"accuracy": {"with_skill": with_skill, "baseline": baseline, "lift": lift}},
+        }
+
+        output = CLIReporter().render(result)
+        plain_output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+        row = next(line for line in plain_output.splitlines() if "Accuracy" in line)
+
+        assert [cell.strip() for cell in row.split("│")[1:-1]] == [
+            "Accuracy",
+            expected_with_skill,
+            expected_baseline,
+            expected_lift,
+        ]
+
+    @pytest.mark.parametrize(
+        ("scores", "expected_cells"),
+        [
+            ({}, ["NO SCORE", "NO SCORE", "NO SCORE"]),
+            ({"with_skill": 0.0}, ["0.00", "NO SCORE", "NO SCORE"]),
+            ({"baseline": 0.0}, ["NO SCORE", "0.00", "NO SCORE"]),
+            ({"lift": 0.0}, ["NO SCORE", "NO SCORE", "+0.00"]),
+        ],
+    )
+    def test_render_agent_eval_missing_scores_are_unavailable(self, scores, expected_cells) -> None:
+        result = ValidationResult(validator_name="AGENT_EVAL")
+        result.metadata["agent_eval"] = {"evaluators": {"accuracy": scores}}
+
+        output = CLIReporter().render(result)
+        plain_output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+        row = next(line for line in plain_output.splitlines() if "Accuracy" in line)
+
+        assert [cell.strip() for cell in row.split("│")[1:-1]] == ["Accuracy", *expected_cells]
+
+    def test_render_failure_escapes_markup_in_finding_fields(self) -> None:
+        """Dynamic finding text should not be parsed as Rich markup."""
+        result = ValidationResult(
+            validator_name="SECURITY",
+            validator_description="Security checks",
+        )
+        result.add_finding(
+            Finding(
+                category="SECURITY",
+                severity=Severity.HIGH,
+                check_name="mcp-least-privilege",
+                message="Unexpected path [/tmp/nemo-gym-upstream]",
+                file_path="skills/gym-benchmark-config/SKILL.md",
+                line_number=1,
+                line_content="Read [/tmp/nemo-gym-upstream] before running.",
+                suggestion="Replace broad access to [/tmp/nemo-gym-upstream].",
+            )
+        )
+
+        output = CLIReporter().render(result)
+        plain_output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+
+        assert "[/tmp/nemo-gym-upstream]" in plain_output
+        assert "Replace broad access" in plain_output
+
+    def test_render_escapes_markup_in_legacy_errors(self) -> None:
+        result = ValidationResult(
+            validator_name="SIMILARITY",
+            validator_description="Similarity checks",
+        )
+        result.add_error("Catalog value [/red] could not be parsed")
+
+        output = CLIReporter().render(result)
+        plain_output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+
+        assert "[/red]" in plain_output
+
+    def test_failed_tier2_scan_is_reported_as_an_error_not_a_duplicate(self, tmp_path: Path, monkeypatch) -> None:
+        from skillevaluator.deduplication.intra_skill.intra_skill_validator import IntraSkillValidator
+        from skillevaluator.deduplication.utils import skill_collector
+
+        monkeypatch.setattr(skill_collector, "CONTENT_DEDUP_MAX_DISCOVERED_PATHS", 2)
+        skill = tmp_path / "over-budget"
+        skill.mkdir()
+        for name in ("SKILL.md", "a.bin", "b.bin"):
+            (skill / name).write_text("content", encoding="utf-8")
+
+        result = IntraSkillValidator().validate(skill)
+        assert result.findings[0].check_name == "path_count_limit"
+
+        output = re.sub(r"\x1b\[[0-9;]*m", "", CLIReporter().render_all([result]))
+
+        assert "Errors:" in output
+        assert "Skill tree contains more than 2 paths." in output
+        assert "duplicates found" not in output.lower()
+
+    def test_render_escapes_markup_in_success_details(self) -> None:
+        result = ValidationResult(
+            validator_name="SIMILARITY",
+            validator_description="Similarity checks",
+        )
+        result.add_success(
+            "catalog_compared",
+            "Compared '[tool]' against catalog",
+            target_name="[tool]",
+        )
+
+        output = CLIReporter().render(result)
+        plain_output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+
+        assert "[tool]" in plain_output
+
+    def test_render_all(self, mixed_results: list[ValidationResult]) -> None:
+        """Test rendering multiple results."""
+        reporter = CLIReporter()
+        output = reporter.render_all(mixed_results)
+
+        assert "SCHEMA" in output
+        assert "SECRETS" in output
+        assert "PASS" in output
+        assert "FAIL" in output
+
+    @pytest.mark.parametrize("colored", [False, True])
+    def test_success_metadata_uses_default_text_color(self, colored: bool) -> None:
+        from io import StringIO
+
+        from rich.console import Console
+
+        result = ValidationResult(validator_name="QUALITY", validator_description="Quality checks")
+        result.add_success("quality_score", "Quality score: 84.5/100", grade="B", skill_type="script-based", count=3)
+        stream = StringIO()
+        console = Console(
+            file=stream,
+            force_terminal=colored,
+            color_system="standard" if colored else None,
+            no_color=False,
+            width=160,
+        )
+
+        CLIReporter()._print_success_details(result, console)
+
+        output = stream.getvalue()
+        # Syntax highlighting can hide values against PowerShell's blue background.
+        # TERM=dumb may wrap even an explicit width; keep ANSI while joining lines.
+        assert "Quality score: 84.5/100 (grade=B, skill_type=script-based, count=3)" in " ".join(output.split())
+        if colored:
+            assert "\x1b[32m[OK]\x1b[0m" in output
+
+    @pytest.mark.parametrize("severity", [Severity.MEDIUM, Severity.LOW])
+    def test_render_all_shows_passing_findings_without_changing_pass_state(self, severity: Severity) -> None:
+        result = _similarity_result(severity=severity)
+
+        output = re.sub(r"\x1b\[[0-9;]*m", "", CLIReporter().render_all([result]))
+
+        assert result.passed is True
+        assert "same-name similarity match" in output
+        assert "Passed required checks" in output
+
+    def test_render_finding_shows_both_related_paths(self) -> None:
+        result = _similarity_result()
+
+        output = re.sub(r"\x1b\[[0-9;]*m", "", CLIReporter().render(result))
+
+        assert "team-a/shared-skill" in output
+        assert "team-b/shared-skill" in output
+
+    def test_render_tier3_harbor_links_and_evidence(self) -> None:
+        """Tier 3 CLI output should include Harbor job, analysis, and step links."""
+        output = CLIReporter().render(_tier3_harbor_result())
+        plain_output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+
+        assert "Harbor logs:" in plain_output
+        assert "Harbor analysis:" in plain_output
+        assert "https://harbor.example.test/jobs/log-analyzer" in plain_output
+        assert "View Step 9" in plain_output
+        assert "log-analyzer-001?step=9" in plain_output
+        assert "javascript:alert" not in plain_output
+
+    def test_name_property(self) -> None:
+        """Test reporter name."""
+        reporter = CLIReporter()
+        assert reporter.name == "cli"
+
+    def test_folder_static_test_evidence_does_not_report_only_the_first_skill(self) -> None:
+        result = ValidationResult(validator_name="Code Integrity & Hygiene")
+        result.add_success(
+            "skill-a",
+            "All checks passed",
+            checks=[
+                {
+                    "name": "test_discovery",
+                    "description": "Found 1 candidate; target tests were not executed and coverage was not measured",
+                    "metadata": {"test_count": 1},
+                }
+            ],
+        )
+        result.add_success(
+            "skill-b",
+            "All checks passed",
+            checks=[
+                {
+                    "name": "test_discovery",
+                    "description": "Found 3 candidates; target tests were not executed and coverage was not measured",
+                    "metadata": {"test_count": 3},
+                }
+            ],
+        )
+        expected = "Target tests were not executed and coverage was not measured for any discovered skill"
+
+        assert CLIReporter._static_test_evidence_message(result) == expected
+        assert BenchmarkReporter._static_test_evidence_message(result) == expected
+
+
+class TestBenchmarkReporter:
+    def test_static_test_limitation_is_preserved_when_other_findings_exist(self) -> None:
+        hygiene = ValidationResult(validator_name="Code Integrity & Hygiene")
+        hygiene.add_success(
+            "test_discovery",
+            "Found 1 candidate; target tests were not executed and coverage was not measured",
+            test_count=1,
+            execution_performed=False,
+            coverage_measured=False,
+        )
+        hygiene.metadata["benchmark_policy"] = {
+            "tier2_required": False,
+            "tier3_required": False,
+        }
+        _bind_publication_target(hygiene, skill_name="skill")
+        advisory = ValidationResult(validator_name="Advisory")
+        advisory.add_finding(
+            Finding(
+                category="ADVISORY",
+                severity=Severity.LOW,
+                check_name="note",
+                message="Minor observation",
+                file_path="SKILL.md",
+            )
+        )
+        _bind_publication_target(advisory, skill_name="skill")
+
+        output = BenchmarkReporter(include_timestamp=False).render_all([hygiene, advisory])
+
+        assert "target tests were not executed" in output.lower()
+        assert "coverage was not measured" in output.lower()
+        assert "Publication Recommendation" in output
+
+
+class TestJSONReporter:
+    """Tests for JSONReporter."""
+
+    def test_render_success(self, success_result: ValidationResult) -> None:
+        """Test JSON output for successful validation."""
+        reporter = JSONReporter(include_timestamp=False)
+        output = reporter.render(success_result)
+
+        data = json.loads(output)
+        assert data["validator"] == "SCHEMA"
+        assert data["passed"] is True
+        assert len(data["success_details"]) == 3
+
+    def test_render_failure(self, failure_result: ValidationResult) -> None:
+        """Test JSON output for failed validation."""
+        reporter = JSONReporter(include_timestamp=False)
+        output = reporter.render(failure_result)
+
+        data = json.loads(output)
+        assert data["validator"] == "SECRETS"
+        assert data["passed"] is False
+        assert len(data["findings"]) == 2
+        assert data["findings"][0]["severity"] == "critical"
+
+    def test_render_all(self, mixed_results: list[ValidationResult]) -> None:
+        """Test JSON output for multiple results."""
+        reporter = JSONReporter(include_timestamp=False)
+        output = reporter.render_all(mixed_results)
+
+        data = json.loads(output)
+        assert data["overall_passed"] is False
+        assert data["total_validators"] == 2
+        assert len(data["results"]) == 2
+
+    @staticmethod
+    def _clean_schema_result() -> ValidationResult:
+        """A single-skill schema result with no finding, as a clean skill gives."""
+        result = ValidationResult(
+            validator_name="Schema & Repository Governance",
+            validator_description="Validate SKILL.md frontmatter and repository structure",
+        )
+        result.add_success("manifest_exists", "Found skill manifest: SKILL.md")
+        result.add_success("frontmatter_valid", "Valid frontmatter for skill 'simple'")
+        result.add_success("naming_convention", "Folder name 'simple' follows kebab-case convention")
+        return result
+
+    def test_render_all_names_the_explicit_skill_of_a_clean_single_skill_run(self) -> None:
+        data = json.loads(
+            JSONReporter(
+                include_timestamp=False,
+                target_path="https://github.com/example/skills/tree/main/skills/simple",
+                explicit_skill_name="simple",
+            ).render_all([self._clean_schema_result()])
+        )
+
+        assert data["skills"] == [{"name": "simple", "passed": True, "issue_count": 0}]
+
+    def test_render_all_names_the_skill_at_a_local_target_path(self, tmp_path: Path) -> None:
+        skill = tmp_path / "simple"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("---\nname: simple\n---\n", encoding="utf-8")
+
+        data = json.loads(
+            JSONReporter(include_timestamp=False, target_path=str(skill)).render_all([self._clean_schema_result()])
+        )
+
+        assert [entry["name"] for entry in data["skills"]] == ["simple"]
+        assert data["target_path"] == str(skill)
+
+    @pytest.mark.parametrize(
+        ("working_directory", "target"),
+        [
+            ("simple", "."),
+            ("simple", "./"),
+            ("simple/nested", ".."),
+            (".", "simple"),
+            (".", "./simple"),
+            (".", "simple/"),
+            ("simple/nested", "../../simple"),
+        ],
+    )
+    def test_render_all_names_the_skill_for_every_spelling_of_a_local_target(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, working_directory: str, target: str
+    ) -> None:
+        """``.`` and ``..`` have no folder name of their own; the folder they open does."""
+        skill = tmp_path / "simple"
+        (skill / "nested").mkdir(parents=True)
+        (skill / "SKILL.md").write_text("---\nname: simple\n---\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path / working_directory)
+
+        data = json.loads(
+            JSONReporter(include_timestamp=False, target_path=target).render_all([self._clean_schema_result()])
+        )
+
+        assert data["skills"] == [{"name": "simple", "passed": True, "issue_count": 0}]
+        assert data["target_path"] == target
+
+    def test_render_all_does_not_name_a_current_directory_that_holds_no_skill(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        folder = tmp_path / "plain"
+        folder.mkdir()
+        monkeypatch.chdir(folder)
+
+        data = json.loads(
+            JSONReporter(include_timestamp=False, target_path=".").render_all([self._clean_schema_result()])
+        )
+
+        assert "plain" not in [entry["name"] for entry in data["skills"]]
+
+    def test_render_all_records_the_evaluator_version_and_target(self, success_result: ValidationResult) -> None:
+        from skillevaluator import __version__
+
+        target = "https://github.com/example/skills/tree/main/skills/test-skill"
+        data = json.loads(JSONReporter(include_timestamp=False, target_path=target).render_all([success_result]))
+        programmatic = json.loads(JSONReporter(include_timestamp=False).render_all([success_result]))
+
+        assert data["version"] == __version__
+        assert data["target_path"] == target
+        assert programmatic["version"] == __version__
+        assert programmatic["target_path"] is None
+
+    def test_render_all_lists_the_html_top_issues_without_the_html_anchor(
+        self, mixed_results: list[ValidationResult]
+    ) -> None:
+        output = JSONReporter(include_timestamp=False).render_all(mixed_results)
+        data = json.loads(output)
+        html_rows = _html_report_data(HTMLReporter(include_timestamp=False).render_all(mixed_results))["top_issues"]
+
+        assert [(row["message"], row["severity"], row["total_count"]) for row in data["top_issues"]] == [
+            ("AWS Access Key ID detected", "critical", 1),
+            ("Generic API key pattern detected", "high", 1),
+        ]
+        assert all(
+            set(row) == {"message", "severity", "total_count", "skills_affected", "category", "suggestion"}
+            for row in data["top_issues"]
+        )
+        assert data["top_issues"] == [
+            {key: value for key, value in row.items() if key != "issue_key"} for row in html_rows
+        ]
+        # The anchor hashes finding text, which CI redaction cannot refresh.
+        assert all(row["issue_key"] not in output for row in html_rows)
+
+    def test_top_issues_cover_every_tier_while_the_html_panel_lists_tier1(
+        self, success_result: ValidationResult
+    ) -> None:
+        results = [success_result, _similarity_result(severity=Severity.HIGH)]
+
+        data = json.loads(JSONReporter(include_timestamp=False).render_all(results))
+        html = HTMLReporter(include_timestamp=False).render_all(results)
+
+        assert [row["message"] for row in data["top_issues"]] == ["same-name similarity match"]
+        assert data["top_issues"] == [
+            {key: value for key, value in row.items() if key != "issue_key"}
+            for row in _html_report_data(html)["top_issues"]
+        ]
+        # The HTML summary panel lists the Tier 1 rows only.
+        assert "same-name similarity match" not in _html_tab(html, "tier1")
+
+    def test_gating_tiers_record_each_validator_policy(self) -> None:
+        schema = ValidationResult(validator_name="Schema & Repository Governance")
+        schema.metadata["gating"] = {"tier": 1, "blocking": True}
+        blocking_dedup = ValidationResult(validator_name="Context Deduplication")
+        blocking_dedup.metadata["gating"] = {"tier": 2, "blocking": True}
+        advisory_dedup = ValidationResult(validator_name="Inter-Skill Deduplication")
+        advisory_dedup.metadata["gating"] = {"tier": 2, "blocking": False}
+
+        data = json.loads(JSONReporter(include_timestamp=False).render_all([schema, blocking_dedup, advisory_dedup]))
+
+        assert data["gating"]["tiers"] == {
+            "1": {
+                "blocking": True,
+                "validators": ["Schema & Repository Governance"],
+                "validator_policies": [{"validator": "Schema & Repository Governance", "blocking": True}],
+            },
+            "2": {
+                "blocking": True,
+                "validators": ["Context Deduplication", "Inter-Skill Deduplication"],
+                "validator_policies": [
+                    {"validator": "Context Deduplication", "blocking": True},
+                    {"validator": "Inter-Skill Deduplication", "blocking": False},
+                ],
+            },
+        }
+
+    def test_render_all_persists_typed_rubric_execution_metadata(self) -> None:
+        result = ValidationResult(
+            validator_name="RUBRIC_EVAL",
+            validator_description="LLM rubric evaluation",
+        )
+        result.metadata["rubric_eval"] = {
+            "execution_status": "succeeded",
+            "overall_score": 76.4,
+            "overall_pass": False,
+            "checks": [{"id": "scope_definition", "score": 4, "pass": False}],
+        }
+        result.add_error("Rubric evaluation failed")
+
+        data = json.loads(JSONReporter(include_timestamp=False).render_all([result]))
+
+        assert data["rubric_eval"]["execution_status"] == "succeeded"
+        assert data["results"][0]["rubric_eval"] == data["rubric_eval"]
+
+    def test_render_all_persists_resolved_and_per_result_benchmark_policy(self) -> None:
+        tier1 = ValidationResult(validator_name="SCHEMA")
+        tier1.metadata["benchmark_policy"] = {"tier2_required": False}
+        _bind_publication_target(tier1)
+        tier3 = ValidationResult(validator_name="AGENT_EVAL")
+        tier3.metadata["agent_eval"] = {
+            "skill_name": "demo",
+            "benchmark_policy": {"tier3_required": False},
+        }
+        _bind_publication_target(tier3)
+
+        data = json.loads(JSONReporter(include_timestamp=False).render_all([tier1, tier3]))
+
+        assert data["benchmark_policy"] == {
+            "tier2_required": False,
+            "tier3_required": False,
+        }
+        assert data["results"][0]["benchmark_policy"] == {"tier2_required": False}
+        assert "benchmark_policy" not in data["results"][1]
+
+    def test_per_result_benchmark_policy_drops_hostile_and_non_boolean_fields(self) -> None:
+        result = ValidationResult(validator_name="SCHEMA")
+        policy: dict[str, object] = {
+            "tier2_required": False,
+            "tier3_required": float("nan"),
+            "untrusted": "x" * 1_000_000,
+        }
+        policy["self"] = policy
+        result.metadata["benchmark_policy"] = policy
+        _bind_publication_target(result)
+
+        data = json.loads(JSONReporter(include_timestamp=False).render_all([result]))
+
+        assert data["results"][0]["benchmark_policy"] == {"tier2_required": False}
+        assert data["benchmark_policy"] == {"tier2_required": False, "tier3_required": True}
+
+    def test_compact_output(self, success_result: ValidationResult) -> None:
+        """Test compact JSON output without indentation."""
+        reporter = JSONReporter(indent=None, include_timestamp=False)
+        output = reporter.render(success_result)
+
+        # Compact JSON should not have newlines (except in strings)
+        assert output.count("\n") == 0
+
+    def test_tier2_analysis_diagnostics_are_exported_without_unrelated_metadata(self) -> None:
+        result = ValidationResult(validator_name="Context Deduplication")
+        result.mark_scan_incomplete("deduplication-llm")
+        result.metadata["llm_analysis"] = {
+            "provider": "nv_build",
+            "model": "nvidia/test-model",
+            "clusters_total": 6,
+            "clusters_completed": 1,
+            "clusters_failed": 5,
+            "failures": [{"count": 5, "diagnostic": "HTTP 410: Model unavailable."}],
+        }
+        result.metadata["private_provider_context"] = "private-token"
+        reporter = JSONReporter(include_timestamp=False)
+
+        for text in (reporter.render(result), reporter.render_all([result])):
+            data = json.loads(text)
+            actual = data["results"][0] if "results" in data else data
+            assert actual["status"] == "incomplete"
+            assert actual["llm_analysis"] == result.metadata["llm_analysis"]
+            assert "private-token" not in text
+
+    def test_name_property(self) -> None:
+        """Test reporter name."""
+        reporter = JSONReporter()
+        assert reporter.name == "json"
+
+
+def _repeated_finding_results() -> list[ValidationResult]:
+    """Same semantic finding across validators and concrete locations."""
+    results = [
+        ValidationResult(validator_name="SECURITY", validator_description="Security"),
+        ValidationResult(validator_name="CODE_RISK", validator_description="Code risk"),
+    ]
+    for result, line_number in ((results[0], 8), (results[0], 12), (results[1], 8)):
+        result.add_finding(
+            Finding(
+                category="SECURITY",
+                severity=Severity.HIGH,
+                check_name="unsafe-command",
+                message="Unsafe command execution",
+                file_path="scripts/run.py",
+                line_number=line_number,
+                suggestion="Use an argument vector.",
+            )
+        )
+    results[0].add_message("Scanned executable helpers")
+    return results
+
+
+def _exec_summary(html: str) -> str:
+    """Return the Tier 1 executive summary: verdict, KPIs and Fix first."""
+    return html.split('<section class="exec-summary', 1)[1].split("</section>", 1)[0]
+
+
+def _findings_kpi(html: str) -> tuple[str, str]:
+    """Return the Findings KPI value and its reconciliation detail line ("" when absent)."""
+    summary = _exec_summary(html)
+    value = re.search(r'<dt>Findings</dt>\s*<dd class="kpi-value"><strong>(\d+)</strong></dd>', summary)
+    assert value is not None
+    detail = re.search(r'<dd class="kpi-sub kpi-issue-detail">([^<]*)</dd>', summary)
+    return value.group(1), detail.group(1) if detail else ""
+
+
+def test_finding_identity_is_semantic_and_occurrence_identity_is_location_bound() -> None:
+    first = Finding(
+        category="SECURITY",
+        severity=Severity.HIGH,
+        check_name="unsafe-command",
+        message="Unsafe  command execution",
+        file_path="scripts/run.py",
+        line_number=8,
+        suggestion="Use an argument vector.",
+    )
+    second = Finding(
+        category="security",
+        severity=Severity.MEDIUM,
+        check_name="unsafe-command",
+        message=" Unsafe command execution ",
+        file_path="scripts/run.py",
+        line_number=12,
+        suggestion="Use an argument vector.",
+    )
+
+    assert first.finding_id == second.finding_id
+    assert re.fullmatch(r"SEF-[0-9a-f]{20}", first.finding_id)
+    assert first.occurrence_id != second.occurrence_id
+    assert re.fullmatch(r"SEO-[0-9a-f]{20}", first.occurrence_id)
+    # IDs are part of the serialized finding and stable across processes.
+    assert first.to_dict()["finding_id"] == first.finding_id
+    assert first.to_dict()["occurrence_id"] == first.occurrence_id
+    assert first.finding_id == "SEF-cca71f6c36db0948f02b"
+
+
+def test_occurrence_identity_distinguishes_line_zero_from_no_line() -> None:
+    common = {
+        "category": "SECURITY",
+        "severity": Severity.HIGH,
+        "check_name": "unsafe-command",
+        "message": "Unsafe command execution",
+        "file_path": "scripts/run.py",
+    }
+
+    assert Finding(**common, line_number=0).occurrence_id != Finding(**common, line_number=None).occurrence_id
+
+
+def test_secret_finding_id_ignores_the_location_written_into_its_message() -> None:
+    from skillevaluator.tier1.plugin_checks import _attribute_scan_result
+    from skillevaluator.validators.secrets import SecretsValidator
+
+    def scan(file_path: str, line: int) -> ValidationResult:
+        result = ValidationResult(validator_name="Secrets Detection")
+        SecretsValidator()._process_findings(
+            [{"RuleID": "generic-api-key", "Description": "Generic API Key", "File": file_path, "StartLine": line}],
+            result,
+        )
+        return result
+
+    findings = [scan("scripts/run.py", line).findings[0] for line in (10, 11)]
+    # A folder run prefixes the skill name and a plugin scan the member
+    # directory to file_path; neither rewrites the message.
+    for line in (10, 11):
+        folder = ValidationResult(validator_name="Secrets Detection")
+        folder.merge_with_prefix(scan("scripts/run.py", line), "alpha")
+        member = scan("scripts/run.py", line)
+        _attribute_scan_result(member, "skills/alpha", Path("/view"), Path("/plugin"))
+        findings.extend([folder.findings[0], member.findings[0]])
+    assert {finding.file_path for finding in findings} == {
+        "scripts/run.py",
+        "[alpha] scripts/run.py",
+        "skills/alpha/scripts/run.py",
+    }
+
+    # The message still names the location; only the identity leaves it out.
+    assert findings[0].message == "Generic API Key in scripts/run.py:10 [generic-api-key]"
+    assert findings[-1].message == "Generic API Key in scripts/run.py:11 [generic-api-key]"
+    assert len({finding.finding_id for finding in findings}) == 1
+    assert len({finding.occurrence_id for finding in findings}) == 6
+    # The suggestion names the file, so a secret in another file is another finding.
+    other = scan("scripts/other.py", 10).findings[0]
+    assert "scripts/other.py" in other.suggestion
+    assert other.finding_id != findings[0].finding_id
+
+
+def test_secret_finding_id_ignores_a_windows_location_in_its_message() -> None:
+    from skillevaluator.validators.secrets import SecretsValidator
+
+    def scan(line: int) -> Finding:
+        result = ValidationResult(validator_name="Secrets Detection")
+        SecretsValidator()._process_findings(
+            [
+                {
+                    "RuleID": "generic-api-key",
+                    "Description": "Generic API Key",
+                    "File": "scripts\\run.py",
+                    "StartLine": line,
+                }
+            ],
+            result,
+        )
+        [finding] = result.findings
+        # On Windows, plugin member attribution writes file_path with "/"
+        # while the message keeps the path Gitleaks reported.
+        finding.file_path = "skills/alpha/scripts/run.py"
+        return finding
+
+    moved = [scan(line) for line in (10, 11)]
+
+    assert moved[0].message == "Generic API Key in scripts\\run.py:10 [generic-api-key]"
+    assert moved[0].finding_id == moved[1].finding_id
+    assert moved[0].occurrence_id != moved[1].occurrence_id
+    # A path that is not the finding's own location stays part of the identity.
+    other = Finding("SECRETS", Severity.HIGH, "generic-api-key", "Key in other\\run.py:10", "scripts/run.py", 10)
+    renamed = Finding("SECRETS", Severity.HIGH, "generic-api-key", "Key in other\\run.py:11", "scripts/run.py", 11)
+    assert other.finding_id != renamed.finding_id
+
+
+def test_repeated_pii_finding_id_survives_line_moves(tmp_path) -> None:
+    from skillevaluator.validators.security import SecurityValidator
+
+    def scan(name: str, padding: str, repeats: int) -> Finding:
+        skill = tmp_path / name
+        skill.mkdir()
+        body = "".join(f"See /Users/johndoe/notes{index}.\n" for index in range(repeats))
+        (skill / "SKILL.md").write_text(
+            "---\nname: demo\ndescription: A sample skill.\n---\n# Demo\n" + padding + body, encoding="utf-8"
+        )
+        result = SecurityValidator(use_llm=False).validate_pii_only(skill)
+        [finding] = [finding for finding in result.findings if "/Users/johndoe/" in finding.message]
+        return finding
+
+    repeated = scan("repeated", "", 2)
+    moved = scan("moved", "\n", 2)
+    single = scan("single", "", 1)
+
+    assert "2 occurrences (SKILL.md lines 6, 7)" in repeated.message
+    assert "2 occurrences (SKILL.md lines 7, 8)" in moved.message
+    assert repeated.finding_id == moved.finding_id == single.finding_id
+    assert repeated.occurrence_id != moved.occurrence_id
+
+
+def test_occurrence_identity_uses_forward_slashes() -> None:
+    common = {
+        "category": "SECURITY",
+        "severity": Severity.HIGH,
+        "check_name": "unsafe-command",
+        "message": "Unsafe command execution",
+        "line_number": 3,
+    }
+
+    windows = Finding(**common, file_path="scripts\\run.py")
+    posix = Finding(**common, file_path="scripts/run.py")
+
+    assert windows.occurrence_id == posix.occurrence_id
+
+
+def test_occurrences_with_and_without_a_line_number_sort_without_error() -> None:
+    from skillevaluator.reporting.finding_summary import summarize_findings
+
+    result = ValidationResult(validator_name="SECURITY", validator_description="Security")
+    for line_number in (None, 3):
+        result.add_finding(
+            Finding(
+                category="SECURITY",
+                severity=Severity.HIGH,
+                check_name="unsafe-command",
+                message="Unsafe command execution",
+                file_path="scripts/run.py",
+                line_number=line_number,
+            )
+        )
+
+    summary = summarize_findings([result])
+
+    assert summary["unique_findings"] == 1
+    assert summary["distinct_occurrences"] == 2
+    assert [item["line_number"] for item in summary["groups"][0]["occurrences"]] == [None, 3]
+    data = json.loads(JSONReporter(include_timestamp=False).render_all([result]))
+    assert data["finding_groups"][0]["occurrence_count"] == 2
+    assert "1 unique finding (1 high) / 2 occurrences" in MarkdownReporter().render_all([result])
+    assert _findings_kpi(HTMLReporter(include_timestamp=False).render_all([result]))[0] == "1"
+
+
+def _unsafe_command(severity: Severity, line_number: int) -> Finding:
+    return Finding(
+        category="SECURITY",
+        severity=severity,
+        check_name="unsafe-command",
+        message="Unsafe command execution",
+        file_path="scripts/run.py",
+        line_number=line_number,
+        suggestion="Use an argument vector.",
+    )
+
+
+def test_reconciled_finding_keeps_its_highest_severity_in_every_format() -> None:
+    # JSON merges per-result summaries; HTML and Markdown summarize all
+    # results at once. Both paths must keep the higher severity.
+    medium = ValidationResult(validator_name="SECURITY", validator_description="Security")
+    medium.add_finding(_unsafe_command(Severity.MEDIUM, 8))
+    high = ValidationResult(validator_name="CODE_RISK", validator_description="Code risk")
+    high.add_finding(_unsafe_command(Severity.HIGH, 8))
+    results = [medium, high]
+
+    data = json.loads(JSONReporter(include_timestamp=False).render_all(results))
+    html_data = _html_report_data(HTMLReporter(include_timestamp=False).render_all(results))
+    for document in (data, html_data):
+        assert [group["severity"] for group in document["finding_groups"]] == ["high"]
+        assert document["finding_counts"]["unique_by_severity"]["high"] == 1
+        assert document["finding_counts"]["unique_by_severity"]["medium"] == 0
+    assert "| Total Issues | 1 unique finding (1 high) / 1 occurrence / 2 raw records |" in (
+        MarkdownReporter().render_all(results)
+    )
+
+    # One validator reporting the finding as medium, then high, blocks as high.
+    single = ValidationResult(validator_name="SECURITY", validator_description="Security")
+    single.add_finding(_unsafe_command(Severity.MEDIUM, 8))
+    single.add_finding(_unsafe_command(Severity.HIGH, 12))
+    summary = _exec_summary(HTMLReporter(include_timestamp=False).render_all([single]))
+    assert re.search(r'Blocking critical \+ high</dt>\s*<dd class="kpi-value"><strong[^>]*>1</strong>', summary)
+
+
+def test_finding_reconciliation_contract_matches_json_markdown_and_html(monkeypatch) -> None:
+    results = _repeated_finding_results()
+
+    original_to_dict = Finding.to_dict
+    to_dict_calls = 0
+
+    def counting_to_dict(finding):
+        nonlocal to_dict_calls
+        to_dict_calls += 1
+        return original_to_dict(finding)
+
+    monkeypatch.setattr(Finding, "to_dict", counting_to_dict)
+
+    json_data = json.loads(JSONReporter(include_timestamp=False).render_all(results))
+    assert to_dict_calls == 3
+    markdown = MarkdownReporter(include_timestamp=False).render_all(results)
+    html = HTMLReporter(include_timestamp=False).render_all(results)
+    html_data = _html_report_data(html)
+
+    expected = {
+        "raw_occurrences": 3,
+        "distinct_occurrences": 2,
+        "unique_findings": 1,
+        "duplicates_removed": 1,
+        "occurrences_grouped": 1,
+        "raw_by_severity": {"critical": 0, "high": 3, "medium": 0, "low": 0, "info": 0},
+        "unique_by_severity": {"critical": 0, "high": 1, "medium": 0, "low": 0, "info": 0},
+    }
+    assert json_data["finding_counts"] == expected
+    assert html_data["finding_counts"] == expected
+    # Error strings that mirror findings are not counted again.
+    assert json_data["message_counts"] == {
+        "informational": 1,
+        "independent_errors": 0,
+        "independent_warnings": 0,
+    }
+    assert html_data["message_counts"] == json_data["message_counts"]
+    # Raw totals stay available for existing consumers.
+    assert json_data["total_errors"] == 3
+    assert [result["finding_counts"]["raw_occurrences"] for result in json_data["results"]] == [2, 1]
+
+    group = json_data["finding_groups"][0]
+    assert group["finding_id"].startswith("SEF-")
+    assert group["occurrence_count"] == 2
+    assert group["validators"] == ["CODE_RISK", "SECURITY"]
+    assert [item["line_number"] for item in group["occurrences"]] == [8, 12]
+    assert html_data["finding_groups"] == json_data["finding_groups"]
+    assert json_data["results"][0]["findings"][0]["finding_id"] == group["finding_id"]
+    assert json_data["results"][0]["findings"][0]["metadata"] is None
+    assert html_data["results"][0]["findings"][0]["finding_id"] == group["finding_id"]
+    assert html_data["summary"]["total_issues"] == 1
+    # A display entry that merges two lines keeps both occurrence IDs.
+    merged_entry = next(iter(html_data["skills"].values()))["validators"]["SECURITY"]["findings"][0]
+    assert merged_entry["occurrences"] == 2
+    assert "occurrence_id" not in merged_entry
+    assert sorted(merged_entry["occurrence_ids"]) == sorted(item["occurrence_id"] for item in group["occurrences"])
+
+    # The severity breakdown qualifies the unique count, so it is not raw.
+    assert "| Total Issues | 1 unique finding (1 high) / 2 occurrences / 3 raw records |" in markdown
+    assert "| Duplicate Occurrences Reconciled | 1 |" in markdown
+    assert "Messages (" not in markdown
+    assert f"| `{group['finding_id']}` | HIGH | Unsafe command execution | 2 |" in markdown
+    assert f"- Occurrence ID: `{group['occurrences'][0]['occurrence_id']}`" in markdown
+    # The HTML summary counts the way Markdown does: one unique high finding,
+    # with its occurrences and raw records beside it.
+    assert _findings_kpi(html) == ("1", "1 unique finding / 2 occurrences / 3 raw records / 1 duplicate reconciled")
+    summary = _exec_summary(html)
+    assert '<span class="sev-dot high" aria-hidden="true"></span>1 high</span>' in summary
+    assert re.search(r'Blocking critical \+ high</dt>\s*<dd class="kpi-value"><strong[^>]*>1</strong>', summary)
+    assert "1 critical or high finding in those checks" in summary
+    assert "each location is an occurrence" in summary
+    # Fix first lists one place; the second occurrence is under its check.
+    assert "The other findings are listed under their checks below." in summary
+    assert '<span class="issue-count-badge">1 finding</span>' in html
+
+
+def test_tier1_dashboard_reconciles_only_tier1_findings() -> None:
+    results = [*_repeated_finding_results(), _similarity_result(severity=Severity.HIGH)]
+
+    html = HTMLReporter(include_timestamp=False).render_all(results)
+    html_data = _html_report_data(html)
+
+    # The embedded summary covers every tier; the Tier 1 card and KPI cover Tier 1 only.
+    assert html_data["summary"]["total_issues"] == 2
+    assert html_data["finding_counts"]["raw_occurrences"] == 4
+    assert _findings_kpi(html) == ("1", "1 unique finding / 2 occurrences / 3 raw records / 1 duplicate reconciled")
+    tier_cards = html.split('class="tier-cards', 1)[1].split("</nav>", 1)[0]
+    assert re.search(r"<strong>1</strong> finding</span>", tier_cards)
+    assert "tier-card-sev-pill" not in tier_cards
+    dashboard = html.split('id="tab-tier1"', 1)[1].split('<details class="t3-details">', 1)[0]
+    assert '<p class="dashboard-card-subtitle">1 high</p>' in dashboard
+    assert re.search(r"<strong>1</strong> finding\(s\)</span>", tier_cards)
+    # The gate policy counts each tier's unique findings.
+    gate_policy = html.split('class="gate-policy"', 1)[1].split("</div>", 1)[0]
+    assert "0 critical · 2 high · 0 medium · 0 low" in gate_policy
+
+
+def test_tier1_dashboard_counts_only_tier1_errors_without_findings() -> None:
+    tier2 = _similarity_result(severity=Severity.HIGH)
+    tier2.add_error("Similarity provider request failed")
+    results = [*_repeated_finding_results(), tier2]
+
+    html = HTMLReporter(include_timestamp=False).render_all(results)
+
+    assert _findings_kpi(html) == ("1", "1 unique finding / 2 occurrences / 3 raw records / 1 duplicate reconciled")
+    assert "without a finding" not in _html_tab(html, "tier1")
+    assert _html_report_data(html)["summary"]["total_issues"] == 3
+
+
+def _gate_only_result() -> ValidationResult:
+    result = ValidationResult(validator_name="QUALITY", validator_description="Quality")
+    result.fail_gate("Quality score 42 is below the required minimum 70")
+    return result
+
+
+def _incomplete_scan_error_result() -> ValidationResult:
+    result = ValidationResult(validator_name="SECRETS", validator_description="Secrets")
+    result.add_error("gitleaks crashed before writing its report")
+    result.mark_scan_incomplete("gitleaks")
+    return result
+
+
+def _incomplete_scan_warning_result() -> ValidationResult:
+    result = ValidationResult(validator_name="CODE_RISK", validator_description="Code risk")
+    result.add_warning("bandit not installed.")
+    result.mark_scan_incomplete("bandit")
+    return result
+
+
+@pytest.mark.parametrize(
+    ("build_result", "verdict", "expected_text", "expected_messages"),
+    [
+        (_gate_only_result, "fail", "1 error without a finding", (1, 0)),
+        (_incomplete_scan_error_result, "incomplete", "1 error without a finding", (1, 0)),
+        (_incomplete_scan_warning_result, "incomplete", "1 warning without a finding", (0, 1)),
+    ],
+    ids=["gate-only", "incomplete-scan-error", "incomplete-scan-warning"],
+)
+def test_issue_counts_include_errors_and_warnings_without_findings(
+    build_result, verdict: str, expected_text: str, expected_messages: tuple[int, int]
+) -> None:
+    # A failed gate or an incomplete scan without any finding is not zero issues.
+    results = [build_result()]
+
+    json_data = json.loads(JSONReporter(include_timestamp=False).render_all(results))
+    markdown = MarkdownReporter(include_timestamp=False).render_all(results)
+    html = HTMLReporter(include_timestamp=False).render_all(results)
+    html_data = _html_report_data(html)
+
+    independent_errors, independent_warnings = expected_messages
+    assert json_data["finding_counts"]["unique_findings"] == 0
+    assert json_data["message_counts"] == {
+        "informational": 0,
+        "independent_errors": independent_errors,
+        "independent_warnings": independent_warnings,
+    }
+    assert html_data["message_counts"] == json_data["message_counts"]
+    assert html_data["summary"]["total_issues"] == 1
+    assert f"| Total Issues | {expected_text} |" in markdown
+    summary = _exec_summary(html)
+    assert f'<span class="verdict-chip {"warn" if verdict == "incomplete" else verdict}">' in summary
+    assert _findings_kpi(html) == ("0", expected_text)
+    assert "None reported" in summary
+
+
+def test_issue_counts_put_errors_without_findings_after_unique_findings() -> None:
+    results = _repeated_finding_results()
+    results[0].fail_gate("Security policy requires a clean scan")
+
+    markdown = MarkdownReporter(include_timestamp=False).render_all(results)
+    html = HTMLReporter(include_timestamp=False).render_all(results)
+
+    assert (
+        "| Total Issues | 1 unique finding (1 high) / 2 occurrences / 3 raw records; 1 error without a finding |"
+    ) in markdown
+    assert _findings_kpi(html) == (
+        "1",
+        "1 unique finding / 2 occurrences / 3 raw records / 1 duplicate reconciled; 1 error without a finding",
+    )
+    assert _html_report_data(html)["summary"]["total_issues"] == 2
+
+
+def test_findings_kpi_has_no_detail_line_when_every_record_is_unique() -> None:
+    result = ValidationResult(validator_name="SECURITY", validator_description="Security")
+    for line_number, message in ((3, "Unsafe command execution"), (9, "Hard-coded token")):
+        result.add_finding(
+            Finding(
+                category="SECURITY",
+                severity=Severity.HIGH,
+                check_name="unsafe-command",
+                message=message,
+                file_path="scripts/run.py",
+                line_number=line_number,
+            )
+        )
+
+    html = HTMLReporter(include_timestamp=False).render_all([result])
+
+    assert _findings_kpi(html) == ("2", "")
+    assert '<span class="issue-count-badge">2 findings</span>' in html
+
+
+def test_workflow_scope_note_is_not_an_issue_without_a_finding() -> None:
+    from skillevaluator.tier_workflows import _record_scope
+
+    result = ValidationResult(validator_name="Schema Validation", validator_description="Schema")
+    result.add_success(check_name="schema", message="Frontmatter is valid")
+    _record_scope([result], 1, {"llm": {"status": "skipped", "reason": "LLM checks disabled by --no-llm."}})
+    assert result.warnings == ["Workflow scope: llm skipped. LLM checks disabled by --no-llm."]
+
+    html = HTMLReporter(include_timestamp=False).render_all([result])
+    assert _findings_kpi(html) == ("0", "")
+    assert _html_report_data(html)["summary"]["total_issues"] == 0
+    data = json.loads(JSONReporter(include_timestamp=False).render_all([result]))
+    assert data["message_counts"]["independent_warnings"] == 0
+    assert data["total_warnings"] == 1
+    assert "| Total Issues | 0 unique findings / 0 occurrences / 0 raw records |" in MarkdownReporter().render_all(
+        [result]
+    )
+
+
+def test_folded_pii_finding_counts_each_listed_location_as_an_occurrence(tmp_path) -> None:
+    from skillevaluator.reporting.finding_summary import refresh_finding_identities
+    from skillevaluator.validators.security import SecurityValidator
+
+    skill = tmp_path / "demo"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: A sample skill.\n---\n# Demo\n\n\n"
+        "See /Users/johndoe/a.\nSee /Users/johndoe/b.\n",
+        encoding="utf-8",
+    )
+    result = SecurityValidator(use_llm=False).validate_pii_only(skill)
+    result.validator_name = "PII Scan"
+    [finding] = [finding for finding in result.findings if "/Users/johndoe/" in finding.message]
+    assert finding.metadata["occurrence_count"] == 2
+
+    data = json.loads(JSONReporter(include_timestamp=False).render_all([result]))
+    [group] = [group for group in data["finding_groups"] if group["finding_id"] == finding.finding_id]
+    assert group["occurrence_count"] == 2
+    assert [(item["file_path"], item["line_number"]) for item in group["occurrences"]] == [
+        ("SKILL.md", 8),
+        ("SKILL.md", 9),
+    ]
+    assert finding.occurrence_id in {item["occurrence_id"] for item in group["occurrences"]}
+    counts = data["finding_counts"]
+    assert counts["distinct_occurrences"] == counts["raw_occurrences"] + 1
+    assert counts["duplicates_removed"] == 0
+    # Refreshing the IDs of an unredacted report changes nothing.
+    refreshed = copy.deepcopy(data)
+    refresh_finding_identities(refreshed)
+    assert refreshed == data
+
+    markdown = MarkdownReporter().render_all([result])
+    assert re.search(rf"\| `{finding.finding_id}` \| HIGH \| [^|]+ \| 2 \| PII Scan \|", markdown)
+    html = HTMLReporter(include_timestamp=False).render_all([result])
+    html_data = _html_report_data(html)
+    assert html_data["finding_counts"] == data["finding_counts"]
+    assert html_data["finding_groups"] == data["finding_groups"]
+    unique = counts["unique_findings"]
+    occurrences = counts["distinct_occurrences"]
+    assert f"/ {occurrences} occurrences /" in _findings_kpi(html)[1]
+    assert _findings_kpi(html)[0] == str(unique)
+
+
+def test_folded_pii_finding_in_a_folder_run_counts_each_location_once(tmp_path) -> None:
+    from skillevaluator.validators.security import SecurityValidator
+
+    for name, body in (("support", "Mail boss@company.com.\nAlso boss@company.com.\n"), ("other", "Nothing.\n")):
+        skill = tmp_path / name
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: A sample skill.\n---\n{body}",
+            encoding="utf-8",
+        )
+    original = ValidationResult(validator_name="PII Scan")
+    original.add_finding(
+        Finding(
+            category="PII",
+            severity=Severity.HIGH,
+            check_name="pii",
+            message="Folded",
+            file_path="SKILL.md",
+            line_number=5,
+            metadata={"occurrences": [{"file": "SKILL.md", "line": 5}, {"file": "SKILL.md", "line": 6}]},
+        )
+    )
+    ValidationResult(validator_name="PII Scan").merge_with_prefix(original, "support")
+    # Prefixing a merged copy leaves the original finding's metadata alone.
+    assert original.findings[0].metadata["occurrences"][0]["file"] == "SKILL.md"
+
+    result = SecurityValidator(use_llm=False).validate_pii_only(tmp_path)
+    result.validator_name = "PII Scan"
+    [finding] = [finding for finding in result.findings if "boss@company.com" in finding.message]
+    assert finding.file_path == "[support] SKILL.md"
+    assert "2 occurrences" in finding.message
+
+    data = json.loads(JSONReporter(include_timestamp=False).render_all([result]))
+    [group] = [group for group in data["finding_groups"] if group["finding_id"] == finding.finding_id]
+    assert [(item["file_path"], item["line_number"]) for item in group["occurrences"]] == [
+        ("[support] SKILL.md", 5),
+        ("[support] SKILL.md", 6),
+    ]
+    assert group["occurrence_count"] == 2
+    assert finding.occurrence_id in {item["occurrence_id"] for item in group["occurrences"]}
+    assert data["finding_counts"]["distinct_occurrences"] == data["finding_counts"]["raw_occurrences"] + 1
+
+    markdown = MarkdownReporter().render_all([result])
+    assert re.search(rf"\| `{finding.finding_id}` \| HIGH \| [^|]+ \| 2 \| PII Scan \|", markdown)
+
+
+def test_top_issues_count_a_folded_pii_finding_as_one_record(tmp_path) -> None:
+    from skillevaluator.validators.security import SecurityValidator
+
+    skill = tmp_path / "simple"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text(
+        "---\nname: simple\ndescription: A sample skill.\n---\n# Simple\n\n\n"
+        "See /Users/johndoe/a.\nSee /Users/johndoe/b.\nSee /Users/johndoe/c.\n",
+        encoding="utf-8",
+    )
+    result = SecurityValidator(use_llm=False).validate_pii_only(skill)
+    result.validator_name = "PII Scan"
+    [finding] = [finding for finding in result.findings if "/Users/johndoe/" in finding.message]
+    assert finding.metadata["occurrence_count"] == 3
+
+    data = json.loads(JSONReporter(include_timestamp=False, target_path=str(skill)).render_all([result]))
+
+    # finding_groups lists each folded location; top_issues counts raw finding
+    # records, the unit of skills[].issue_count, so the folded finding counts once.
+    [group] = [group for group in data["finding_groups"] if group["finding_id"] == finding.finding_id]
+    assert len(group["occurrences"]) == 3
+    [issue] = [issue for issue in data["top_issues"] if "/Users/johndoe/" in issue["message"]]
+    assert issue["total_count"] == 1
+    assert data["skills"] == [{"name": "simple", "passed": False, "issue_count": len(result.findings)}]
+    assert sum(issue["total_count"] for issue in data["top_issues"]) == data["skills"][0]["issue_count"]
+
+    # The JSON field table in the CI docs states that unit.
+    docs = (Path(__file__).resolve().parents[2] / "docs" / "ci-integration.mdx").read_text(encoding="utf-8")
+    rows = {line.split(" | ", 1)[0]: line for line in docs.splitlines() if line.startswith("| `")}
+    assert "`total_count` of raw finding records" in rows["| `top_issues`"]
+    assert "raw occurrences" not in rows["| `top_issues`"]
+    assert "`issue_count` counts raw finding records" in rows["| `skills`"]
+
+
+def test_finding_group_occurrences_do_not_copy_the_source_line() -> None:
+    result = ValidationResult(validator_name="Code Risk")
+    for line_number in (3, 9):
+        result.add_finding(
+            Finding(
+                category="SECURITY",
+                severity=Severity.MEDIUM,
+                check_name="shell",
+                message="subprocess call with shell=True",
+                file_path="run.py",
+                line_number=line_number,
+                line_content="subprocess.run(command, shell=True)  # " + "x" * 200,
+            )
+        )
+
+    data = json.loads(JSONReporter(include_timestamp=False).render_all([result]))
+    html_data = _html_report_data(HTMLReporter(include_timestamp=False).render_all([result]))
+    [group] = data["finding_groups"]
+    assert html_data["finding_groups"] == data["finding_groups"]
+    # Each location keeps its identity; its source line is on the finding
+    # with the same occurrence_id, not repeated in the group.
+    assert [sorted(item) for item in group["occurrences"]] == [
+        ["file_path", "line_number", "occurrence_id", "validator"]
+    ] * 2
+    by_occurrence = {finding["occurrence_id"]: finding for finding in data["results"][0]["findings"]}
+    assert all(by_occurrence[item["occurrence_id"]]["line_content"] for item in group["occurrences"])
+    assert json.dumps(data).count("x" * 200) == 2
+
+
+def test_html_skill_entries_merge_only_occurrences_of_one_finding() -> None:
+    # Two checks with the same message and suggestion are two findings.
+    result = ValidationResult(validator_name="SECURITY", validator_description="Security")
+    for check_name, line_number in (("rule-a", 3), ("rule-b", 9)):
+        result.add_finding(
+            Finding(
+                category="SECURITY",
+                severity=Severity.HIGH,
+                check_name=check_name,
+                message="Unsafe command execution",
+                file_path="scripts/run.py",
+                line_number=line_number,
+                suggestion="Use an argument vector.",
+            )
+        )
+
+    data = _html_report_data(HTMLReporter(include_timestamp=False).render_all([result]))
+
+    group_of = {
+        item["occurrence_id"]: group["finding_id"] for group in data["finding_groups"] for item in group["occurrences"]
+    }
+    [skill] = data["skills"].values()
+    entries = [entry for validator in skill["validators"].values() for entry in validator["findings"]]
+    assert len(entries) == skill["finding_count"] == 2
+    for entry in entries:
+        assert entry["occurrence_ids"]
+        assert {group_of[occurrence_id] for occurrence_id in entry["occurrence_ids"]} == {entry["finding_id"]}
+
+
+def test_same_finding_in_several_skills_counts_once_with_one_occurrence_per_skill() -> None:
+    collection = ValidationResult(validator_name="SCHEMA", validator_description="Schema")
+    for skill in ("alpha", "beta", "gamma"):
+        per_skill = ValidationResult(validator_name="SCHEMA", validator_description="Schema")
+        per_skill.add_finding(
+            Finding("SCHEMA", Severity.HIGH, "missing-description", "Missing description field", "SKILL.md", 1)
+        )
+        collection.merge_with_prefix(per_skill, skill)
+    results = [collection]
+
+    json_data = json.loads(JSONReporter(include_timestamp=False).render_all(results))
+    markdown = MarkdownReporter(include_timestamp=False).render_all(results)
+    html = HTMLReporter(include_timestamp=False).render_all(results)
+
+    # Identical findings in different skills share one finding_id.
+    assert json_data["finding_counts"]["unique_findings"] == 1
+    assert json_data["finding_counts"]["distinct_occurrences"] == 3
+    assert [item["file_path"] for item in json_data["finding_groups"][0]["occurrences"]] == [
+        "[alpha] SKILL.md",
+        "[beta] SKILL.md",
+        "[gamma] SKILL.md",
+    ]
+    assert "| Total Issues | 1 unique finding (1 high) / 3 occurrences / 3 raw records |" in markdown
+    assert _findings_kpi(html) == ("1", "1 unique finding / 3 occurrences / 3 raw records")
+    # Each skill still has its own finding, and JSON skills[] keeps raw records.
+    assert html.count('<span class="issue-count-badge">1 finding</span>') == 3
+    assert sorted((skill["name"], skill["issue_count"]) for skill in json_data["skills"]) == [
+        ("alpha", 1),
+        ("beta", 1),
+        ("gamma", 1),
+    ]
+
+
+def test_markdown_reconciliation_table_lists_the_most_severe_findings_first() -> None:
+    result = ValidationResult(validator_name="SECURITY", validator_description="Security")
+    lows = [
+        Finding("SECURITY", Severity.LOW, "style", f"Low finding {index}", "SKILL.md", index + 1) for index in range(12)
+    ]
+    # Pick a critical finding that falls past the 10-row cap in finding_id order.
+    critical = next(
+        finding
+        for finding in (
+            Finding("SECURITY", Severity.CRITICAL, "secret", f"Hard-coded AWS key {index}", "config.py", 4)
+            for index in range(1000)
+        )
+        if sum(low.finding_id < finding.finding_id for low in lows) >= 10
+    )
+    for finding in [*lows, critical]:
+        result.add_finding(finding)
+    finding_ids = sorted(finding.finding_id for finding in result.findings)
+    assert finding_ids.index(critical.finding_id) >= 10
+
+    markdown = MarkdownReporter(include_timestamp=False).render_all([result])
+    json_data = json.loads(JSONReporter(include_timestamp=False).render_all([result]))
+
+    table = markdown.split("## Finding Reconciliation", 1)[1].split("\n\n", 2)[1]
+    rows = [line for line in table.splitlines() if line.startswith("| `SEF-")]
+    assert len(rows) == 10
+    assert rows[0].startswith(f"| `{critical.finding_id}` | CRITICAL | {critical.message} |")
+    assert "*3 more unique findings*" in table
+    # Machine output stays ordered by finding_id.
+    assert [group["finding_id"] for group in json_data["finding_groups"]] == finding_ids
+
+
+def test_message_counts_leave_out_passed_check_lines() -> None:
+    result = ValidationResult(validator_name="SECURITY", validator_description="Security")
+    result.add_success("no-secrets", "No secrets found")
+    result.add_success("no-shell", "No shell commands")
+    result.add_message("Scanned 4 files")
+
+    json_data = json.loads(JSONReporter(include_timestamp=False).render_all([result]))
+
+    assert json_data["message_counts"] == {"informational": 1, "independent_errors": 0, "independent_warnings": 0}
+
+
+def test_markdown_finding_reconciliation_escapes_untrusted_text() -> None:
+    result = ValidationResult(validator_name="SECURITY | @maintainers", validator_description="Security")
+    result.add_finding(
+        Finding(
+            category="SECURITY",
+            severity=Severity.HIGH,
+            check_name="unsafe-command",
+            message="bad | <img src=x onerror=alert(1)> [click](https://example.com) @maintainers",
+            file_path="scripts/run.py",
+            line_number=3,
+        )
+    )
+
+    markdown = MarkdownReporter(include_timestamp=False).render_all([result])
+
+    row = next(line for line in markdown.splitlines() if line.startswith(f"| `{result.findings[0].finding_id}`"))
+    assert len(row.strip("|").split("|")) == 5
+    assert "<img" not in row
+    assert "&lt;img" in row
+    assert "](" not in row
+    assert "@maintainers" not in row
+    assert "&#64;maintainers" in row
+
+
+class TestSARIFReporter:
+    """Tests for SARIFReporter."""
+
+    def test_render_failure_produces_valid_sarif(self, failure_result: ValidationResult) -> None:
+        reporter = SARIFReporter(include_timestamp=False)
+        document = json.loads(reporter.render_all([failure_result]))
+
+        assert document["version"] == "2.1.0"
+        assert document["$schema"] == (
+            "https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json"
+        )
+        run = document["runs"][0]
+        driver = run["tool"]["driver"]
+        assert driver["name"] == "SkillEvaluator"
+        assert driver["informationUri"] == "https://github.com/NVIDIA/SkillEvaluator"
+        assert len(driver["rules"]) == 2
+        assert len(run["results"]) == 2
+
+        critical = next(item for item in run["results"] if item["level"] == "error")
+        assert critical["ruleId"] == "SECRETS/aws-access-key-id"
+        assert critical["message"]["text"] == "AWS Access Key ID detected"
+        location = critical["locations"][0]["physicalLocation"]
+        assert location["artifactLocation"]["uri"] == "config/settings.py"
+        assert location["region"]["startLine"] == 15
+
+    def test_severity_mapping(self) -> None:
+        result = ValidationResult(validator_name="TEST", validator_description="test")
+        result.add_finding(
+            Finding(
+                category="TEST",
+                severity=Severity.MEDIUM,
+                check_name="medium-check",
+                message="medium issue",
+                file_path="SKILL.md",
+                line_number=3,
+            )
+        )
+        result.add_finding(
+            Finding(
+                category="TEST",
+                severity=Severity.LOW,
+                check_name="low-check",
+                message="low issue",
+                file_path="SKILL.md",
+            )
+        )
+
+        run = json.loads(SARIFReporter(include_timestamp=False).render_all([result]))["runs"][0]
+        levels = {item["ruleId"]: item["level"] for item in run["results"]}
+        assert levels["TEST/medium-check"] == "warning"
+        assert levels["TEST/low-check"] == "note"
+
+    def test_emit_reports_writes_sarif_file(self, failure_result: ValidationResult) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            emit_reports(
+                [failure_result],
+                report_formats=("sarif",),
+                output_dir=output_dir,
+                basename="skillevaluator-security",
+                announce_paths=False,
+            )
+            sarif_path = output_dir / "skillevaluator-security.sarif.json"
+            assert sarif_path.is_file()
+            document = json.loads(sarif_path.read_text(encoding="utf-8"))
+            assert document["runs"][0]["results"]
+
+    def test_name_and_extension(self) -> None:
+        reporter = SARIFReporter()
+        assert reporter.name == "sarif"
+        assert reporter.get_file_extension() == ".sarif.json"
+
+    def test_incomplete_scan_marks_execution_unsuccessful(self) -> None:
+        result = ValidationResult(validator_name="BANDIT", validator_description="Bandit")
+        result.add_error("Bandit did not return valid JSON; scan did not complete")
+        result.mark_scan_incomplete("bandit")
+
+        invocation = json.loads(SARIFReporter(include_timestamp=False).render_all([result]))["runs"][0]["invocations"][
+            0
+        ]
+        assert invocation["executionSuccessful"] is False
+        assert invocation["toolExecutionNotifications"][0]["message"]["text"] == "bandit scan did not complete"
+
+    def test_physical_location_uri_encodes_spaces_and_skips_invalid_lines(self) -> None:
+        root = Path("/workspace/my skill")
+        result = ValidationResult(validator_name="QUALITY", validator_description="quality")
+        result.add_finding(
+            Finding(
+                category="QUALITY",
+                severity=Severity.MEDIUM,
+                check_name="spacing",
+                message="issue",
+                file_path=str(root / "SKILL.md"),
+                line_number=0,
+            )
+        )
+        result.add_finding(
+            Finding(
+                category="QUALITY",
+                severity=Severity.LOW,
+                check_name="spacing",
+                message="issue",
+                file_path=str(root / "notes/readme.md"),
+                line_number=3,
+            )
+        )
+
+        run = json.loads(SARIFReporter(include_timestamp=False, workspace_root=root).render_all([result]))["runs"][0]
+        locations = [item["locations"][0]["physicalLocation"] for item in run["results"]]
+        assert locations[0]["artifactLocation"]["uri"] == "SKILL.md"
+        assert "region" not in locations[0]
+        assert locations[1]["artifactLocation"]["uri"] == "notes/readme.md"
+        assert locations[1]["region"]["startLine"] == 3
+
+    def test_nested_skill_path_relativized_to_repository_root(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        skill = repo / "skills" / "demo"
+        skill.mkdir(parents=True)
+        result = ValidationResult(validator_name="QUALITY", validator_description="quality")
+        result.add_finding(
+            Finding(
+                category="QUALITY",
+                severity=Severity.MEDIUM,
+                check_name="spacing",
+                message="issue",
+                file_path="SKILL.md",
+                line_number=2,
+            )
+        )
+
+        run = json.loads(
+            SARIFReporter(
+                include_timestamp=False,
+                workspace_root=repo,
+                scan_root=skill,
+            ).render_all([result])
+        )["runs"][0]
+        uri = run["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+        assert uri == "skills/demo/SKILL.md"
+
+    def test_physical_location_uri_encodes_percent_signs(self, tmp_path: Path) -> None:
+        names = ["notes/a b.md", "notes/a%20b.md", "notes/100%.md"]
+        result = ValidationResult(validator_name="QUALITY", validator_description="quality")
+        for name in names:
+            result.add_finding(
+                Finding(
+                    category="QUALITY",
+                    severity=Severity.MEDIUM,
+                    check_name="spacing",
+                    message="issue",
+                    file_path=str(tmp_path / name),
+                    line_number=1,
+                )
+            )
+
+        sarif = json.loads(SARIFReporter(include_timestamp=False, workspace_root=tmp_path).render_all([result]))
+        results = sarif["runs"][0]["results"]
+        uris = [item["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] for item in results]
+        assert uris == ["notes/a%20b.md", "notes/a%2520b.md", "notes/100%25.md"]
+
+    @staticmethod
+    def _artifact_uris(
+        file_paths: list[str],
+        *,
+        workspace_root: Path | None,
+        scan_root: Path | None = None,
+    ) -> list[str]:
+        result = ValidationResult(validator_name="QUALITY", validator_description="quality")
+        for file_path in file_paths:
+            result.add_finding(
+                Finding(
+                    category="QUALITY",
+                    severity=Severity.MEDIUM,
+                    check_name="spacing",
+                    message="issue",
+                    file_path=file_path,
+                    line_number=1,
+                )
+            )
+        reporter = SARIFReporter(include_timestamp=False, workspace_root=workspace_root, scan_root=scan_root)
+        results = json.loads(reporter.render_all([result]))["runs"][0]["results"]
+        return [item["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] for item in results]
+
+    @pytest.mark.skipif(os.name == "nt", reason="Windows file names cannot contain ':'")
+    def test_physical_location_uri_keeps_a_colon_in_the_first_segment_a_path(self, tmp_path: Path) -> None:
+        names = ["notes:v2.md", "skills/a:b.md"]
+        uris = self._artifact_uris([str(tmp_path / name) for name in names], workspace_root=tmp_path)
+
+        assert uris == ["./notes:v2.md", "skills/a:b.md"]
+        assert [urlsplit(uri).scheme for uri in uris] == ["", ""]
+
+    @pytest.mark.skipif(os.name == "nt", reason="only POSIX file names carry undecodable bytes as surrogate escapes")
+    def test_physical_location_uri_encodes_the_bytes_of_an_undecodable_file_name(self, tmp_path: Path) -> None:
+        uris = self._artifact_uris([str(tmp_path / "notes" / "caf\udce9.md")], workspace_root=tmp_path)
+
+        assert uris == ["notes/caf%E9.md"]
+
+    def test_physical_location_uri_outside_the_workspace_is_a_file_uri(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        outside = tmp_path / "outside" / "x y%.md"
+
+        (uri,) = self._artifact_uris([str(outside)], workspace_root=repo)
+
+        parts = urlsplit(uri)
+        assert parts.scheme == "file"
+        assert unquote(parts.path).endswith("/outside/x y%.md")
+
+    def test_file_uri_for_windows_drive_and_unc_paths(self) -> None:
+        assert _file_uri(PureWindowsPath(r"C:\outside\x y.md")) == "file:///C:/outside/x%20y.md"
+        assert _file_uri(PureWindowsPath(r"\\server\share\x.md")) == "file://server/share/x.md"
+        assert _file_uri(PureWindowsPath(r"\\server@SSL@443\DavWWWRoot\x.md")) == (
+            "file://server%40SSL%40443/DavWWWRoot/x.md"
+        )
+
+    def test_physical_location_uri_encodes_a_lone_surrogate_that_is_not_an_escape(self) -> None:
+        assert _normalize_artifact_uri("notes/\ud800.md", None) == "notes/%ED%A0%80.md"
+
+    @pytest.mark.skipif(os.name == "nt", reason="Windows collapses '..' before it follows a symlink")
+    def test_physical_location_uri_follows_dot_dot_through_a_symlinked_directory(self, tmp_path: Path) -> None:
+        skill = tmp_path / "repo" / "skills" / "demo"
+        skill.mkdir(parents=True)
+        (skill / "x.md").write_text("decoy\n", encoding="utf-8")
+        outside = tmp_path / "outside" / "deep"
+        (outside / "dir").mkdir(parents=True)
+        (outside / "x.md").write_text("real\n", encoding="utf-8")
+        try:
+            (skill / "dl").symlink_to(outside / "dir", target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not available")
+
+        (uri,) = self._artifact_uris(["dl/../x.md"], workspace_root=tmp_path / "repo", scan_root=skill)
+
+        parts = urlsplit(uri)
+        assert parts.scheme == "file"
+        assert unquote(parts.path).endswith("/outside/deep/x.md")
+
+    def test_physical_location_uri_keeps_a_symlink_that_points_outside_the_workspace(self, tmp_path: Path) -> None:
+        skill = tmp_path / "repo" / "skills" / "demo"
+        skill.mkdir(parents=True)
+        target = tmp_path / "outside.md"
+        target.write_text("notes\n", encoding="utf-8")
+        try:
+            (skill / "notes.md").symlink_to(target)
+        except OSError:
+            pytest.skip("symlinks are not available")
+
+        uris = self._artifact_uris(["notes.md"], workspace_root=tmp_path / "repo", scan_root=skill)
+
+        assert uris == ["skills/demo/notes.md"]
+
+    def test_merge_catalog_sarif_combines_into_single_run(self) -> None:
+        child = SARIFReporter(include_timestamp=False)
+        documents = []
+        for index in range(21):
+            result = ValidationResult(validator_name="TEST", validator_description="test")
+            result.add_finding(
+                Finding(
+                    category="TEST",
+                    severity=Severity.LOW,
+                    check_name=f"check-{index}",
+                    message="issue",
+                    file_path=f"skills/s{index}/SKILL.md",
+                )
+            )
+            documents.append(json.loads(child.render_all([result])))
+
+        from skillevaluator.reporting.sarif_reporter import merge_catalog_sarif_documents
+
+        merged = merge_catalog_sarif_documents(documents)
+        assert len(merged["runs"]) == 1
+        assert len(merged["runs"][0]["results"]) == 21
+        automation = merged["runs"][0]["automationDetails"]
+        assert automation == {"id": "/skillevaluator/catalog"}
+        assert "name" not in automation
+
+    def test_merge_catalog_sarif_preserves_incomplete_invocation(self) -> None:
+        result = ValidationResult(validator_name="BANDIT", validator_description="Bandit")
+        result.add_error("Bandit scan did not complete")
+        result.mark_scan_incomplete("bandit")
+        child = json.loads(SARIFReporter(include_timestamp=False).render_all([result]))
+
+        from skillevaluator.reporting.sarif_reporter import merge_catalog_sarif_documents
+
+        merged = merge_catalog_sarif_documents([child])
+        invocations = merged["runs"][0]["invocations"]
+        assert invocations == child["runs"][0]["invocations"]
+        assert invocations[0]["executionSuccessful"] is False
+        assert invocations[0]["toolExecutionNotifications"][0]["descriptor"]["id"] == "incomplete/bandit"
+
+
+def _blocking_result() -> ValidationResult:
+    """Tier 1 validator result with one critical + one high finding."""
+    r = ValidationResult(validator_name="SECRETS", validator_description="Secrets")
+    r.add_finding(
+        Finding(
+            category="SECRET",
+            severity=Severity.CRITICAL,
+            check_name="aws-key",
+            message="key",
+            file_path="a.py",
+        )
+    )
+    r.add_finding(
+        Finding(
+            category="SECRET",
+            severity=Severity.HIGH,
+            check_name="api-key",
+            message="key",
+            file_path="b.py",
+        )
+    )
+    return r
+
+
+def _advisory_dedup_result() -> ValidationResult:
+    """Tier 2 (advisory) dedup result with one medium finding."""
+    r = ValidationResult(
+        validator_name="Context Deduplication",
+        validator_description="dedup",
+    )
+    r.add_finding(
+        Finding(
+            category="PARTIAL_OVERLAP",
+            severity=Severity.MEDIUM,
+            check_name="partial_overlap",
+            message="overlap",
+            file_path="SKILL.md",
+        )
+    )
+    return r
+
+
+def _advisory_agent_eval_result() -> ValidationResult:
+    """Tier 3 (advisory) agent-eval result with one low finding."""
+    r = ValidationResult(validator_name="AGENT_EVAL", validator_description="eval")
+    r.add_finding(
+        Finding(
+            category="AGENT_EVAL",
+            severity=Severity.LOW,
+            check_name="some_check",
+            message="advisory",
+            file_path="evals/evals.json",
+        )
+    )
+    return r
+
+
+def _tier3_harbor_result() -> ValidationResult:
+    """Tier 3 result with safe Harbor links and one unsafe link to sanitize."""
+    r = ValidationResult(validator_name="AGENT_EVAL", validator_description="eval")
+    step_url = "https://harbor.example.test/jobs/log-analyzer/tasks/_/codex/openai/gpt/trials/log-analyzer-001?step=9"
+    r.metadata["agent_eval"] = {
+        "schema_version": "2.0",
+        "summary": {
+            "schema_version": "2.0",
+            "verdict": "pass",
+            "skill_name": "log-analyzer",
+            "best_agent": "codex",
+            "agents_run": ["codex"],
+            "overall_score": 0.82,
+            "overall_lift": 0.12,
+            "environment": "local",
+            "runtime_seconds": 42.0,
+            "harbor_viewer": {
+                "job_url": "javascript:alert(1)",
+                "analysis_url": "file:///tmp/report.html",
+            },
+        },
+        "skill_name": "log-analyzer",
+        "verdict": "pass",
+        "best_agent": "codex",
+        "agents_run": ["codex"],
+        "environment": "local",
+        "overall_score": 0.82,
+        "overall_lift": 0.12,
+        "composite_lift": 0.12,
+        "runtime_seconds": 42.0,
+        "agents": {},
+        "dimensions": [],
+        "evaluators": {},
+        "insights": {},
+        "conclusions": [],
+        "recommendations": [
+            {
+                "title": "Tighten workflow",
+                "message": "Tighten the workflow instructions for the failed retrieval case.",
+                "category": "Improve",
+                "severity": "warn",
+                "source": "deterministic",
+                "evidence": {"url": step_url, "label": "goal_accuracy"},
+            },
+            {
+                "title": "Unsafe evidence",
+                "message": "This unsafe evidence link should not render.",
+                "evidence": {"url": "javascript:alert(2)", "label": "bad"},
+            },
+        ],
+        "suggestions": ["Tighten the workflow instructions for the failed retrieval case."],
+        "suggestions_v2": [
+            {
+                "metric": "goal_accuracy",
+                "recommendation": "Tighten the workflow instructions for the failed retrieval case.",
+                "harbor_evidence": {"url": step_url, "label": "goal_accuracy"},
+                "evidence_refs": [],
+            }
+        ],
+        "metric_ids": [],
+        "metric_labels": {},
+        "attempt_policy": {},
+        "dataset": [],
+        "provenance": {},
+        "harbor_viewer": {
+            "job_url": "https://harbor.example.test/jobs/log-analyzer",
+            "analysis_url": "https://harbor.example.test/jobs/log-analyzer?tab=analysis",
+            "jobs": [
+                {
+                    "url": "https://harbor.example.test/jobs/log-analyzer",
+                    "analysis_url": "https://harbor.example.test/jobs/log-analyzer?tab=analysis",
+                    "name": "log-analyzer-codex-with--20260624",
+                }
+            ],
+            "evidence_links": [{"url": step_url, "label": "goal_accuracy", "step": 9}],
+        },
+    }
+    r.add_success("agent_eval", "Tier 3 evaluation complete")
+    r.passed = True
+    return r
+
+
+class TestTier3HarborCanonicalPayload:
+    """Canonical Tier 3 payload should preserve Harbor report links."""
+
+    def test_build_payload_preserves_harbor_links_and_step_evidence(self) -> None:
+        step_url = (
+            "https://harbor.example.test/jobs/log-analyzer/tasks/_/codex/openai/gpt/trials/log-analyzer-001?step=9"
+        )
+        payload = build_agent_eval_payload(
+            "log-analyzer",
+            {
+                "codex": {
+                    "execution_status": "succeeded",
+                    "execution_errors": [],
+                    "expected_attempts": 1,
+                    "scored_attempts": 1,
+                    "with_skill": {"security": 1.0, "accuracy": 0.62, "goal_accuracy": 0.55},
+                    "without_skill": {"security": 1.0, "accuracy": 0.50, "goal_accuracy": 0.40},
+                    "rewards": [
+                        {
+                            "trial_id": "log-analyzer-001__abc",
+                            "entry_id": "log-analyzer-001",
+                            "overall": 0.62,
+                            "security": 1.0,
+                            "accuracy": 0.62,
+                            "goal_accuracy": 0.55,
+                            "harbor_viewer": {
+                                "job_name": "log-analyzer-codex-with--20260624",
+                                "job_url": "https://harbor.example.test/jobs/log-analyzer",
+                                "analysis_url": ("https://harbor.example.test/jobs/log-analyzer?tab=analysis"),
+                                "trial_url": (
+                                    "https://harbor.example.test/jobs/log-analyzer/tasks/_/"
+                                    "codex/openai/gpt/trials/log-analyzer-001"
+                                ),
+                                "evidence_urls": [{"label": "goal_accuracy", "url": step_url}],
+                            },
+                        }
+                    ],
+                }
+            },
+            use_llm_judge=False,
+        )
+
+        assert payload is not None
+        assert payload["harbor_viewer"]["job_url"].endswith("/jobs/log-analyzer")
+        assert payload["harbor_viewer"]["analysis_url"].endswith("?tab=analysis")
+        assert payload["harbor_viewer"]["evidence_links"][0]["label"] == "Step 9"
+        assert payload["harbor_viewer"]["evidence_links"][0]["step"] == 9
+        assert payload["trials"][0]["harbor_viewer"]["evidence_urls"][0]["step"] == 9
+        assert payload["recommendations"][0]["evidence"]["url"] == step_url
+
+    def test_failed_run_has_no_synthetic_score_or_top_performer(self) -> None:
+        payload = build_agent_eval_payload(
+            "broken-skill",
+            {
+                "codex": {
+                    "execution_status": "failed",
+                    "execution_errors": ["Scored attempt coverage is 0/1"],
+                    "expected_attempts": 1,
+                    "scored_attempts": 0,
+                    "with_skill": {},
+                    "rewards": [],
+                }
+            },
+            use_llm_judge=False,
+        )
+
+        assert payload is not None
+        assert payload["execution_status"] == "failed"
+        assert payload["overall_score"] is None
+        assert payload["best_agent"] == ""
+        assert payload["composite_lift"] is None
+        assert payload["conclusions"][0]["title"] == "Evaluation incomplete"
+        assert not any("healthy" in text.lower() for text in payload["suggestions"])
+
+    def test_advisory_skip_is_false_without_synthetic_score(self) -> None:
+        result = advisory_skip_result("No public provider key", skill_name="demo")
+
+        assert result.passed is False
+        assert result.metadata["agent_eval"]["execution_status"] == "skipped"
+        assert result.metadata["agent_eval"]["overall_score"] is None
+        cli_output = CLIReporter().render_all([result])
+        assert "SKIP" in cli_output
+        assert "Validation failed" not in cli_output
+        assert "Passed required checks" in cli_output
+
+    def test_legacy_summary_without_execution_status_is_unknown(self, tmp_path: Path) -> None:
+        from skillevaluator.tier3.harbor.report_data import load_agent_data
+
+        summary = tmp_path / "codex" / "with-skill" / "summary.json"
+        summary.parent.mkdir(parents=True)
+        summary.write_text(json.dumps({"scores": {"accuracy": 1.0}, "num_trials": 1}), encoding="utf-8")
+
+        agents = load_agent_data(tmp_path)
+
+        assert agents["codex"]["execution_status"] == "unknown"
+        assert agents["codex"]["with_skill"] == {}
+
+    def test_failed_summary_status_survives_reader(self, tmp_path: Path) -> None:
+        from skillevaluator.tier3.harbor.report_data import load_agent_data
+
+        summary = tmp_path / "codex" / "with-skill" / "summary.json"
+        summary.parent.mkdir(parents=True)
+        summary.write_text(
+            json.dumps(
+                {
+                    "scores": {},
+                    "num_trials": 0,
+                    "execution_status": "failed",
+                    "execution_errors": ["No Harbor job result"],
+                    "expected_attempts": 1,
+                    "scored_attempts": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        agents = load_agent_data(tmp_path)
+
+        assert agents["codex"]["execution_status"] == "failed"
+        assert agents["codex"]["execution_errors"] == ["No Harbor job result"]
+
+    def test_failed_run_produces_false_agent_eval_result(self, tmp_path: Path) -> None:
+        skill = tmp_path / "demo"
+        skill.mkdir()
+        results_root = tmp_path / "results" / "demo"
+        run_id = "20260709_120000"
+        run_dir = results_root / run_id
+        summary = run_dir / "codex" / "with-skill" / "summary.json"
+        summary.parent.mkdir(parents=True)
+        summary.write_text(
+            json.dumps(
+                {
+                    "scores": {},
+                    "num_trials": 0,
+                    "execution_status": "failed",
+                    "execution_errors": ["No Harbor job result"],
+                    "expected_attempts": 1,
+                    "scored_attempts": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (run_dir / "run_config.json").write_text("{}", encoding="utf-8")
+        (run_dir / "result.json").write_text(json.dumps({"run_id": run_id}), encoding="utf-8")
+        (results_root / "latest").symlink_to(run_id)
+
+        result = agent_eval_result_from_run(
+            skill,
+            results_dir=tmp_path / "results",
+            use_llm_judge=False,
+        )
+
+        assert result is not None
+        assert result.passed is False
+        assert result.errors == ["No Harbor job result"]
+        assert result.metadata["agent_eval"]["overall_score"] is None
+
+
+class TestGatingSplit:
+    """Tests for the CLI-consistent Tier 1/Tier 2 gate and advisory Tier 3."""
+
+    def test_tier2_advisory_policy_keeps_accurate_gate_counts(self) -> None:
+        tier1 = _failed_result("Security Scan")
+        tier2 = _failed_result("Similarity Check")
+        tier2.metadata["gating"] = {"tier": 2, "blocking": False}
+        output = HTMLReporter(
+            include_timestamp=False,
+            tabs=[{"id": "tier1", "label": "Tier 1"}, {"id": "tier2", "label": "Tier 2"}],
+        ).render_all([tier1, tier2])
+        assert "Blocking (Tier 1)" in output
+        assert "Advisory (Tier 2)" in output
+        assert output.count("0 critical · 1 high · 0 medium · 0 low") == 2
+
+    def test_tier3_blocking_policy_keeps_accurate_gate_counts(self) -> None:
+        tier1 = _failed_result("Security Scan")
+        tier3 = _failed_result("AGENT_EVAL")
+        tier3.metadata["gating"] = {"tier": 3, "blocking": True}
+        output = HTMLReporter(
+            include_timestamp=False,
+            tabs=[{"id": "tier1", "label": "Tier 1"}, {"id": "tier3", "label": "Tier 3"}],
+        ).render_all([tier1, tier3])
+        assert "Blocking (Tier 1 + Tier 3 agent-eval)" in output
+        assert "0 critical · 2 high · 0 medium · 0 low" in output
+        assert "Tier 3 agent-eval findings are advisory and don't block merge." not in output
+
+    @pytest.mark.parametrize(
+        "validator_name",
+        [
+            "Similarity Check",
+            "Context Deduplication",
+            "Context Optimization",
+            "Context Optimization Check",
+            "Tier 2 Deduplication",
+        ],
+    )
+    def test_failed_tier2_names_render_in_tier2_and_block(
+        self,
+        validator_name: str,
+        tmp_path: Path,
+    ) -> None:
+        output_dir = tmp_path / validator_name.lower().replace(" ", "-")
+
+        reports_passed = emit_reports(
+            [_failed_result(validator_name)],
+            report_formats=("html",),
+            output_dir=output_dir,
+            basename="report",
+        )
+
+        output = (output_dir / "report.html").read_text(encoding="utf-8")
+        report_data = _html_report_data(output)
+        assert reports_passed is False
+        assert 'data-target-tab="tier2"' in output
+        tier2_card = output.split('data-target-tab="tier2"', 1)[1].split("</nav>", 1)[0]
+        assert 'class="tier-card-verdict">Changes required</span>' in tier2_card
+        assert "<strong>1</strong> finding(s)</span>" in tier2_card
+        tier2 = output.split('id="tab-tier2"', 1)[1]
+        assert re.search(r'Reported checks</h3>\s*<p class="dashboard-card-value">1</p>', tier2)
+        assert report_data["gating"] == {
+            "blocking_tiers": ["tier1", "tier2"],
+            "advisory_tiers": ["tier3"],
+            "blocking": {"critical": 0, "high": 1, "medium": 0, "low": 0},
+            "advisory": {"critical": 0, "high": 0, "medium": 0, "low": 0},
+            "blocking_findings": 1,
+            "would_block": True,
+        }
+        assert "Advisory (Tier 2" not in output
+
+    def test_failed_tier2_without_structured_findings_still_blocks(self) -> None:
+        output = HTMLReporter(include_timestamp=False).render_all(
+            [_failed_result("Context Deduplication", severity=None)]
+        )
+
+        gating = _html_report_data(output)["gating"]
+        assert gating["would_block"] is True
+
+    def test_tier1_failure_remains_blocking(self) -> None:
+        output = HTMLReporter(include_timestamp=False).render_all([_failed_result("Security Scan")])
+
+        gating = _html_report_data(output)["gating"]
+        assert gating["blocking_tiers"] == ["tier1", "tier2"]
+        assert gating["blocking"]["high"] == 1
+        assert gating["would_block"] is True
+
+    def test_tier1_report_does_not_claim_combined_tier_policy(self) -> None:
+        output = HTMLReporter(include_timestamp=False).render_all([_failed_result("Security Scan")])
+
+        assert "Blocking (Tier 1 + Tier 2)" not in output
+        assert "Advisory (Tier 3 agent-eval)" not in output
+        assert "Tier 2 · Not run" in output
+        assert "Tier 3 · Not run" in output
+
+    def test_tier3_failure_remains_advisory(self) -> None:
+        output = HTMLReporter(include_timestamp=False).render_all([_failed_result("AGENT_EVAL")])
+
+        gating = _html_report_data(output)["gating"]
+        assert gating["advisory_tiers"] == ["tier3"]
+        assert gating["blocking"]["high"] == 0
+        assert gating["advisory"]["high"] == 1
+        assert gating["would_block"] is False
+
+    def test_combined_report_labels_tier2_blocking_and_only_tier3_advisory(self) -> None:
+        output = HTMLReporter(
+            include_timestamp=False,
+            tabs=[
+                {"id": "tier1", "label": "Tier 1"},
+                {"id": "tier2", "label": "Tier 2"},
+                {"id": "tier3", "label": "Tier 3"},
+            ],
+        ).render_all([_failed_result("Similarity Check"), _failed_result("AGENT_EVAL")])
+
+        assert "Blocking (Tier 1 + Tier 2)" in output
+        assert "Advisory (Tier 3 agent-eval)" in output
+        assert output.count("0 critical · 1 high · 0 medium · 0 low") == 2
+        assert "Tier 3 agent-eval findings are advisory and don't block merge." in output
+        assert "Advisory (Tier 2" not in output
+        assert "Advisory findings (dedup + agent-eval)" not in output
+
+    def test_tier1_quality_score_warning_and_advisory_rows_render(self) -> None:
+        quality = ValidationResult(validator_name="Quality Score", validator_description="Skill quality")
+        quality.metadata["quality_scores"] = {
+            "skill_name": "demo-skill",
+            "overall_score": 72.5,
+            "grade": "C",
+            "skill_type": "script-based",
+            "dimensions": {
+                "clarity": {"score": 75.0, "weight": 0.5},
+                "safety": {"score": 70.0, "weight": 0.5},
+            },
+            "metrics": {"total_tokens": 123, "recommended_max_tokens": 500, "script_count": 1},
+        }
+        warnings = ValidationResult(validator_name="Schema", validator_description="Schema checks")
+        warnings.add_warning("Metadata author is recommended.")
+        advisory = ValidationResult(validator_name="Code Integrity & Hygiene", validator_description="Advisory checks")
+        advisory.add_finding(
+            Finding(
+                category="HYGIENE",
+                severity=Severity.LOW,
+                check_name="tests_missing",
+                message="Target tests were not executed and coverage was not measured.",
+                file_path="demo-skill/SKILL.md",
+                suggestion="Add a representative test case.",
+            )
+        )
+
+        output = HTMLReporter(include_timestamp=False).render_all([quality, warnings, advisory])
+        report_data = _html_report_data(output)
+
+        assert report_data["quality_scores"]["demo-skill"]["overall_score"] == 72.5
+        assert 'data-quality-skill-name="demo-skill"' in output
+        assert "Quality score: 72.5 / 100" in output
+        assert "Type: script-based" in output
+        assert ">clarity</td>" in output
+        assert '<td class="warning-text">1</td>' in output
+        assert "Metadata author is recommended." in output
+        assert "1 advisory finding(s)" in output
+        assert "not blocking:" in output
+        assert "Target tests were not executed and coverage was not measured." in output
+
+    def test_similarity_only_html_uses_tier2_tab_and_renders_the_match(self, tmp_path: Path) -> None:
+        result = _similarity_result(severity=Severity.HIGH)
+
+        emit_reports(
+            [result],
+            report_formats=("html",),
+            output_dir=tmp_path,
+            basename="similarity-only",
+        )
+
+        output = (tmp_path / "similarity-only.html").read_text(encoding="utf-8")
+        assert 'id="tab-tier1"' not in output
+        tier2 = _html_tab(output, "tier2")
+        assert "same-name similarity match" in tier2
+        assert "Intra-skill check was not run" not in tier2
+
+    @pytest.mark.parametrize("tier", [2, 3])
+    @pytest.mark.parametrize("comprehensive", [False, True])
+    def test_emit_reports_uses_recorded_tier_for_custom_validator_names(
+        self, tmp_path: Path, tier: int, comprehensive: bool
+    ) -> None:
+        result = _similarity_result(severity=Severity.HIGH) if tier == 2 else _failed_result("Custom live evaluation")
+        result.validator_name = "Custom recorded check"
+        result.metadata["gating"] = {"tier": tier, "blocking": tier == 2}
+        before = JSONReporter(include_timestamp=False).render_all([result])
+        scope = {"requested_tiers": (tier,), "displayed_tiers": (1, 2, 3)} if comprehensive else {}
+
+        assert (
+            emit_reports([result], report_formats=("html",), output_dir=tmp_path, basename="recorded", **scope) is False
+        )
+
+        output = (tmp_path / "recorded.html").read_text(encoding="utf-8")
+        panel = _html_tab(output, f"tier{tier}")
+        assert "No check evidence was recorded for this tier." not in panel
+        if tier == 2:
+            assert "same-name similarity match" in panel
+        else:
+            assert 'class="tab-content active"' in panel
+        if not comprehensive:
+            assert 'id="tab-tier1"' not in output
+        assert JSONReporter(include_timestamp=False).render_all([result]) == before
+
+    def test_default_html_reporter_classifies_similarity_as_tier2(self) -> None:
+        output = HTMLReporter(include_timestamp=False).render_all([_similarity_result(severity=Severity.HIGH)])
+
+        assert 'id="tab-tier1"' not in output
+        assert "same-name similarity match" in _html_tab(output, "tier2")
+
+    def test_combined_html_keeps_similarity_out_of_tier1(
+        self,
+        success_result: ValidationResult,
+        tmp_path: Path,
+    ) -> None:
+        similarity = _similarity_result(severity=Severity.HIGH)
+
+        emit_reports(
+            [success_result, similarity],
+            report_formats=("html",),
+            output_dir=tmp_path,
+            basename="combined",
+        )
+
+        output = (tmp_path / "combined.html").read_text(encoding="utf-8")
+        assert "same-name similarity match" not in _html_tab(output, "tier1")
+        assert "same-name similarity match" in _html_tab(output, "tier2")
+
+    def test_similarity_html_renders_both_related_paths(self) -> None:
+        result = _similarity_result(severity=Severity.HIGH)
+
+        output = HTMLReporter(
+            include_timestamp=False,
+            tabs=[{"id": "tier2", "label": "Tier 2"}],
+        ).render_all([result])
+        tier2 = _html_tab(output, "tier2")
+
+        assert "team-a/shared-skill" in tier2
+        assert "team-b/shared-skill" in tier2
+
+
+@pytest.mark.parametrize(
+    ("baseline_scores", "expected_baseline", "expected_lift", "markdown_cells"),
+    [
+        ({}, None, None, "0.95 | NO SCORE | NO SCORE"),
+        ({"accuracy": 0.0}, 0.0, 0.95, "0.95 | 0.00 | +0.95"),
+        ({"accuracy": 0.95}, 0.95, 0.0, "0.95 | 0.95 | +0.00"),
+    ],
+)
+def test_emit_reports_preserves_unavailable_evaluator_lift(
+    tmp_path, capsys, baseline_scores, expected_baseline, expected_lift, markdown_cells
+) -> None:
+    agents = {
+        "codex": {
+            "execution_status": "succeeded",
+            "execution_errors": [],
+            "expected_attempts": 1,
+            "scored_attempts": 1,
+            "with_skill": {"accuracy": 0.95},
+            "without_skill": baseline_scores,
+            "rewards": [{"entry_id": "case-1", "accuracy": 0.95}],
+        }
+    }
+    original_agents = copy.deepcopy(agents)
+    payload = build_agent_eval_payload("demo-skill", agents, use_llm_judge=False)
+    assert payload is not None
+    expected_evaluator = {
+        "with_skill": 0.95,
+        "baseline": expected_baseline,
+        "lift": expected_lift,
+        "with_skill_status": "scored",
+        "baseline_status": "missing" if expected_baseline is None else "scored",
+    }
+    assert payload["evaluators"]["accuracy"] == expected_evaluator
+    assert payload["agents"]["codex"]["evaluators"]["accuracy"] == expected_evaluator
+    assert payload["evaluator_cards"][0]["lift"] == expected_lift
+    original_payload = copy.deepcopy(payload)
+    result = ValidationResult(validator_name="AGENT_EVAL")
+    result.metadata["agent_eval"] = payload
+    # Findings make emit_reports include the detailed CLI evaluator table.
+    result.add_finding(
+        Finding(
+            category="AGENT_EVAL",
+            severity=Severity.LOW,
+            check_name="diagnostic",
+            message="Review evaluation diagnostics.",
+            file_path="SKILL.md",
+        )
+    )
+
+    emit_reports([result], report_formats=("cli", "json", "html"), output_dir=tmp_path, basename="skip-baseline")
+
+    assert "Accuracy" in capsys.readouterr().out
+    json_report = json.loads((tmp_path / "skip-baseline.json").read_text())
+    saved_payload = json_report["tier3"]
+    assert json_report["results"][0]["tier3"]["evaluators"]["accuracy"] == expected_evaluator
+    assert saved_payload["evaluators"]["accuracy"] == expected_evaluator
+    assert saved_payload["agents"]["codex"]["evaluators"]["accuracy"] == expected_evaluator
+    html_report = (tmp_path / "skip-baseline.html").read_text()
+    assert "<!DOCTYPE html>" in html_report
+    assert "demo-skill" in html_report
+    replayed = ValidationResult(validator_name="AGENT_EVAL", metadata={"agent_eval": saved_payload})
+    assert f"| Accuracy | {markdown_cells} |" in MarkdownReporter(include_timestamp=False).render_all([replayed])
+    assert agents == original_agents
+    assert payload == original_payload
+
+
+class TestHTMLReporter:
+    """Tests for HTMLReporter."""
+
+    def test_render_success(self, success_result: ValidationResult) -> None:
+        """Test HTML output for successful validation."""
+        reporter = HTMLReporter(include_timestamp=False)
+        output = reporter.render(success_result)
+
+        assert "<!DOCTYPE html>" in output
+        assert "SCHEMA" in output
+        assert "Pass" in output  # Status badge uses "Pass" not "PASS"
+        assert "manifest_found" in output
+
+    def test_render_failure(self, failure_result: ValidationResult) -> None:
+        """Test HTML output for failed validation."""
+        reporter = HTMLReporter(include_timestamp=False)
+        output = reporter.render(failure_result)
+
+        assert "<!DOCTYPE html>" in output
+        assert "SECRETS" in output
+        assert "fail" in output.lower()
+        assert "AWS Access Key ID detected" in output
+        assert "severity-critical" in output
+
+    def test_render_all(self, mixed_results: list[ValidationResult]) -> None:
+        """Test HTML output for multiple results."""
+        reporter = HTMLReporter(include_timestamp=False)
+        output = reporter.render_all(mixed_results)
+
+        assert "Validation Report" in output or "SkillEvaluator" in output
+        assert "SCHEMA" in output
+        assert "SECRETS" in output
+
+    def test_render_tier3_harbor_links_and_evidence(self) -> None:
+        """Tier 3 HTML should link Harbor logs, analysis, and exact trajectory steps."""
+        output = HTMLReporter(include_timestamp=False).render_all([_tier3_harbor_result()])
+
+        assert "Harbor artifacts" in output
+        assert "Harbor logs" in output
+        assert "Harbor analysis" in output
+        assert "View Step 9" in output
+        assert "log-analyzer-001?step=9" in output
+        assert not re.search(r'href=[\'"]javascript:', output)
+
+    def test_failed_tier3_html_renders_na_without_top_performer(self) -> None:
+        payload = build_agent_eval_payload(
+            "broken-skill",
+            {
+                "codex": {
+                    "execution_status": "failed",
+                    "execution_errors": ["No Harbor job result"],
+                    "expected_attempts": 1,
+                    "scored_attempts": 0,
+                    "with_skill": {},
+                    "rewards": [],
+                }
+            },
+            use_llm_judge=False,
+        )
+        result = ValidationResult(validator_name="AGENT_EVAL", validator_description="Live evaluation")
+        result.metadata["agent_eval"] = payload
+        result.add_error("No Harbor job result")
+
+        output = HTMLReporter(include_timestamp=False).render_all([result])
+
+        assert "Quality measurements unavailable" in output
+        assert "Default agent is the top performer" not in output
+        assert 'data-primary-metric="score"' not in output
+        assert ">N/A<" in output
+        assert "performing well across evaluated dimensions" not in output
+
+        markdown = MarkdownReporter(include_timestamp=False).render_all([result])
+        assert "Skill Lift = N/A" in markdown
+        assert "Skill Lift = +0.00" not in markdown
+
+    def test_standalone_tier3_report_uses_skillevaluator_branding(self, tmp_path: Path) -> None:
+        """Standalone Tier 3 HTML should use the canonical SkillEvaluator branding."""
+        skill = tmp_path / "log-analyzer"
+        skill.mkdir()
+        results_dir = tmp_path / "20260624_134842"
+        trial_dir = results_dir / "codex" / "with-skill" / "trials" / "log-analyzer-001__sample"
+        trial_dir.mkdir(parents=True)
+        (results_dir / "codex" / "with-skill" / "summary.json").write_text(
+            json.dumps(
+                {
+                    "scores": {
+                        "security": 1.0,
+                        "skill_execution": 0.95,
+                        "skill_efficiency": 0.84,
+                        "accuracy": 0.92,
+                        "goal_accuracy": 0.88,
+                        "behavior_check": 0.90,
+                    },
+                    "metrics": [
+                        "security",
+                        "skill_execution",
+                        "skill_efficiency",
+                        "accuracy",
+                        "goal_accuracy",
+                        "behavior_check",
+                    ],
+                    "num_trials": 1,
+                    "execution_status": "succeeded",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (trial_dir / "reward.json").write_text(
+            json.dumps(
+                {
+                    "entry_id": "log-analyzer-001",
+                    "security": 1.0,
+                    "skill_execution": 0.95,
+                    "skill_efficiency": 0.84,
+                    "accuracy": 0.92,
+                    "goal_accuracy": 0.88,
+                    "behavior_check": 0.90,
+                    "harbor_viewer": {
+                        "analysis_url": "https://harbor.example.test/jobs/log-analyzer?tab=analysis",
+                        "evidence_urls": [
+                            {
+                                "label": "skill_efficiency",
+                                "url": "https://harbor.example.test/jobs/log-analyzer/trials/log-analyzer-001?step=9",
+                            }
+                        ],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        report_path = render_agent_eval_html_report(
+            skill,
+            results_dir,
+            use_llm_judge=False,
+        )
+        output = report_path.read_text(encoding="utf-8")
+
+        assert "SkillEvaluator" in output
+        assert "Generated by <strong>SkillEvaluator</strong>" in output
+        assert "?tab=analysis" in output
+        assert "?step=9" in output
+
+    def test_standalone_failed_tier3_report_shows_failure_without_score(self, tmp_path: Path) -> None:
+        skill = tmp_path / "broken-skill"
+        skill.mkdir()
+        summary = tmp_path / "codex" / "with-skill" / "summary.json"
+        summary.parent.mkdir(parents=True)
+        summary.write_text(
+            json.dumps(
+                {
+                    "scores": {},
+                    "num_trials": 0,
+                    "execution_status": "failed",
+                    "execution_errors": ["Missing reward for case-001"],
+                    "expected_attempts": 1,
+                    "scored_attempts": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        output = render_agent_eval_html_report(
+            skill,
+            tmp_path,
+            use_llm_judge=False,
+        ).read_text(encoding="utf-8")
+
+        assert ">N/A<" in output
+        assert "Quality measurements unavailable" in output
+        assert "Missing reward for case-001" in output
+        assert "-1.00" not in output
+
+    def test_custom_title(self, success_result: ValidationResult) -> None:
+        """Test custom report title."""
+        reporter = HTMLReporter(title="Custom Report Title")
+        output = reporter.render(success_result)
+
+        assert "Custom Report Title" in output
+
+    def test_self_contained(self, success_result: ValidationResult) -> None:
+        """Test that HTML is self-contained with embedded CSS."""
+        reporter = HTMLReporter()
+        output = reporter.render(success_result)
+
+        assert "<style>" in output
+        assert "</style>" in output
+
+    def test_name_property(self) -> None:
+        """Test reporter name."""
+        reporter = HTMLReporter()
+        assert reporter.name == "html"
+
+
+class TestMarkdownReporter:
+    """Tests for MarkdownReporter."""
+
+    def test_render_success(self, success_result: ValidationResult) -> None:
+        """Test Markdown output for successful validation."""
+        reporter = MarkdownReporter(include_timestamp=False)
+        output = reporter.render(success_result)
+
+        assert "SCHEMA" in output
+        assert "✅" in output or "✓" in output
+        assert "manifest_found" in output
+
+    def test_render_failure(self, failure_result: ValidationResult) -> None:
+        """Test Markdown output for failed validation."""
+        reporter = MarkdownReporter(include_timestamp=False)
+        output = reporter.render(failure_result)
+
+        assert "SECRETS" in output
+        assert "❌" in output
+        assert "AWS Access Key ID detected" in output
+
+    def test_render_all(self, mixed_results: list[ValidationResult]) -> None:
+        """Test Markdown output for multiple results."""
+        reporter = MarkdownReporter(include_timestamp=False)
+        output = reporter.render_all(mixed_results)
+
+        assert "# " in output  # Header
+        assert "SCHEMA" in output
+        assert "SECRETS" in output
+        assert "|" in output  # Table
+
+    @pytest.mark.parametrize("severity", [Severity.MEDIUM, Severity.LOW])
+    def test_render_all_shows_passing_findings_without_changing_pass_state(self, severity: Severity) -> None:
+        result = _similarity_result(severity=severity)
+
+        output = MarkdownReporter(include_timestamp=False).render_all([result])
+
+        assert result.passed is True
+        assert "**Status:** ✅ PASSED" in output
+        assert "same-name similarity match" in output
+
+    def test_render_finding_shows_both_related_paths(self) -> None:
+        result = _similarity_result()
+
+        output = MarkdownReporter(include_timestamp=False).render(result)
+
+        assert "team-a/shared-skill" in output
+        assert "team-b/shared-skill" in output
+
+    def test_render_tier3_harbor_links_and_evidence(self) -> None:
+        """Tier 3 Markdown should include compact Harbor and evidence links."""
+        output = MarkdownReporter(include_timestamp=False).render_all([_tier3_harbor_result()])
+
+        assert re.search(
+            r"^- \*\*[^*]+:\*\* \[Harbor logs\]\(https://[^)]+\) · \[Harbor analysis\]\(", output, re.MULTILINE
+        )
+        assert "https://harbor.example.test/jobs/log-analyzer" in output
+        assert "Evidence: [View Step 9](" in output
+        assert "log-analyzer-001?step=9" in output
+        assert "javascript:alert" not in output
+
+    def test_render_canonical_tier3_without_baseline(self) -> None:
+        """A normal skill-only run uses N/A rather than crashing on absent baseline scores."""
+        payload = build_agent_eval_payload(
+            "demo-skill",
+            {
+                "codex": {
+                    "execution_status": "succeeded",
+                    "execution_errors": [],
+                    "expected_attempts": 1,
+                    "scored_attempts": 1,
+                    "with_skill": {"security": 1.0, "accuracy": 0.9},
+                    "without_skill": {},
+                    "rewards": [
+                        {
+                            "trial_id": "case-001__attempt-1",
+                            "entry_id": "case-001",
+                            "overall": 0.9,
+                            "security": 1.0,
+                            "accuracy": 0.9,
+                        }
+                    ],
+                }
+            },
+            use_llm_judge=False,
+        )
+        assert payload is not None
+        result = ValidationResult(validator_name="AGENT_EVAL")
+        result.metadata["agent_eval"] = payload
+        result.add_success("agent_eval", "Tier 3 evaluation complete")
+
+        output = MarkdownReporter(include_timestamp=False).render_all([result])
+
+        assert "### Evaluator Scores" in output
+        assert "| Accuracy | 0.90 | NO SCORE | NO SCORE |" in output
+
+    def test_markdown_names_skill_lift_and_pass_rate_difference(self) -> None:
+        result = _tier3_harbor_result()
+        agent_eval = result.metadata["agent_eval"]
+        agent_eval["composite_lift"] = 0.2
+        agent_eval["overall_lift"] = 0.2
+        agent_eval["attempt_policy"] = {"max_attempts": 2, "pass_threshold": 0.6}
+        agent_eval["pass_at_k"] = {
+            "with_skill": {"k": 2, "pass_threshold": 0.6, "rate": 0.75},
+            "without_skill": {"k": 2, "pass_threshold": 0.6, "rate": 0.5},
+            "lift": {"delta": 0.25},
+        }
+
+        output = MarkdownReporter(include_timestamp=False).render_all([result])
+
+        assert "Skill Lift = +0.20" in output
+        assert SKILL_LIFT_DEFINITION in output
+        assert "Pass@2 (supporting reliability" in output
+        assert "Pass-rate difference +25.0 percentage points" in output
+
+    def test_render_tier3_normalized_evidence_uses_distinct_evidence_ids(self) -> None:
+        result = _tier3_harbor_result()
+        result.metadata["agent_eval"]["suggestions_v2"][0]["evidence_refs"] = [
+            {
+                "source": "trajectory.json",
+                "json_pointer": "/steps/0/tool_calls/0",
+                "evidence_id": f"/steps/0/tool_calls/0/normalized/{index}",
+                "kind": "tool_call",
+            }
+            for index in range(2)
+        ]
+
+        output = MarkdownReporter(include_timestamp=False).render_all([result])
+
+        assert "`/steps/0/tool_calls/0/normalized/0`" in output
+        assert "`/steps/0/tool_calls/0/normalized/1`" in output
+
+    def test_details_section(self, failure_result: ValidationResult) -> None:
+        """Test expandable details section."""
+        reporter = MarkdownReporter(include_details=True)
+        output = reporter.render(failure_result)
+
+        assert "<details>" in output
+        assert "</details>" in output
+
+    def test_max_findings_limit(self, failure_result: ValidationResult) -> None:
+        """Test max findings limit."""
+        reporter = MarkdownReporter(max_findings_shown=1)
+        output = reporter.render(failure_result)
+
+        # Should show truncation message
+        assert "more" in output.lower()
+
+    def test_name_property(self) -> None:
+        """Test reporter name."""
+        reporter = MarkdownReporter()
+        assert reporter.name == "markdown"
+
+
+class TestReporterSaveMethod:
+    """Tests for the save method across all reporters."""
+
+    def test_json_save(self, success_result: ValidationResult) -> None:
+        """Test saving JSON report to file."""
+        reporter = JSONReporter(include_timestamp=False)
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            output_path = Path(f.name)
+
+        try:
+            reporter.save([success_result], output_path)
+            content = output_path.read_text(encoding="utf-8")
+            data = json.loads(content)
+            assert data["overall_passed"] is True
+        finally:
+            output_path.unlink()
+
+    def test_html_save(self, success_result: ValidationResult) -> None:
+        """Test saving HTML report to file."""
+        reporter = HTMLReporter()
+
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as f:
+            output_path = Path(f.name)
+
+        try:
+            reporter.save([success_result], output_path)
+            content = output_path.read_text(encoding="utf-8")
+            assert "<!DOCTYPE html>" in content
+        finally:
+            output_path.unlink()
+
+    def test_markdown_save(self, success_result: ValidationResult) -> None:
+        """Test saving Markdown report to file."""
+        reporter = MarkdownReporter()
+
+        with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as f:
+            output_path = Path(f.name)
+
+        try:
+            reporter.save([success_result], output_path)
+            content = output_path.read_text(encoding="utf-8")
+            assert "#" in content
+        finally:
+            output_path.unlink()
+
+
+class TestFindingBackwardCompatibility:
+    """Tests for backward compatibility with string severity."""
+
+    def test_finding_with_string_severity(self) -> None:
+        """Test that Finding accepts string severity."""
+        finding = Finding(
+            category="LICENSE",
+            severity="HIGH",  # String instead of Severity enum
+            check_name="blocked_license",
+            message="License blocked",
+            file_path="LICENSE",
+        )
+
+        # Should convert to Severity enum
+        assert finding.severity == Severity.HIGH
+
+    def test_finding_with_enum_severity(self) -> None:
+        """Test that Finding accepts Severity enum."""
+        finding = Finding(
+            category="LICENSE",
+            severity=Severity.HIGH,
+            check_name="blocked_license",
+            message="License blocked",
+            file_path="LICENSE",
+        )
+
+        assert finding.severity == Severity.HIGH
+
+    def test_legacy_add_finding(self) -> None:
+        """Test legacy add_finding(tag, severity, message) signature."""
+        result = ValidationResult(validator_name="TEST")
+        result.add_finding("SECRET", Severity.HIGH, "Test secret found")
+
+        assert not result.passed
+        assert len(result.errors) == 1
+        assert "[SECRET-HIGH]" in result.errors[0]
+
+
+class TestValidationResultMethods:
+    """Tests for ValidationResult methods."""
+
+    def test_add_success(self) -> None:
+        """Test add_success method."""
+        result = ValidationResult(validator_name="TEST")
+        result.add_success("check1", "Check passed", extra="data")
+
+        assert result.passed
+        assert len(result.success_details) == 1
+        assert result.success_details[0].check_name == "check1"
+        assert result.success_details[0].metadata["extra"] == "data"
+        assert result.summary.checks_performed == 1
+
+    def test_add_structured_finding(self) -> None:
+        """Test add_structured_finding method."""
+        result = ValidationResult(validator_name="TEST")
+        finding = Finding(
+            category="TEST",
+            severity=Severity.HIGH,
+            check_name="test_check",
+            message="Test message",
+            file_path="test.py",
+        )
+        result.add_structured_finding(finding, is_error=True)
+
+        assert not result.passed
+        assert len(result.findings) == 1
+        assert len(result.errors) == 1
+
+    def test_merge_results(self) -> None:
+        """Test merging two ValidationResults."""
+        result1 = ValidationResult(validator_name="TEST1")
+        result1.add_error("Error 1")
+
+        result2 = ValidationResult(validator_name="TEST2")
+        result2.add_warning("Warning 1")
+
+        result1.merge(result2)
+
+        assert not result1.passed
+        assert len(result1.errors) == 1
+        assert len(result1.warnings) == 1
+
+
+class TestSkillSpectorVersionReporting:
+    def test_html_tier1_card_records_skillspector_version(self) -> None:
+        first = ValidationResult(validator_name="Security Scan")
+        first.metadata["skillspector_version"] = "2.12.0"
+        second = ValidationResult(validator_name="Security Scan")
+        second.metadata["skillspector_version"] = " 2.12.0 "
+
+        # The version must not depend on the timestamped header line.
+        html = HTMLReporter(include_timestamp=False, target_path="skills/example").render_all([first, second])
+        run_details = html.split('id="run-metadata"', 1)[1].split("</details>", 1)[0]
+
+        assert "SkillSpector <strong>v2.12.0</strong>" in run_details
+        assert _html_report_data(html)["skillspector_versions"] == ["2.12.0"]
+
+    @pytest.mark.parametrize("raw_version", [None, "", "unknown", "v2.12.0", "2.12.0<script>", 212])
+    def test_html_omits_missing_or_malformed_skillspector_version(self, raw_version: object) -> None:
+        result = ValidationResult(validator_name="Security Scan")
+        if raw_version is not None:
+            result.metadata["skillspector_version"] = raw_version
+
+        html = HTMLReporter(include_timestamp=False).render_all([result])
+
+        assert "SkillSpector <strong>v" not in html
+        assert _html_report_data(html)["skillspector_versions"] == []
+
+
+class TestSkillSpectorProvenanceReporting:
+    @staticmethod
+    def _security_result(provenance: dict | None, provider_id: str | None = "nv_build") -> ValidationResult:
+        result = ValidationResult(validator_name="Security Scan", validator_description="Detect security issues")
+        if provenance is not None:
+            result.metadata["skillspector_llm_provenance"] = provenance
+        if provider_id is not None:
+            result.metadata["skillspector_provider_id"] = provider_id
+        return result
+
+    def test_json_report_exports_canonical_provenance(self) -> None:
+        provenance = json.loads(_SKILLSPECTOR_2_12_LLM_PROVENANCE.read_text(encoding="utf-8"))
+        result = self._security_result({**provenance, "prompt": "do-not-export"})
+
+        data = json.loads(JSONReporter(include_timestamp=False).render_all([result]))
+
+        exported = data["results"][0]
+        assert exported["skillspector_llm_provenance"] == provenance
+        assert exported["skillspector_provider_id"] == "nv_build"
+        assert "do-not-export" not in json.dumps(data)
+
+    def test_html_tier1_tab_lists_provenance(self) -> None:
+        provenance = json.loads(_SKILLSPECTOR_2_12_LLM_PROVENANCE.read_text(encoding="utf-8"))
+        result = self._security_result(provenance)
+
+        html = HTMLReporter(include_timestamp=False, target_path="skills/example").render_all([result])
+        tier1 = _html_tab(html, "tier1")
+
+        assert "Tier 1 LLM Provenance" in tier1
+        assert tier1.count("<td><code>gpt-6.1-sol</code></td>") == 5
+        assert "semantic_security_discovery" in tier1
+        assert "<td>nv_build</td>" in tier1
+        assert "<code>c0ffee000000</code>" in tier1
+        assert "nondeterministic / best_effort_controls_forwarded" in tier1
+        assert _html_report_data(html)["skillspector_provenance"] == [
+            {"provider_id": "nv_build", "provenance": provenance}
+        ]
+
+    def test_reports_drop_unsafe_provenance_but_keep_provider(self) -> None:
+        credential = "AI" + "za" + "A" * 35
+        provenance = json.loads(_SKILLSPECTOR_2_12_LLM_PROVENANCE.read_text(encoding="utf-8"))
+        provenance["analyzers"][0]["model"] = credential
+        result = self._security_result(provenance)
+
+        html = HTMLReporter(include_timestamp=False).render_all([result])
+        data = json.loads(JSONReporter(include_timestamp=False).render_all([result]))
+
+        assert credential not in html
+        assert credential not in json.dumps(data)
+        assert "skillspector_llm_provenance" not in data["results"][0]
+        assert "No valid LLM provenance was recorded for this scan." in _html_tab(html, "tier1")
+        assert _html_report_data(html)["skillspector_provenance"] == [{"provider_id": "nv_build", "provenance": None}]
+
+    def test_reports_without_provenance_add_nothing(self) -> None:
+        result = self._security_result(None, provider_id=None)
+
+        html = HTMLReporter(include_timestamp=False).render_all([result])
+        data = json.loads(JSONReporter(include_timestamp=False).render_all([result]))
+
+        assert "Tier 1 LLM Provenance" not in html
+        assert _html_report_data(html)["skillspector_provenance"] == []
+        assert "skillspector_llm_provenance" not in data["results"][0]
+        assert "skillspector_provider_id" not in data["results"][0]
+
+
+class TestHTMLReporterHeroHelpers:
+    """Hero-card helpers introduced for the combined Tier 1+2+3 report.
+
+    These helpers exist so the hero card on the report's first page can:
+
+    - Show ``skills/<name>`` in the title instead of leaking the full
+      filesystem / repo path (the full path stays clickable in the header).
+    - Render one tile per *tier that actually ran*, with each tile's stats
+      sourced from only that tier's results (no leakage from global counts).
+
+    Each test below pins one of those guarantees in isolation so future
+    template / pipeline tweaks can't silently regress hero behavior.
+    """
+
+
+class TestTopIssuesDeepLink:
+    """Top-Issues rows must deep-link to the actual finding card.
+
+    Originally the executive-summary pills called ``scrollToSkill`` which
+    only opened the skill card and landed the user on the quality-score
+    panel (the first thing rendered inside the card). The fix:
+
+    1. Each finding gets a stable ``issue_key`` shared with the matching
+       top-issue row so JS can find the right card to scroll to.
+    2. Skill pills inside the executive summary scroll to that finding.
+    3. A separate ``Q`` chip is rendered next to each pill for users who
+       actually want to inspect the quality score.
+
+    The tests below pin those three guarantees so a future template
+    refactor can't silently regress the wiring.
+    """
+
+    @staticmethod
+    def _failing_finding_result(skill_name: str = "skill-x") -> ValidationResult:
+        result = ValidationResult(validator_name="SECRETS")
+        result.add_finding(
+            Finding(
+                category="SECRET",
+                severity=Severity.HIGH,
+                check_name="generic-api-key",
+                message="Generic API key pattern detected",
+                file_path=f"{skill_name}/src/api.py",
+                line_number=8,
+                line_content=_api_key_line(),
+                suggestion="Move API key to secrets vault.",
+            )
+        )
+        return result
+
+
+@pytest.mark.parametrize("reporter", [CLIReporter, MarkdownReporter, HTMLReporter])
+def test_all_harbor_jobs_are_navigable_without_attribution_guessing(reporter):
+    from copy import deepcopy
+
+    result = _tier3_harbor_result()
+    viewer = result.metadata["agent_eval"]["harbor_viewer"]
+    viewer["jobs"] += [
+        {
+            "url": "https://harbor.example.test/jobs/second",
+            "analysis_url": "https://harbor.example.test/analysis/second",
+            "name": "<job>[bad](x)",
+        },
+        {"url": "https://harbor.example.test/jobs/third"},
+        {"url": "https://harbor.example.test/jobs/second", "name": "duplicate"},
+        {"url": "javascript:alert(99)", "name": "unsafe"},
+    ]
+    original = deepcopy(result)
+    output = reporter().render_all([result])
+    assert "https://harbor.example.test/jobs/second" in output
+    assert "https://harbor.example.test/analysis/second" in output
+    assert "https://harbor.example.test/jobs/third" in output
+    assert "Job 3" in output
+    assert "Results" in output
+    if reporter is HTMLReporter:
+        assert not re.search(r'href=[\'"]javascript:', output)
+    else:
+        assert "javascript:alert(99)" not in output
+    if reporter is HTMLReporter:
+        assert "&lt;job&gt;[bad](x)" in output
+        assert "<job>" not in output
+        panel = output.split('class="t3-harbor-panel"', 1)[1].split("</div>\n            </div>", 1)[0]
+        assert panel.count('href="https://harbor.example.test/jobs/second"') == 1
+    elif reporter is MarkdownReporter:
+        assert "&lt;job&gt;&#91;bad&#93;(x)" in output
+    else:
+        assert "<job>[bad](x)" in output
+    assert result == original
+
+
+def test_html_discloses_only_recorded_validated_provenance_without_changing_payload():
+    from copy import deepcopy
+
+    result = _tier3_harbor_result()
+    ae = result.metadata["agent_eval"]
+    ae["evaluator_version"] = "recorded-evaluator-v1"
+    ae["dataset_digest"] = "sha256:" + "a" * 64
+    ae["dataset_digest_algorithm"] = "skill-evaluator-dataset-snapshot/1"
+    ae["agents"] = {"agent": {"model": "recorded-model-v1"}}
+    result.metadata["evaluated_source"] = {"repository": "org/skill", "commit": "b" * 40}
+    original = deepcopy(result)
+    output = HTMLReporter(include_timestamp=False).render_all([result])
+    diagnostics = output.split('id="tier3-page-provenance"', 1)[1].split("</section>", 1)[0]
+    assert "Recorded evaluation provenance" in diagnostics
+    assert "recorded-evaluator-v1" in diagnostics
+    assert "recorded-model-v1" in diagnostics
+    assert "sha256:" + "a" * 64 in diagnostics
+    assert "org/skill" in diagnostics and "b" * 40 in diagnostics
+    assert result == original
+
+
+@pytest.mark.parametrize("reporter", [CLIReporter, MarkdownReporter, HTMLReporter])
+@pytest.mark.parametrize("summary_only", [False, True])
+def test_legacy_analysis_only_harbor_evidence_is_available(reporter, summary_only):
+    result = _tier3_harbor_result()
+    ae = result.metadata["agent_eval"]
+    ae.pop("harbor_viewer", None)
+    viewer = {"analysis_url": "https://harbor.example.test/analysis-only"}
+    if summary_only:
+        ae["summary"]["harbor_viewer"] = viewer
+    else:
+        ae["harbor_viewer"] = viewer
+    output = reporter().render_all([result])
+    assert "https://harbor.example.test/analysis-only" in output
+    assert "Run analysis" in output
+
+
+@pytest.mark.parametrize("colored", [False, True])
+def test_cli_harbor_job_labels_remain_neutral_and_literal(colored):
+    from io import StringIO
+
+    from rich.console import Console
+
+    stream = StringIO()
+    console = Console(
+        file=stream, force_terminal=colored, color_system="standard" if colored else None, record=True, width=160
+    )
+    payload = {
+        "harbor_viewer": {
+            "jobs": [
+                {
+                    "name": "Job 3 [bad]",
+                    "url": "https://example.test/jobs/3",
+                    "analysis_url": "https://example.test/analysis/3",
+                }
+            ]
+        }
+    }
+    CLIReporter._print_harbor_artifacts(payload, console)
+    output = stream.getvalue()
+    assert "Job 3 [bad]" in output
+    assert "Harbor logs: Results https://example.test/jobs/3" in output
+    assert "Harbor analysis: https://example.test/analysis/3" in output
+    assert "Job 3 [bad]" in console.export_text()
+    if colored:
+        assert "\x1b[1mJob 3 [bad]\x1b[0m" in output
+
+
+@pytest.mark.skipif(os.name == "nt", reason="only POSIX file names carry undecodable bytes as surrogate escapes")
+@pytest.mark.parametrize("report_format", ["json", "markdown", "html", "sarif", "junit"])
+def test_reports_are_written_for_a_file_name_that_is_not_utf8(tmp_path: Path, report_format: str) -> None:
+    # On Linux, os.listdir returns the name b"caf\xe9.md" as "caf\udce9.md".
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: skill\ndescription: Demo.\n---\n", encoding="utf-8")
+    name = "caf\udce9.md"
+    result = ValidationResult(validator_name="SCHEMA", validator_description="schema")
+    result.add_finding(
+        Finding(
+            category="SCHEMA",
+            severity=Severity.LOW,
+            check_name="unexpected_file",
+            message=f"Unexpected '{name}' in skill root",
+            file_path=str(skill / name),
+        )
+    )
+    output_dir = tmp_path / "reports"
+
+    emit_reports(
+        [result],
+        report_formats=(report_format,),
+        output_dir=output_dir,
+        target_path=str(skill),
+        announce_paths=False,
+        scan_root=skill,
+        repository_root=tmp_path,
+    )
+
+    (report,) = [path for path in output_dir.iterdir() if path.name != "BENCHMARK.md"]
+    text = report.read_text(encoding="utf-8")
+    assert "Unexpected" in text
+    if report_format == "sarif":
+        assert "skill/caf%E9.md" in text
+    if report_format == "junit":
+        assert 'file="skill/caf%E9.md"' in text
+        assert "Unexpected 'caf\\xe9.md' in skill root" in text

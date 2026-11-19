@@ -1,0 +1,192 @@
+---
+title: "Tier 2: Deduplication"
+sidebar-title: "Tier 2: Deduplication"
+description: "Check one skill for repeated instructions, compare a collection, or screen a candidate against a saved catalog."
+---
+
+Find instructions you can consolidate, or skills that may overlap. Choose a
+scope, run the check, and open the findings. No Docker or evaluation dataset needed.
+
+<Steps toc={true}>
+
+### Connect your provider
+
+[Install SkillEvaluator](/skills/skillevaluator/installation#all-tiers) with the
+**all-tier option**, then choose one provider below. Replace the example key
+and keep the exports in the terminal where you run the checks.
+
+<Tabs>
+  <Tab title="NVIDIA Build">
+
+Get a key from [NVIDIA Build](https://build.nvidia.com/).
+
+```bash
+export SKILL_EVAL_LLM_PROVIDER=nv_build
+export NVIDIA_API_KEY='nvapi-...'
+```
+
+  </Tab>
+  <Tab title="OpenAI">
+
+Use an [OpenAI API key](https://platform.openai.com/api-keys).
+
+```bash
+export SKILL_EVAL_LLM_PROVIDER=openai
+export OPENAI_API_KEY='sk-...'
+```
+
+  </Tab>
+</Tabs>
+
+These providers use the same key for embeddings and chat. Collection and
+catalog comparisons use embeddings only; checking repeated content inside a
+skill also uses chat. See [other providers and local models](/skills/skillevaluator/configuration).
+Hosted checks send the selected skill text to your provider and can incur charges.
+
+### Choose your check
+
+Replace the paths with your own skill folders. Keep reports and catalogs outside
+the folders you are checking.
+
+<Tabs>
+  <Tab title="One skill">
+
+**Find repeated instructions inside a skill.** Point at the folder containing
+its `SKILL.md`:
+
+```bash title="Check inside one skill"
+skillevaluator tier2 ./my-skill \
+  -r cli,json,html -o reports/tier2-one
+```
+
+The report links findings to overlapping sections. Without a catalog, comparison
+with other skills is marked **not run**.
+Open `reports/tier2-one/skillevaluator-tier2.html`.
+
+  </Tab>
+  <Tab title="Skill collection">
+
+**Find overlapping skills.** Point at a collection containing at least two
+skills, each with its own `SKILL.md`:
+
+```bash title="Compare skills in a collection"
+skillevaluator similarity-check ./skills \
+  -r cli,json,html -o reports/tier2-collection
+```
+
+This compares skill names and descriptions. The report lists matching pairs
+and their similarity scores; it does not inspect repeated sections inside each skill.
+Open `reports/tier2-collection/skillevaluator-similarity.html`.
+
+  </Tab>
+  <Tab title="Saved catalog">
+
+**Screen a candidate against an existing collection.** First save the collection:
+
+```bash title="Build a reusable catalog"
+skillevaluator similarity-check ./skills --save-catalog ./skill-catalog.json \
+  -r cli,json,html -o reports/tier2-catalog
+```
+
+Once `skill-catalog.json` has been saved, compare a candidate against it:
+
+```bash title="Screen a candidate"
+skillevaluator similarity-check ./candidate-skill --catalog ./skill-catalog.json \
+  -r cli,json,html -o reports/tier2-candidate
+```
+
+Open `reports/tier2-candidate/skillevaluator-similarity.html`.
+Use the same embedding provider, model, and mode when building and querying.
+Rebuild the catalog when its source skills change.
+
+  </Tab>
+</Tabs>
+
+### Read the findings
+
+The terminal prints the outcome and report paths. Open the HTML file named
+above; the JSON file beside it contains machine-readable findings for automation.
+
+| Result | What to do |
+| --- | --- |
+| **PASS** | No blocking finding. Review any advisory overlaps before deciding to merge or keep content. |
+| **FAIL** | Follow the reported file locations. Consolidate duplicate instructions, or clarify the scope of overlapping skills. |
+| **INCOMPLETE** | Fix the named credential, input, or limit problem and rerun. Missing coverage is not evidence that the skills are distinct. |
+
+HIGH and CRITICAL findings and blocking analysis errors exit nonzero.
+MEDIUM and LOW findings are advisory. The same exit behavior applies with
+terminal, JSON, or HTML output.
+An early setup error can stop before a report is written; fix the terminal error and rerun.
+[Interpret classifications and confidence](/skills/skillevaluator/tier2-reference#verdicts-and-what-to-do-about-them).
+
+</Steps>
+
+## Continue from your result
+
+<CardGroup cols={2}>
+  <Card title="Check one skill against a catalog too" icon="copy" href="/skills/skillevaluator/tier2-reference#run-tier-2">
+    Add `--catalog` to `tier2` for both checks in one report.
+  </Card>
+  <Card title="Measure the effect on an agent" icon="flask" href="/skills/skillevaluator/tier3-live-evaluation">
+    Run the same tasks with and without the skill.
+  </Card>
+</CardGroup>
+
+## Advanced topics
+
+<div id="run-tier-2">
+<div id="which-check-do-you-need">
+<div id="detect-redundancy-inside-one-skill">
+<div id="what-gets-chunked">
+<div id="verdicts-and-what-to-do-about-them">
+<Accordion title="Repeated content, chunking, and verdicts">
+  - [Combine inside-skill and catalog checks](/skills/skillevaluator/tier2-reference#run-tier-2)
+  - [Choose a check](/skills/skillevaluator/tier2-reference#which-check-do-you-need)
+  - [How repeated content is detected](/skills/skillevaluator/tier2-reference#detect-redundancy-inside-one-skill)
+  - [What gets chunked](/skills/skillevaluator/tier2-reference#what-gets-chunked)
+  - [Verdicts and what to fix](/skills/skillevaluator/tier2-reference#verdicts-and-what-to-do-about-them)
+</Accordion>
+</div>
+</div>
+</div>
+</div>
+</div>
+
+<div id="compare-skills-across-a-collection">
+<div id="use-a-local-catalog">
+<div id="measured-real-provider-scale-examples">
+<div id="reproduce-scale-and-limit-measurements">
+<Accordion title="Collections, catalogs, and scale">
+  - [Similarity classifications and options](/skills/skillevaluator/tier2-reference#compare-skills-across-a-collection)
+  - [Catalog compatibility and candidate identity](/skills/skillevaluator/tier2-reference#use-a-local-catalog)
+  - [Measured scale examples](/skills/skillevaluator/tier2-reference#measured-real-provider-scale-examples)
+  - [Reproduce scale and limit measurements](/skills/skillevaluator/tier2-reference#reproduce-scale-and-limit-measurements)
+</Accordion>
+</div>
+</div>
+</div>
+</div>
+
+<div id="defaults-and-safety-limits">
+<div id="what-leaves-your-machine">
+<div id="edge-cases">
+<Accordion title="Limits, data handling, and troubleshooting">
+  - [Defaults and safety limits](/skills/skillevaluator/tier2-reference#defaults-and-safety-limits)
+  - [What leaves your machine](/skills/skillevaluator/tier2-reference#what-leaves-your-machine)
+  - [Edge cases and incomplete results](/skills/skillevaluator/tier2-reference#edge-cases)
+</Accordion>
+</div>
+</div>
+</div>
+
+<div id="tier-2-in-automatic-ci">
+<div id="inside-validate">
+<div id="next-steps">
+<Accordion title="CI and combined validation">
+  - [Tier 2 in automatic CI](/skills/skillevaluator/tier2-reference#tier-2-in-automatic-ci)
+  - [Tier 2 inside validate](/skills/skillevaluator/tier2-reference#inside-validate)
+  - [More guides](/skills/skillevaluator/tier2-reference#next-steps)
+</Accordion>
+</div>
+</div>
+</div>

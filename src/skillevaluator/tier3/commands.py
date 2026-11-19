@@ -1,0 +1,1872 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tier 3 command implementations."""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import tomllib
+import webbrowser
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+import yaml
+from rich.box import SIMPLE
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+from skillevaluator import __version__
+from skillevaluator.evaluation.results import DatasetGenerationError, DatasetGenerationResult
+from skillevaluator.evaluation.tier3_report import render_agent_eval_html_report
+from skillevaluator.provider_config import ProviderConfigurationError, resolve_llm_provider
+from skillevaluator.tier3.case_ids import safe_child, validate_case_id, validate_case_ids
+from skillevaluator.tier3.dataset_coverage import dataset_coverage_result
+from skillevaluator.tier3.dataset_utils import DATASET_EXTENSIONS, load_dataset_entries_with_format
+from skillevaluator.tier3.evals_config import CONFIG_FILENAMES, _validate_config, load_evals_config
+from skillevaluator.tier3.evals_spec import validate_harbor_contract, validate_skillevaluators
+from skillevaluator.tier3.harbor import (
+    DEFAULT_LLM_VERIFIER_TIMEOUT_SEC,
+    HARBOR_AGENTS,
+    HARBOR_AGENTS_SUPPORTED,
+    canonical_agent_name,
+)
+from skillevaluator.tier3.harbor.metrics import (
+    CUSTOM_ONLY_METRIC_SET,
+    CUSTOM_SCORE_POLICY,
+    DEFAULT_METRIC_SET,
+    DEFAULT_METRICS,
+    DEFAULT_SCORE_POLICY,
+    LEGACY_METRIC_SET,
+    LEGACY_METRICS,
+    LEGACY_SCORE_POLICY,
+    PARTIAL_SCORE_POLICY,
+    not_applicable_list,
+    overall_score_from_metrics,
+)
+from skillevaluator.tier3.harbor.progress import (
+    NullProgressReporter,
+    ProgressEvent,
+    ProgressReporter,
+    Tier3RunPlan,
+    safe_progress_reporter,
+    secret_values_from_environment,
+)
+from skillevaluator.tier3.harbor.runner import (
+    _check_prerequisites,
+    _harbor_bin,
+    _harbor_launch_cwd,
+    _harbor_launch_environment,
+    _model_for_agent,
+    _resolve_agent_runtime_plan,
+    _resolve_environment_kwargs,
+    run_harbor_eval,
+)
+from skillevaluator.tier3.harbor.secure_copy import copytree_secure
+from skillevaluator.tier3.results_location import (
+    _run_timestamp,
+    is_legacy_completed_run_dir,
+    iter_candidate_results_roots,
+    ordered_run_directories,
+    resolve_latest_results,
+    resolve_results_root,
+)
+from skillevaluator.tier3.toml_utils import toml_quote
+from skillevaluator.utils.json_output import json_needs_ascii
+from skillevaluator.utils.rich_markup import escape_markup, strip_terminal_controls
+
+# emoji=False: ":name:" codes in untrusted text must print literally.
+console = Console(emoji=False)
+
+_HARBOR_RESERVED_CASE_NAMES = frozenset({"dataset.toml", "readme.md", "metric.py", "results"})
+_DEFAULT_AGENT_BY_PROVIDER = {
+    "nv_build": "opencode",
+    "openai": "codex",
+    "anthropic": "claude-code",
+    "bedrock": "claude-code",
+    "openai-compatible": "codex",
+}
+
+
+def _engine_env_mode(value: str) -> str:
+    return value
+
+
+def _starter_evals_entry(skill_path: Path, case_id: str) -> dict[str, Any]:
+    return {
+        "id": case_id,
+        "prompt": "Replace this with the eval prompt for the agent.",
+        "expected_output": "Replace this with the expected outcome.",
+        "expected_skill": skill_path.name,
+        "assertions": [
+            # The no-skill baseline is graded on the same assertions, so grade the
+            # outcome, not skill use (skill_execution scores that).
+            "The agent's final response completes the task in the prompt.",
+        ],
+    }
+
+
+def _ensure_starter_evals_json(evals_dir: Path, skill_path: Path, case_id: str) -> None:
+    existing = [evals_dir / f"evals{extension}" for extension in DATASET_EXTENSIONS]
+    existing = [path for path in existing if path.exists()]
+    if len(existing) > 1:
+        raise ValueError("multiple eval datasets found: " + ", ".join(str(path) for path in existing))
+    if existing:
+        return
+    evals_file = evals_dir / "evals.json"
+    payload = {"skill_name": skill_path.name, "evals": [_starter_evals_entry(skill_path, case_id)]}
+    evals_file.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _validate_existing_scaffold_state(private_root: Path, evals_dir: Path) -> None:
+    """Validate authored dataset/config inputs before changing a private snapshot."""
+
+    datasets = [evals_dir / f"evals{extension}" for extension in DATASET_EXTENSIONS]
+    datasets = [path for path in datasets if path.exists()]
+    if len(datasets) > 1:
+        raise ValueError("multiple eval datasets found: " + ", ".join(str(path) for path in datasets))
+    if datasets:
+        entries, dataset_format = load_dataset_entries_with_format(datasets[0])
+        if not entries:
+            raise ValueError(f"eval dataset is empty: {datasets[0]}")
+        validate_case_ids(entry.get("id") for entry in entries)
+        for index, entry in enumerate(entries):
+            required_text = ("prompt", "expected_output") if dataset_format == "agentskills" else ("question",)
+            for field_name in required_text:
+                value = entry.get(field_name)
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"invalid eval dataset entry {index}: {field_name} must be a non-empty string")
+            if dataset_format == "agentskills":
+                for authored_name, runtime_name in (
+                    ("prompt", "question"),
+                    ("expected_output", "ground_truth"),
+                    ("assertions", "expected_behavior"),
+                ):
+                    if authored_name in entry and runtime_name in entry and entry[authored_name] != entry[runtime_name]:
+                        raise ValueError(
+                            f"invalid eval dataset entry {index}: conflicting {authored_name} and {runtime_name}"
+                        )
+            assertions = entry.get("assertions")
+            if assertions is not None and (
+                not isinstance(assertions, list)
+                or any(not isinstance(assertion, str) or not assertion.strip() for assertion in assertions)
+            ):
+                raise ValueError(f"invalid eval dataset entry {index}: assertions must be a list of non-empty strings")
+            question = entry.get("question")
+            if not isinstance(question, str) or not question.strip():
+                raise ValueError(f"invalid eval dataset entry {index}: question must be a non-empty string")
+            ground_truth = entry.get("ground_truth")
+            if ground_truth is not None and (
+                not isinstance(ground_truth, str) or (dataset_format == "agentskills" and not ground_truth.strip())
+            ):
+                raise ValueError(f"invalid eval dataset entry {index}: ground_truth must be a non-empty string")
+            expected_behavior = entry.get("expected_behavior")
+            if expected_behavior is not None and (
+                not isinstance(expected_behavior, list)
+                or any(not isinstance(behavior, str) or not behavior.strip() for behavior in expected_behavior)
+            ):
+                raise ValueError(
+                    f"invalid eval dataset entry {index}: expected_behavior must be a list of non-empty strings"
+                )
+
+    configs = [evals_dir / name for name in CONFIG_FILENAMES]
+    configs = [path for path in configs if path.exists()]
+    if len(configs) > 1:
+        raise ValueError("multiple eval config files found: " + ", ".join(str(path) for path in configs))
+    load_evals_config(private_root)
+
+
+def _write_evals_config(evals_dir: Path, *, grading_mode: str, task_source: str) -> None:
+    candidates = [evals_dir / name for name in CONFIG_FILENAMES]
+    existing = [path for path in candidates if path.exists()]
+    if len(existing) > 1:
+        raise ValueError("multiple eval config files found: " + ", ".join(str(path) for path in existing))
+    config_file = existing[0] if existing else candidates[0]
+    if config_file.exists():
+        data = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+        if data is None:
+            data = {}
+        elif not isinstance(data, dict):
+            raise ValueError(f"invalid eval config in {config_file}: top level must be a mapping")
+    else:
+        data = {}
+
+    data["schema_version"] = data.get("schema_version", 1)
+    harbor = data.setdefault("harbor", {})
+    if not isinstance(harbor, dict):
+        raise ValueError(f"invalid eval config in {config_file}: harbor must be a mapping")
+    harbor["task_source"] = task_source
+    harbor.setdefault("n_attempts", 1)
+    harbor.setdefault("pass_threshold", 0.60)
+    harbor.setdefault("stop_on_pass", False)
+
+    grading = data.setdefault("grading", {})
+    if not isinstance(grading, dict):
+        raise ValueError(f"invalid eval config in {config_file}: grading must be a mapping")
+    grading["mode"] = grading_mode
+
+    _validate_config(data, config_file)
+    config_file.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+
+def _python_grader_template() -> str:
+    return '''#!/usr/bin/env python3
+"""User-owned SkillEvaluator custom grader.
+
+Contract:
+- Read /logs/agent/trajectory.json for the agent trajectory.
+- Read /tests/entry.json for eval case metadata.
+- Write /logs/verifier/reward.json.
+- Write /logs/verifier/reward.txt with a numeric 0.0-1.0 score.
+
+In default_plus_custom mode, default grading runs first. Put domain-specific scores
+under custom_metrics and do not overwrite reserved metric names:
+security, skill_execution, skill_efficiency, accuracy, goal_accuracy,
+behavior_check, overall, details, metrics, metric_set, entry_id.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+TRAJECTORY_JSON = Path(os.environ.get("HARBOR_ATIF_PATH", "/logs/agent/trajectory.json"))
+ENTRY_JSON = Path(os.environ.get("HARBOR_ENTRY_JSON", "/tests/entry.json"))
+REWARD_JSON = Path(os.environ.get("HARBOR_REWARD_JSON", "/logs/verifier/reward.json"))
+REWARD_TXT = Path(os.environ.get("HARBOR_REWARD_TXT", "/logs/verifier/reward.txt"))
+
+
+def main() -> None:
+    _trajectory = json.loads(TRAJECTORY_JSON.read_text(encoding="utf-8")) if TRAJECTORY_JSON.exists() else {}
+    _entry = json.loads(ENTRY_JSON.read_text(encoding="utf-8")) if ENTRY_JSON.exists() else {}
+
+    score = 1.0
+    reward = {
+        "overall": score,
+        "custom_metrics": {
+            "custom_check": score,
+        },
+        "details": {
+            "custom_check": {
+                "score": score,
+                "reason": "Replace this with real custom grading logic.",
+            }
+        },
+    }
+    REWARD_JSON.parent.mkdir(parents=True, exist_ok=True)
+    REWARD_JSON.write_text(json.dumps(reward, indent=2), encoding="utf-8")
+    REWARD_TXT.write_text(str(score), encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _shell_grader_template() -> str:
+    return """#!/usr/bin/env bash
+set -euo pipefail
+
+# User-owned SkillEvaluator custom grader.
+#
+# Contract:
+# - Read /logs/agent/trajectory.json for the agent trajectory.
+# - Read /tests/entry.json for eval case metadata.
+# - Write /logs/verifier/reward.json.
+# - Write /logs/verifier/reward.txt with a numeric 0.0-1.0 score.
+#
+# In default_plus_custom, default grading runs first. Put domain-specific scores
+# under custom_metrics and do not overwrite reserved metric names.
+
+REWARD_JSON="${HARBOR_REWARD_JSON:-/logs/verifier/reward.json}"
+REWARD_TXT="${HARBOR_REWARD_TXT:-/logs/verifier/reward.txt}"
+score="1.0"
+
+mkdir -p "$(dirname "$REWARD_JSON")"
+cat > "$REWARD_JSON" <<EOF
+{
+  "overall": ${score},
+  "custom_metrics": {
+    "custom_check": ${score}
+  },
+  "details": {
+    "custom_check": {
+      "score": ${score},
+      "reason": "Replace this with real custom grading logic."
+    }
+  }
+}
+EOF
+
+printf "%s" "$score" > "$REWARD_TXT"
+"""
+
+
+def _write_grader_file(path: Path, *, language: str) -> None:
+    # LF only: graders run inside a Linux container, and Windows' default CRLF
+    # breaks the shebang and `set -euo pipefail`.
+    if language == "shell":
+        path.write_text(_shell_grader_template(), encoding="utf-8", newline="\n")
+    else:
+        path.write_text(_python_grader_template(), encoding="utf-8", newline="\n")
+    path.chmod(0o755)
+
+
+def _native_test_sh(language: str) -> str:
+    command = 'bash "${tests_dir}/grader.sh"' if language == "shell" else 'python3 "${tests_dir}/grader.py"'
+    return f'#!/bin/bash\nset -euo pipefail\ntests_dir="${{HARBOR_TESTS_DIR:-/tests}}"\n{command}\n'
+
+
+def _write_harbor_dataset(harbor_dir: Path, case_id: str) -> None:
+    """Add one quoted task to a private Harbor dataset manifest."""
+    dataset_file = harbor_dir / "dataset.toml"
+    task_name = f"nvidia/{case_id}"
+    if dataset_file.exists():
+        content = dataset_file.read_text(encoding="utf-8")
+        try:
+            parsed = tomllib.loads(content)
+        except tomllib.TOMLDecodeError as exc:
+            raise ValueError(f"invalid Harbor dataset manifest {dataset_file}: {exc}") from exc
+        tasks = parsed.get("tasks", [])
+        if not isinstance(tasks, list) or any(
+            not isinstance(task, dict) or not isinstance(task.get("name"), str) for task in tasks
+        ):
+            raise ValueError(f"invalid Harbor dataset manifest {dataset_file}: tasks must contain string names")
+        if any(task["name"] == task_name for task in tasks):
+            return
+        separator = "" if not content or content.endswith("\n\n") else "\n" if content.endswith("\n") else "\n\n"
+        content = f"{content}{separator}[[tasks]]\nname = {toml_quote(task_name)}\n"
+    else:
+        content = (
+            "[dataset]\n"
+            f"name = {toml_quote('custom-skillevaluator')}\n"
+            f"description = {toml_quote('User-owned Harbor task set for SkillEvaluator')}\n\n"
+            "[[tasks]]\n"
+            f"name = {toml_quote(task_name)}\n"
+        )
+    try:
+        tomllib.loads(content)
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"generated invalid Harbor dataset manifest: {exc}") from exc
+    dataset_file.write_text(content, encoding="utf-8")
+
+
+def parse_agents(raw_agents: str | None) -> list[str]:
+    """Parse a comma-separated Harbor agent list."""
+    if not raw_agents:
+        return []
+    agents = [canonical_agent_name(item.strip()) for item in raw_agents.split(",") if item.strip()]
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for agent in agents:
+        if agent not in seen:
+            deduped.append(agent)
+            seen.add(agent)
+    return deduped
+
+
+def resolve_agents(raw_agents: str | None, *, provider: str) -> list[str]:
+    """Resolve an explicit agent list or choose the provider's native default."""
+    if raw_agents is not None:
+        return parse_agents(raw_agents)
+    try:
+        return [_DEFAULT_AGENT_BY_PROVIDER[provider]]
+    except KeyError as exc:
+        raise ValueError(
+            f"No automatic Harbor agent is configured for provider '{provider}'; select one with --agents."
+        ) from exc
+
+
+def parse_agent_model_overrides(raw_overrides: tuple[str, ...]) -> dict[str, list[str]]:
+    """Parse ``--agent-model agent=model`` values."""
+    overrides: dict[str, list[str]] = {}
+    authored_names: dict[str, str] = {}
+    for raw in raw_overrides:
+        if "=" not in raw:
+            raise ValueError("--agent-model must be in AGENT=MODEL form")
+        agent, model = raw.split("=", 1)
+        authored_name = agent.strip()
+        agent = canonical_agent_name(authored_name)
+        model = model.strip()
+        if not agent or not model:
+            raise ValueError("--agent-model must include both agent and model")
+        previous = authored_names.get(agent)
+        if previous is not None:
+            raise ValueError(
+                f"--agent-model names {previous} and {authored_name} refer to the same agent "
+                f"({agent}); specify only one model for {agent}"
+            )
+        overrides.setdefault(agent, []).append(model)
+        authored_names[agent] = authored_name
+    return overrides
+
+
+def parse_environment_kwargs(
+    raw_kwargs: tuple[str, ...] | list[str],
+    *,
+    env_mode: str | None = None,
+) -> dict[str, Any]:
+    """Parse repeatable ``--ek key=value`` CLI pairs via ``parse_environment_kwarg_overrides``."""
+    from skillevaluator.tier3.evals_config import parse_environment_kwarg_overrides
+
+    return parse_environment_kwarg_overrides(raw_kwargs, env_mode=env_mode)
+
+
+def validate_agents(agents: list[str]) -> list[str]:
+    """Return unsupported agent names."""
+    return [agent for agent in agents if agent not in HARBOR_AGENTS]
+
+
+def create_dataset(
+    skill_path: Path,
+    *,
+    full: bool = False,
+    no_llm: bool = False,
+    dry_run: bool = False,
+    force: bool = False,
+    prompt: Path | None = None,
+    grounding: str = "auto",
+    refine: bool = False,
+    from_results: Path | None = None,
+    results_dir: Path | None = None,
+) -> DatasetGenerationResult:
+    """Generate a synthetic evaluation dataset using the migrated generator."""
+    from skillevaluator.tier3 import generate_dataset
+
+    argv = [str(skill_path.resolve())]
+    if full:
+        argv.append("--full")
+    if no_llm:
+        argv.append("--no-llm")
+    if dry_run:
+        argv.append("--dry-run")
+    if force:
+        argv.append("--force")
+    if prompt:
+        argv.extend(["--prompt", str(prompt.resolve())])
+    if grounding != "auto":
+        argv.extend(["--grounding", grounding])
+    if refine:
+        argv.append("--refine")
+    if from_results:
+        argv.extend(["--from-results", str(from_results.resolve())])
+    if results_dir:
+        argv.extend(["--results-dir", str(results_dir.expanduser().resolve())])
+
+    try:
+        return generate_dataset.main(argv)
+    except SystemExit as exc:
+        diagnostic = getattr(exc, "diagnostic", None)
+        if isinstance(diagnostic, str) and diagnostic.strip():
+            raise DatasetGenerationError(diagnostic) from exc
+        raise DatasetGenerationError(f"Dataset generation failed with exit code {exc.code}") from exc
+
+
+def init_custom_grader(
+    skill_path: Path,
+    *,
+    mode: str,
+    language: str,
+    force: bool,
+    no_config: bool,
+) -> int:
+    """Create a BYOG custom grader starter under evals/."""
+    skill_path = skill_path.expanduser().resolve()
+    evals_dir = skill_path / "evals"
+    if evals_dir.is_symlink():
+        raise ValueError(f"evals directory must not be a symlink: {evals_dir}")
+    if os.path.lexists(evals_dir) and not evals_dir.is_dir():
+        raise ValueError(f"evals path must be a directory: {evals_dir}")
+
+    with tempfile.TemporaryDirectory(prefix="skillevaluator-custom-grader-") as temporary:
+        private_root = Path(temporary).resolve(strict=True)
+        private_evals = private_root / "evals"
+        if evals_dir.exists():
+            copytree_secure(evals_dir, private_evals, allowed_root=skill_path)
+        else:
+            private_evals.mkdir(mode=0o700)
+
+        grader_py = private_evals / "grader.py"
+        grader_sh = private_evals / "grader.sh"
+        existing = [path for path in (grader_py, grader_sh) if path.exists()]
+        if existing and not force:
+            names = ", ".join(str(evals_dir / path.name) for path in existing)
+            console.print(
+                f"[red]Error:[/red] custom grader already exists: {escape_markup(names)}. "
+                "Re-run with --force to overwrite."
+            )
+            return 1
+        if force:
+            for existing_path in existing:
+                existing_path.unlink()
+
+        private_grader = grader_sh if language == "shell" else grader_py
+        _write_grader_file(private_grader, language=language)
+        _ensure_starter_evals_json(private_evals, skill_path, "case-001")
+        if not no_config:
+            _write_evals_config(private_evals, grading_mode=mode, task_source="evals_json")
+
+        copytree_secure(private_evals, evals_dir, replace_existing=True, allowed_root=private_root)
+
+    grader_path = evals_dir / private_grader.name
+    console.print(f"Created SkillEvaluator custom grader starter at [cyan]{escape_markup(str(grader_path))}[/cyan]")
+    return 0
+
+
+def init_harbor_task(
+    skill_path: Path,
+    *,
+    force: bool,
+    case_id: str,
+    mode: str,
+    language: str,
+    with_config: bool,
+) -> int:
+    """Create a BYOT Harbor starter template under evals/harbor/."""
+    requested_skill_path = skill_path.expanduser()
+    if requested_skill_path.is_symlink():
+        raise ValueError(f"skill path must not be a symlink: {requested_skill_path}")
+    skill_path = requested_skill_path.resolve()
+    skill_file = skill_path / "SKILL.md"
+    if not skill_path.is_dir() or not skill_file.is_file() or skill_file.is_symlink():
+        raise ValueError(f"skill path must be a directory containing a regular SKILL.md: {skill_path}")
+
+    case_id = validate_case_id(case_id)
+    if case_id.casefold() in _HARBOR_RESERVED_CASE_NAMES:
+        raise ValueError(f"case id {case_id!r} is reserved in the Harbor dataset root")
+
+    evals_dir = skill_path / "evals"
+    if evals_dir.is_symlink():
+        raise ValueError(f"evals directory must not be a symlink: {evals_dir}")
+    if os.path.lexists(evals_dir) and not evals_dir.is_dir():
+        raise ValueError(f"evals path must be a directory: {evals_dir}")
+
+    with tempfile.TemporaryDirectory(prefix="skillevaluator-scaffold-") as temporary:
+        private_root = Path(temporary).resolve(strict=True)
+        private_evals = private_root / "evals"
+        if evals_dir.exists():
+            copytree_secure(evals_dir, private_evals, allowed_root=skill_path)
+        else:
+            private_evals.mkdir(mode=0o700)
+        _validate_existing_scaffold_state(private_root, private_evals)
+
+        private_harbor = private_evals / "harbor"
+        if os.path.lexists(private_harbor) and not private_harbor.is_dir():
+            raise ValueError(f"Harbor scaffold root must be a directory: {evals_dir / 'harbor'}")
+        private_harbor.mkdir(exist_ok=True)
+        collision = next(
+            (
+                child.name
+                for child in private_harbor.iterdir()
+                if child.name != case_id and child.name.casefold() == case_id.casefold()
+            ),
+            None,
+        )
+        if collision is not None:
+            raise ValueError(f"case id {case_id!r} conflicts with existing Harbor entry {collision!r}")
+        private_case = safe_child(private_harbor, case_id)
+        public_case = evals_dir / "harbor" / case_id
+        if os.path.lexists(private_case):
+            if not force:
+                console.print(
+                    f"[red]Error:[/red] {escape_markup(str(public_case))} already exists. "
+                    "Re-run with --force to overwrite."
+                )
+                return 1
+            if not private_case.is_dir() or private_case.is_symlink():
+                raise ValueError(f"existing Harbor case must be a real directory: {public_case}")
+            shutil.rmtree(private_case)
+
+        tests_dir = private_case / "tests"
+        env_dir = private_case / "environment"
+        tests_dir.mkdir(parents=True)
+        env_dir.mkdir()
+
+        _ensure_starter_evals_json(private_evals, skill_path, case_id)
+        if with_config:
+            _write_evals_config(private_evals, grading_mode=mode, task_source="native_harbor")
+        _write_harbor_dataset(private_harbor, case_id)
+
+        task_content = f"""schema_version = {toml_quote("1.3")}
+
+[task]
+name = {toml_quote(f"nvidia/{case_id}")}
+description = {toml_quote("Custom SkillEvaluator Harbor task")}
+
+[metadata]
+entry_id = {toml_quote(case_id)}
+
+[agent]
+timeout_sec = 300.0
+
+[verifier]
+timeout_sec = {DEFAULT_LLM_VERIFIER_TIMEOUT_SEC}
+
+[environment]
+cpus = 2
+memory_mb = 4096
+storage_mb = 2048
+network_mode = {toml_quote("public")}
+skills_dir = {toml_quote("/workspace/skills")}
+"""
+        tomllib.loads(task_content)
+        (private_case / "task.toml").write_text(task_content, encoding="utf-8")
+        (private_case / "instruction.md").write_text(
+            "Replace this with the user-facing task instruction for the agent.\n", encoding="utf-8"
+        )
+        (env_dir / "Dockerfile").write_text(
+            """FROM python:3.12-slim
+
+RUN apt-get -o Acquire::Retries=3 update && \\
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends bash curl git jq procps ripgrep && \\
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /workspace/skills /logs/agent /logs/verifier
+WORKDIR /workspace
+""",
+            encoding="utf-8",
+        )
+        grader_path = tests_dir / ("grader.sh" if language == "shell" else "grader.py")
+        _write_grader_file(grader_path, language=language)
+        test_sh = tests_dir / "test.sh"
+        test_sh.write_text(_native_test_sh(language), encoding="utf-8", newline="\n")
+        test_sh.chmod(0o755)
+        (private_harbor / "README.md").write_text(
+            """# SkillEvaluator BYOT Harbor Tasks
+
+This directory is user-owned. SkillEvaluator stages copies under eval
+results and does not mutate these source files in place.
+
+Keep the result contract stable:
+
+- trajectory path: `/logs/agent/trajectory.json`
+- reward JSON: `/logs/verifier/reward.json`
+- reward text: `/logs/verifier/reward.txt`
+- score range: `0.0` to `1.0`
+- case IDs should match `evals/evals.json` when using `default` or `default_plus_custom`
+""",
+            encoding="utf-8",
+        )
+
+        copytree_secure(private_evals, evals_dir, replace_existing=True, allowed_root=private_root)
+
+    console.print(f"Created Harbor BYOT starter at [cyan]{escape_markup(str(evals_dir / 'harbor'))}[/cyan]")
+    return 0
+
+
+def evaluate(
+    skill_path: Path,
+    *,
+    agents: str | None,
+    env_mode: str,
+    backend: str = "harbor",
+    environment_kwarg: tuple[str, ...] = (),
+    skip_baseline: bool,
+    skip_with_skill: bool = False,
+    reuse_baseline: str | None = None,
+    compare_to: str | None = None,
+    n_attempts: int | None,
+    max_agent_tokens: int | None = None,
+    max_judge_calls: int | None = None,
+    max_attempts_total: int | None = None,
+    max_cost_usd: float | None = None,
+    price_file: Path | None = None,
+    pass_threshold: float | None,
+    stop_on_pass: bool | None = None,
+    n_concurrent: int | None,
+    max_agents: int | None,
+    max_cases: int | None = None,
+    model: str | None,
+    agent_model: tuple[str, ...],
+    custom_dockerfile_mode: str | None,
+    skill_workspace_mode: str | None,
+    include_skills: tuple[Path, ...],
+    copy_repo: bool,
+    grading_mode: str | None,
+    results_dir: Path | None,
+    harbor_keep_jobs: bool,
+    agent_runtime_preflight: bool | None = None,
+    tolerate_baseline_timeouts: bool | None = None,
+    timeout_multiplier: float | None,
+    override_cpus: int | None,
+    override_memory_mb: int | None,
+    override_storage_mb: int | None,
+    repo_context_exclude_paths: tuple[Path, ...] = (),
+    evaluated_source: dict[str, str] | None = None,
+    progress_reporter: ProgressReporter | None = None,
+    environment_kwargs: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Run a live-agent evaluation for a skill on the selected execution backend."""
+    from skillevaluator.tier3.nemo_gym.backend import NEMO_GYM_BACKEND, nemo_gym_capability_errors, normalize_backend
+
+    env_mode = _engine_env_mode(env_mode)
+    execution_backend = normalize_backend(backend)
+
+    if agents is None:
+        try:
+            provider = resolve_llm_provider()
+        except ProviderConfigurationError as exc:
+            raise ValueError(f"A public LLM provider is required for live evaluation: {exc}") from exc
+        agent_list = resolve_agents(None, provider=provider.provider)
+    else:
+        agent_list = parse_agents(agents)
+        if not agent_list:
+            raise ValueError("Select at least one agent with --agents.")
+    reporter = safe_progress_reporter(progress_reporter or NullProgressReporter())
+    engine_started = False
+    try:
+        reporter.set_secret_values(secret_values_from_environment(os.environ))
+        reporter.start(
+            Tier3RunPlan(
+                skill_name=skill_path.name,
+                environment=env_mode,
+                agents=tuple(agent_list),
+                baseline=not skip_baseline,
+                with_skill=not skip_with_skill,
+                attempts=n_attempts,
+                concurrency=n_concurrent,
+                max_agents=max_agents,
+                timeout_multiplier=timeout_multiplier,
+            )
+        )
+        reporter.emit(ProgressEvent(stage="configuration", state="running"))
+        if skip_baseline and skip_with_skill:
+            raise ValueError("--skip-baseline and --skip-with-skill are mutually exclusive (no arm would run)")
+        if reuse_baseline and (skip_baseline or skip_with_skill):
+            raise ValueError("--reuse-baseline is mutually exclusive with --skip-baseline and --skip-with-skill")
+        if compare_to and skip_with_skill:
+            raise ValueError("--compare-to is mutually exclusive with --skip-with-skill")
+        unknown = validate_agents(agent_list)
+        if unknown:
+            supported = ", ".join(sorted(HARBOR_AGENTS_SUPPORTED))
+            raise ValueError(f"Unknown agent(s): {', '.join(unknown)}. Supported agents: {supported}")
+
+        if agents is not None:
+            try:
+                resolve_llm_provider()
+            except ProviderConfigurationError as exc:
+                raise ValueError(f"A public LLM provider is required for live evaluation: {exc}") from exc
+
+        agent_models = parse_agent_model_overrides(agent_model)
+        from skillevaluator.tier3.evals_config import parse_environment_kwarg_overrides
+
+        parsed_cli_kwargs = parse_environment_kwarg_overrides(environment_kwarg, env_mode=env_mode)
+        merged_environment_kwargs = {**dict(environment_kwargs or {}), **parsed_cli_kwargs}
+        unknown_model_agents = sorted(set(agent_models) - set(agent_list))
+        if unknown_model_agents:
+            raise ValueError(
+                "--agent-model provided for agent(s) not selected by -a/--agents: " + ", ".join(unknown_model_agents)
+            )
+
+        output_dir = resolve_results_root(skill_path, results_dir)
+        if execution_backend == NEMO_GYM_BACKEND:
+            from skillevaluator.tier3.nemo_gym.runner import run_nemo_gym_eval
+
+            capability_errors = nemo_gym_capability_errors(
+                agents=agent_list,
+                env_mode=env_mode,
+                grading_mode=grading_mode,
+                harbor_keep_jobs=harbor_keep_jobs,
+                stop_on_pass=bool(stop_on_pass),
+                custom_dockerfile_mode=custom_dockerfile_mode,
+                copy_repo=copy_repo,
+                environment_kwargs=merged_environment_kwargs,
+                override_storage_mb=override_storage_mb,
+                agent_runtime_preflight=bool(agent_runtime_preflight),
+                run_options={
+                    "reuse_baseline": reuse_baseline,
+                    "compare_to": compare_to,
+                    "max_agent_tokens": max_agent_tokens,
+                    "max_judge_calls": max_judge_calls,
+                    "max_attempts_total": max_attempts_total,
+                    "max_cost_usd": max_cost_usd,
+                    "price_file": price_file,
+                    "tolerate_baseline_timeouts": tolerate_baseline_timeouts,
+                },
+            )
+            multi_model_agents = sorted(agent for agent, models in agent_models.items() if len(models) != 1)
+            if multi_model_agents:
+                capability_errors.append(
+                    "--backend nemo-gym runs one --agent-model per agent; got several for "
+                    + ", ".join(multi_model_agents)
+                )
+            if capability_errors:
+                raise ValueError("; ".join(capability_errors))
+            engine_started = True
+            return run_nemo_gym_eval(
+                skill_path=skill_path.resolve(),
+                agents=agent_list,
+                skip_baseline=skip_baseline,
+                skip_with_skill=skip_with_skill,
+                n_attempts=n_attempts,
+                pass_threshold=pass_threshold,
+                stop_on_pass=stop_on_pass,
+                n_concurrent=n_concurrent,
+                max_cases=max_cases,
+                max_agents=max_agents,
+                model=model,
+                agent_models={agent: models[0] for agent, models in agent_models.items()} or None,
+                custom_dockerfile_mode=custom_dockerfile_mode,
+                agent_runtime_preflight=agent_runtime_preflight,
+                skill_workspace_mode=skill_workspace_mode,
+                include_skills=[p.resolve() for p in include_skills] or None,
+                grading_mode=grading_mode,
+                output_dir=output_dir,
+                env_mode=env_mode,
+                timeout_multiplier=timeout_multiplier,
+                evaluated_source=evaluated_source,
+                override_cpus=override_cpus,
+                override_memory_mb=override_memory_mb,
+                repo_context_exclude_paths=repo_context_exclude_paths,
+                copy_repo=copy_repo,
+                tolerate_baseline_timeouts=tolerate_baseline_timeouts,
+                progress_reporter=reporter,
+            )
+        engine_started = True
+        return run_harbor_eval(
+            skill_path=skill_path.resolve(),
+            agents=agent_list,
+            skip_baseline=skip_baseline,
+            skip_with_skill=skip_with_skill,
+            reuse_baseline=reuse_baseline,
+            compare_to=compare_to,
+            n_attempts=n_attempts,
+            max_agent_tokens=max_agent_tokens,
+            max_judge_calls=max_judge_calls,
+            max_attempts_total=max_attempts_total,
+            max_cost_usd=max_cost_usd,
+            price_file=price_file,
+            pass_threshold=pass_threshold,
+            stop_on_pass=stop_on_pass,
+            n_concurrent=n_concurrent,
+            max_agents=max_agents,
+            max_cases=max_cases,
+            model=model,
+            agent_models=agent_models or None,
+            custom_dockerfile_mode=custom_dockerfile_mode,
+            skill_workspace_mode=skill_workspace_mode,
+            include_skills=[p.resolve() for p in include_skills] or None,
+            copy_repo=copy_repo,
+            grading_mode=grading_mode,
+            output_dir=output_dir,
+            keep_harbor_jobs=harbor_keep_jobs,
+            agent_runtime_preflight=agent_runtime_preflight,
+            tolerate_baseline_timeouts=tolerate_baseline_timeouts,
+            env_mode=env_mode,
+            env_mode_source="CLI",
+            environment_kwargs=merged_environment_kwargs,
+            timeout_multiplier=timeout_multiplier,
+            evaluated_source=evaluated_source,
+            override_cpus=override_cpus,
+            override_memory_mb=override_memory_mb,
+            override_storage_mb=override_storage_mb,
+            repo_context_exclude_paths=repo_context_exclude_paths,
+            progress_reporter=reporter,
+        )
+    except Exception as exc:
+        if not engine_started:
+            reporter.emit(ProgressEvent(stage="configuration", state="failed", detail=str(exc)))
+        raise
+    finally:
+        reporter.close()
+
+
+def doctor(
+    *,
+    agents: str | None,
+    env_mode: str,
+    environment_kwarg: tuple[str, ...] = (),
+    verify_models: bool = False,
+    agent_model: tuple[str, ...] = (),
+    environment_kwargs: Mapping[str, Any] | None = None,
+    backend: str | None = None,
+) -> int:
+    """Check whether live evaluation dependencies are available."""
+    from skillevaluator.tier3.evals_config import parse_environment_kwarg_overrides
+    from skillevaluator.tier3.nemo_gym.backend import NEMO_GYM_BACKEND, normalize_backend
+
+    gym_backend = normalize_backend(backend) == NEMO_GYM_BACKEND
+
+    env_mode = _engine_env_mode(env_mode)
+    agent_list = parse_agents(agents) if agents is not None else []
+    rows: list[tuple[str, str, str]] = []
+    rows.append(("CLI package", "pass", f"skillevaluator {__version__}"))
+
+    kwarg_parse_error: str | None = None
+    try:
+        parsed_cli_kwargs = parse_environment_kwarg_overrides(environment_kwarg, env_mode=env_mode)
+    except ValueError as exc:
+        parsed_cli_kwargs = {}
+        kwarg_parse_error = str(exc)
+
+    merged_cli_kwargs = {**dict(environment_kwargs or {}), **parsed_cli_kwargs}
+    resolved_env_kwargs = _resolve_environment_kwargs(
+        env_mode,
+        cli_kwargs=merged_cli_kwargs,
+        environ=os.environ,
+    )
+    provider = None
+    model_resolution: dict[str, tuple[str, str]] = {}
+    runtime_plans: dict[str, Any] = {}
+    try:
+        provider = resolve_llm_provider()
+    except ProviderConfigurationError as exc:
+        rows.append(("Public LLM provider", "fail", str(exc)))
+    else:
+        agent_list = resolve_agents(agents, provider=provider.provider)
+        rows.append(("Public LLM provider", "pass", f"{provider.provider} / {provider.model}"))
+        try:
+            overrides = parse_agent_model_overrides(agent_model)
+        except ValueError as exc:
+            overrides = {}
+            rows.append(("Agent model plan", "fail", str(exc)))
+        unknown_model_agents = sorted(set(overrides) - set(agent_list))
+        if unknown_model_agents:
+            rows.append(
+                (
+                    "Agent model plan",
+                    "fail",
+                    "--agent-model provided for agent(s) not selected by -a/--agents: "
+                    + ", ".join(unknown_model_agents),
+                )
+            )
+        model_resolution = {
+            agent: _model_for_agent(
+                agent,
+                cli_model=(overrides.get(agent) or [None])[0],
+                config_agents={},
+                provider=provider,
+            )
+            for agent in agent_list
+        }
+        plan_error: str | None = None
+        if not gym_backend and not unknown_model_agents and not validate_agents(agent_list):
+            try:
+                runtime_plans = _resolve_agent_runtime_plan(
+                    provider=provider,
+                    agents=agent_list,
+                    models={agent: details[0] for agent, details in model_resolution.items()},
+                    configured_runtime_env={},
+                    env_mode=env_mode,
+                    model_sources={agent: details[1] for agent, details in model_resolution.items()},
+                    environment_kwargs=resolved_env_kwargs,
+                )
+            except ValueError as exc:
+                plan_error = str(exc)
+        if provider.provider == "nv_build":
+            labels = {"codex": "Codex", "claude-code": "Claude Code", "opencode": "OpenCode"}
+            credential_label = (
+                f"{labels[agent_list[0]]} runtime credential"
+                if len(agent_list) == 1 and agent_list[0] in labels
+                else "Agent runtime credential"
+            )
+            if plan_error is not None:
+                rows.append((credential_label, "fail", plan_error))
+            elif runtime_plans:
+                rows.append((credential_label, "pass", "operator credential and model plan resolved"))
+        elif plan_error is not None:
+            rows.append(("Agent runtime credential", "fail", plan_error))
+
+    unknown = validate_agents(agent_list)
+    if unknown:
+        rows.append(("Harbor agents", "fail", f"Unknown: {', '.join(unknown)}"))
+    elif agents is not None and not agent_list:
+        rows.append(("Harbor agents", "fail", "Select at least one agent with --agents."))
+    elif not agent_list:
+        rows.append(("Harbor agents", "warn", "automatic selection requires a configured provider"))
+    else:
+        rows.append(("Harbor agents", "pass", ", ".join(agent_list)))
+
+    if kwarg_parse_error is not None:
+        prereq_errors = [kwarg_parse_error]
+    elif gym_backend:
+        rows.extend(_nemo_gym_doctor_rows(agent_list, env_mode, merged_cli_kwargs, agent_model=agent_model))
+        prereq_errors = None
+    else:
+        prerequisite_subprocess_env = dict(next(iter(runtime_plans.values())).subprocess_env) if runtime_plans else None
+        prereq_errors = _check_prerequisites(
+            env_mode=env_mode,
+            agents=agent_list,
+            environment_kwargs=resolved_env_kwargs,
+            subprocess_env=prerequisite_subprocess_env,
+            verify_live_cluster=verify_models,
+        )
+    if prereq_errors:
+        for error in prereq_errors:
+            rows.append((f"{env_mode} prerequisite", "fail", error))
+    elif prereq_errors is not None:
+        rows.append((f"{env_mode} prerequisite", "pass", "ready"))
+
+    if verify_models and gym_backend:
+        rows.append(("provider model", "warn", "--verify-models is not checked for --backend nemo-gym yet"))
+    elif verify_models:
+        if provider is None or not runtime_plans:
+            rows.append(("provider model", "fail", "provider model resolution was unavailable"))
+        else:
+            from skillevaluator.tier3.harbor.gke_environment import (
+                GKE_HOST_UNVERIFIED_VERTEX_AUTH_DETAIL,
+            )
+            from skillevaluator.tier3.harbor.runtime_preflight import (
+                CredentialProbeDisposition,
+                credential_probe_disposition,
+                is_unverified_gke_vertex_auth_probe,
+                probe_model,
+            )
+
+            for agent in agent_list:
+                selected_provider = runtime_plans[agent].provider
+                probe = probe_model(selected_provider)
+                disposition = credential_probe_disposition(selected_provider, probe, env_mode=env_mode)
+                if disposition == CredentialProbeDisposition.FATAL:
+                    status = "fail"
+                    detail = probe.detail
+                elif disposition == CredentialProbeDisposition.DEGRADED:
+                    status = "warn"
+                    if is_unverified_gke_vertex_auth_probe(selected_provider, probe, env_mode=env_mode):
+                        detail = GKE_HOST_UNVERIFIED_VERTEX_AUTH_DETAIL
+                    elif probe.ok:
+                        detail = f"{probe.detail}; catalog access does not verify runtime credentials for this endpoint"
+                    else:
+                        detail = probe.detail
+                else:
+                    status = "pass"
+                    detail = probe.detail
+                rows.append((f"{agent} model", status, detail))
+
+    table = Table(title="SkillEvaluator Doctor", box=SIMPLE, show_edge=False)
+    table.add_column("Check", style="bold")
+    table.add_column("Status")
+    table.add_column("Details")
+    status_styles = {"pass": "green", "warn": "yellow", "fail": "red"}
+    for name, status, detail in rows:
+        style = status_styles[status]
+        table.add_row(escape_markup(str(name)), f"[{style}]{status}[/{style}]", escape_markup(str(detail)))
+    console.print(table)
+    return 1 if any(row[1] == "fail" for row in rows) else 0
+
+
+def _docker_daemon_error(env: Mapping[str, str]) -> str | None:
+    """Return why the Docker daemon Gym would use is unreachable, or None when it answers."""
+    docker = shutil.which("docker")
+    if docker is None:
+        return "NeMo Gym's docker sandbox needs the docker CLI on PATH"
+    try:
+        probe = subprocess.run(
+            [docker, "info", "--format", "{{.ServerVersion}}"],
+            env=dict(env),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=_DOCKER_PROBE_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"NeMo Gym's docker sandbox could not reach the Docker daemon: {type(exc).__name__}"
+    if probe.returncode != 0:
+        reason = (probe.stderr or probe.stdout).strip().splitlines()
+        detail = reason[-1][:200] if reason else f"docker info exited {probe.returncode}"
+        return f"NeMo Gym's docker sandbox could not reach the Docker daemon: {detail}"
+    return None
+
+
+_DOCKER_PROBE_TIMEOUT_S = 15.0
+
+
+_POLICY_ENDPOINT_PROBE_TIMEOUT_S = 3.0
+_POLICY_ENDPOINT_PROBE = """
+import sys
+from urllib.parse import urlsplit, urlunsplit
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, getproxies_environment, proxy_bypass
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+try:
+    url = urlsplit(sys.stdin.read())
+    if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password:
+        sys.exit(1)
+    proxies = getproxies_environment()
+    using_proxy = bool(proxies.get(url.scheme)) and not proxy_bypass(url.netloc)
+    try:
+        response = build_opener(ProxyHandler(proxies), NoRedirect()).open(
+            Request(urlunsplit(url), method="HEAD"), timeout=2
+        )
+    except HTTPError as response:
+        response.close()
+        if using_proxy and (response.code == 407 or url.scheme == "http" and response.code in (502, 504)):
+            sys.exit(2 if response.code == 407 else 3)
+    except URLError as error:
+        if using_proxy:
+            sys.exit(2 if "Tunnel connection failed: 407" in str(error.reason) else 3)
+        sys.exit(1)
+    else:
+        response.close()
+except Exception:
+    sys.exit(1)
+"""
+
+
+def _nemo_gym_policy_endpoint_error(url: str) -> str | None:
+    """Probe anonymously in a bounded child so DNS resolution cannot hang doctor."""
+    from skillevaluator.tier3.nemo_gym.backend import MODEL_URL_ENV
+
+    probe_env = {
+        name: os.environ[name] for name in ("SYSTEMROOT", "SSL_CERT_FILE", "SSL_CERT_DIR") if name in os.environ
+    }
+    for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "no_proxy", "NO_PROXY"):
+        if value := os.environ.get(name):
+            if name.lower() != "no_proxy":
+                try:
+                    parsed = urlsplit(value if "://" in value else "//" + value, scheme="http")
+                    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                        continue
+                    value = parsed._replace(netloc=parsed.netloc.rsplit("@", 1)[-1]).geturl()
+                except ValueError:
+                    continue
+            probe_env[name] = value
+    detail = "could not reach the policy endpoint"
+    try:
+        probe = subprocess.run(
+            [sys.executable, "-I", "-c", _POLICY_ENDPOINT_PROBE],
+            env=probe_env,
+            input=url,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_POLICY_ENDPOINT_PROBE_TIMEOUT_S,
+            check=False,
+        )
+        if probe.returncode == 0:
+            return None
+        if probe.returncode == 2:
+            detail = (
+                "policy endpoint proxy authentication is needed; this anonymous probe does not send proxy credentials"
+            )
+        elif probe.returncode == 3:
+            detail = "policy endpoint proxy could not reach the service; check HTTP_PROXY/HTTPS_PROXY/NO_PROXY and proxy access"
+    except subprocess.TimeoutExpired:
+        detail = f"policy endpoint probe timed out after {_POLICY_ENDPOINT_PROBE_TIMEOUT_S:g}s"
+    except OSError:
+        detail = "could not start the policy endpoint probe"
+    return (
+        f"NeMo Gym {detail}; check {MODEL_URL_ENV} or the selected provider's base URL, "
+        "start the inference service, and check network access. A policy endpoint HTTP response is sufficient; "
+        "this check does not validate credentials or model compatibility."
+    )
+
+
+def _nemo_gym_doctor_rows(
+    agents: list[str],
+    env_mode: str,
+    environment_kwargs: Mapping[str, Any],
+    *,
+    agent_model: tuple[str, ...] = (),
+) -> list[tuple[str, str, str]]:
+    """Readiness rows for ``--backend nemo-gym``: the Gym CLI, its sandbox, the policy endpoint and options."""
+    from skillevaluator.provider_config import ProviderConfigurationError
+    from skillevaluator.tier3.nemo_gym.backend import (
+        MODEL_URL_ENV,
+        NEMO_GYM_BIN_ENV,
+        model_url_credential_error,
+        nemo_gym_bin,
+        nemo_gym_capability_errors,
+        nemo_gym_cli_error,
+        nemo_gym_settings_errors,
+        nemo_gym_version,
+    )
+    from skillevaluator.tier3.nemo_gym.runner import _model_endpoint, gym_launch_environment
+
+    rows: list[tuple[str, str, str]] = []
+    gym = nemo_gym_bin()
+    if gym is None:
+        rows.append(
+            (
+                "NeMo Gym CLI",
+                "fail",
+                f"not found: set {NEMO_GYM_BIN_ENV} to a verified, pinned Gym task-folder CLI; "
+                "public nemo-gym 0.7.0 is incompatible and the candidate source still needs runtime qualification",
+            )
+        )
+    elif cli_error := nemo_gym_cli_error(gym):
+        rows.append(("NeMo Gym CLI", "fail", cli_error))
+    elif version := nemo_gym_version(gym):
+        rows.append(("NeMo Gym CLI", "pass", f"{gym} (nemo-gym {version})"))
+    else:
+        rows.append(("NeMo Gym CLI", "warn", f"{gym} (could not read the nemo-gym version)"))
+    errors = nemo_gym_capability_errors(
+        agents=agents, env_mode=env_mode, grading_mode=None, environment_kwargs=dict(environment_kwargs)
+    )
+    errors += nemo_gym_settings_errors()
+    if gym is None or rows[0][1] == "fail":
+        errors.append("NeMo Gym execution is unavailable until its CLI compatibility check passes")
+    url = os.environ.get(MODEL_URL_ENV, "").strip()
+    if url and (url_error := model_url_credential_error(url)):
+        errors.append(url_error)
+    if not errors:
+        # The same policy endpoint resolution the run uses, per agent and its --agent-model.
+        try:
+            overrides = parse_agent_model_overrides(agent_model)
+        except ValueError:
+            overrides = {}
+        checked_endpoints: set[str] = set()
+        for agent in agents:
+            try:
+                _model, endpoint_url, _key = _model_endpoint((overrides.get(agent) or [None])[0], require_model=False)
+            except (ValueError, ProviderConfigurationError) as exc:
+                errors.append(f"{agent}: {exc}")
+                continue
+            if (url_error := model_url_credential_error(endpoint_url)) and url_error not in errors:
+                errors.append(url_error)
+            elif not url_error and endpoint_url not in checked_endpoints:
+                checked_endpoints.add(endpoint_url)
+                if endpoint_error := _nemo_gym_policy_endpoint_error(endpoint_url):
+                    errors.append(f"{agent}: {endpoint_error}")
+    if env_mode == "docker" and (docker_error := _docker_daemon_error(gym_launch_environment({}))):
+        errors.append(docker_error)
+    rows += [("NeMo Gym backend", "fail", error) for error in errors] or [
+        ("NeMo Gym backend", "pass", f"{env_mode} sandbox ready")
+    ]
+    return rows
+
+
+def validate_evals(skill_path: Path, *, as_json: bool, strict: bool, harbor_contract: bool) -> int:
+    """Validate the Tier 3 evals/ directory and optional Harbor contract."""
+    results = validate_skillevaluators(skill_path)
+    if harbor_contract:
+        results.extend(validate_harbor_contract(skill_path))
+        if _allows_missing_evals_json_for_native_custom_only(skill_path):
+            results = [
+                result
+                for result in results
+                if not (
+                    result.path == "evals/evals.json"
+                    and result.status == "error"
+                    and "REQUIRED dataset file missing" in result.message
+                )
+            ]
+
+    coverage = dataset_coverage_result(skill_path)
+    if as_json:
+        data = [{"path": r.path, "status": r.status, "message": r.message} for r in results]
+        data += [coverage] if coverage is not None else []
+        console.print_json(
+            data=data,
+            ensure_ascii=json_needs_ascii(data, getattr(console.file, "encoding", None)),
+        )
+    else:
+        _print_validate_results(skill_path, results)
+        if coverage is not None:
+            console.print(Text(coverage["message"]))
+
+    has_errors = any(r.status == "error" for r in results)
+    has_warnings = any(r.status == "warning" for r in results)
+    return 1 if has_errors or (strict and has_warnings) else 0
+
+
+def _allows_missing_evals_json_for_native_custom_only(skill_path: Path) -> bool:
+    try:
+        config, _ = load_evals_config(skill_path)
+    except Exception:
+        return False
+
+    harbor = config.get("harbor") if isinstance(config, dict) else None
+    grading = config.get("grading") if isinstance(config, dict) else None
+    return (
+        isinstance(harbor, dict)
+        and isinstance(grading, dict)
+        and harbor.get("task_source") == "native_harbor"
+        and grading.get("mode") == "custom_only"
+        and (skill_path / "evals" / "harbor").is_dir()
+    )
+
+
+def _print_validate_results(skill_path: Path, results: list[Any]) -> None:
+    status_icon = {
+        "ok": ("[ok]", "green"),
+        "missing": ("[MISSING]", "red bold"),
+        "warning": ("[warn]", "yellow"),
+        "error": ("[ERROR]", "red bold"),
+    }
+
+    body = Text()
+    for result in results:
+        icon, style = status_icon.get(result.status, ("[ ? ]", "dim"))
+        body.append(f"  {icon:<10s}", style=style)
+        path_style = "bold" if result.status in ("error", "missing") else "white"
+        body.append(f"{strip_terminal_controls(str(result.path)):<38s}", style=path_style)
+        body.append(f"{strip_terminal_controls(str(result.message))}\n", style="dim")
+
+    n_ok = sum(1 for result in results if result.status == "ok")
+    n_warn = sum(1 for result in results if result.status == "warning")
+    n_err = sum(1 for result in results if result.status in ("error", "missing"))
+
+    summary = Text()
+    summary.append(f"  {n_ok} ok", style="green")
+    if n_warn:
+        summary.append(f"  {n_warn} warning(s)", style="yellow")
+    if n_err:
+        summary.append(f"  {n_err} error(s)", style="red bold")
+    if not n_err and not n_warn:
+        summary.append("  all checks passed", style="green bold")
+
+    console.print()
+    console.print(
+        Panel(
+            body,
+            # Panel parses a str title with emoji enabled whatever the console says.
+            title=Text.from_markup(f"[bold]Validate: {escape_markup(skill_path.name)}/evals/[/bold]", emoji=False),
+            border_style="cyan" if not n_err else "red",
+            padding=(1, 1),
+        )
+    )
+    console.print(summary)
+    if n_err:
+        console.print()
+        console.print("  [dim]See expected structure:[/dim] skillevaluator tier3 validate --help")
+    console.print()
+
+
+def view_results(skill_path: Path, *, results_dir: Path | None = None) -> Path:
+    """Open or generate the latest HTML report."""
+    latest = resolve_latest_results(skill_path, results_dir)
+    if not latest.exists():
+        searched = ", ".join(str(p) for p in iter_candidate_results_roots(skill_path, results_dir))
+        raise FileNotFoundError(
+            f"No results found. Searched: {searched}. Run: skillevaluator evaluate {skill_path} -a codex"
+        )
+
+    target = latest.resolve() if latest.is_symlink() else latest
+    report_path = target / "report.html"
+    if not report_path.exists():
+        from skillevaluator.evaluation.tier3_feedback_chat import _read_result_json, saved_feedback_for_run
+        from skillevaluator.evaluation.tier3_report import _TIER3_FEEDBACK_FIELDS
+
+        saved_result = _read_result_json(target)
+        saved_feedback = saved_feedback_for_run(saved_result, target)
+        # A run saves every feedback field; anything less is rebuilt as before.
+        if saved_feedback and saved_feedback.keys() == set(_TIER3_FEEDBACK_FIELDS):
+            # Rebuild with the feedback this run saved. Asking the judge again
+            # costs tokens and can change the advice; with no provider it
+            # silently drops the advice the run saved.
+            report_path = render_agent_eval_html_report(
+                skill_path,
+                target,
+                engine_result=saved_result,
+                use_llm_judge=False,
+                saved_feedback=saved_feedback,
+            )
+        else:
+            report_path = render_agent_eval_html_report(skill_path, target)
+    console.print(f"Opening: [cyan]{escape_markup(str(report_path))}[/cyan]")
+    webbrowser.open(report_path.as_uri())
+    return report_path
+
+
+def harbor_view(jobs_dir: Path) -> int:
+    """Open retained Harbor job artifacts with Harbor's trajectory browser."""
+    cmd = [_harbor_bin(), "view", str(jobs_dir.resolve())]
+    try:
+        with _harbor_launch_cwd() as launch_cwd:
+            return subprocess.call(cmd, cwd=launch_cwd, env=_harbor_launch_environment(os.environ))
+    except FileNotFoundError:
+        console.print("[red]Error: harbor binary not found.[/red]")
+        return 1
+    except PermissionError:
+        console.print("[red]Error: harbor binary is not executable.[/red]")
+        return 1
+
+
+_FEEDBACK_EXIT_WORDS = frozenset({"exit", "quit", "q", ":q"})
+
+
+def run_feedback_chat(run_dir: Path, *, skill_path: Path | None = None) -> int:
+    """Chat about one completed Tier 3 run directory; nothing is written to disk.
+
+    Returns 0 when the chat ends normally and 1 when the run or provider cannot
+    be used, or when questions were asked but every one of them failed.
+    """
+    from skillevaluator.evaluation.tier3_feedback_chat import (
+        FEEDBACK_CHAT_ASSISTANT_LABEL,
+        assert_completed_run_dir,
+        open_feedback_session,
+        resolve_skill_path_for_run,
+        skill_changed_since_run,
+    )
+
+    try:
+        resolved_run = assert_completed_run_dir(run_dir)
+        resolved_skill = resolve_skill_path_for_run(resolved_run, skill_path)
+        session = open_feedback_session(resolved_skill, resolved_run)
+    except (OSError, ValueError) as exc:
+        # ProviderConfigurationError is a ValueError. No highlighting, so
+        # messages such as "Tier 3" stay plain text.
+        error_line = Text("Error: ", style="red")
+        error_line.append(strip_terminal_controls(str(exc)))
+        console.print(error_line, highlight=False)
+        return 1
+
+    panel_body = Text()
+    panel_body.append(strip_terminal_controls(resolved_skill.name), style="bold")
+    panel_body.append(f" · {strip_terminal_controls(resolved_run.name)}\n")
+    panel_body.append(strip_terminal_controls(str(resolved_run)), style="dim")
+    console.print()
+    console.print(Panel(panel_body, title=Text("Post-run feedback"), border_style="cyan"))
+    if skill_path is not None and skill_changed_since_run(resolved_run, resolved_skill):
+        console.print(
+            Text("The skill has changed since this run; answers describe the evaluated version.", style="yellow")
+        )
+    console.print(
+        Text(
+            "Each question sends this run's evidence to the configured LLM provider. "
+            "Type exit or press Ctrl-D to quit.",
+            style="dim",
+        )
+    )
+    console.print()
+
+    while True:
+        try:
+            line = console.input("[bold cyan]You:[/bold cyan] ")
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            break
+        question = line.strip()
+        if not question:
+            continue
+        if question.lower() in _FEEDBACK_EXIT_WORDS:
+            break
+        try:
+            answer = session.reply(question)
+        except KeyboardInterrupt:
+            # The session keeps no unanswered turn; Ctrl-C at the prompt still exits.
+            console.print()
+            console.print(Text("Interrupted; that question was discarded.", style="dim"))
+            console.print()
+            continue
+        console.print()
+        # Model text is printed literally: never parsed as markup, escapes removed.
+        reply_line = Text(f"{FEEDBACK_CHAT_ASSISTANT_LABEL}: ", style="bold green")
+        reply_line.append(strip_terminal_controls(answer))
+        console.print(reply_line)
+        console.print()
+
+    return 1 if session.failed_turns and not session.answered_turns else 0
+
+
+def compare_results(skill_path: Path, *, results_dir: Path | None = None) -> int:
+    """Compare latest Harbor result scores across agents."""
+    candidate_roots = iter_candidate_results_roots(skill_path, results_dir)
+    if not any(root.exists() for root in candidate_roots):
+        searched = ", ".join(str(p) for p in candidate_roots)
+        console.print(f"[red]Error: No results found. Searched: {escape_markup(searched)}[/red]")
+        return 1
+
+    agent_with: dict[str, dict[str, float]] = {}
+    agent_without: dict[str, dict[str, float]] = {}
+    agent_meta: dict[str, dict[str, Any]] = {}
+
+    for candidate_root in candidate_roots:
+        if not candidate_root.exists():
+            continue
+        root_with: dict[str, dict[str, float]] = {}
+        root_without: dict[str, dict[str, float]] = {}
+        root_meta: dict[str, dict[str, Any]] = {}
+        for ts_dir in ordered_run_directories(candidate_root):
+            allow_missing_status = _run_timestamp(ts_dir.name) is None or is_legacy_completed_run_dir(ts_dir)
+            try:
+                agent_dirs = sorted(ts_dir.iterdir())
+            except OSError:
+                continue
+            for agent_dir in agent_dirs:
+                if not agent_dir.is_dir() or agent_dir.name.startswith("_"):
+                    continue
+                agent_name = agent_dir.name
+                if agent_name in root_with:
+                    continue
+                summary = agent_dir / "with-skill" / "summary.json"
+                if not summary.exists():
+                    summary = agent_dir / "summary.json"
+                if not summary.exists():
+                    continue
+                try:
+                    data = json.loads(summary.read_text(encoding="utf-8"))
+                except (ValueError, OSError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                scores = _summary_scores(data, allow_missing_status=allow_missing_status)
+                overall = _summary_overall(data) if _summary_is_scoreable(data, allow_missing_status) else None
+                if scores or overall is not None:
+                    root_with[agent_name] = scores
+                    root_meta[agent_name] = {
+                        "timestamp": ts_dir.name,
+                        "path": str(agent_dir),
+                        "num_trials": data.get("num_trials", "?"),
+                        "overall_with_skill": overall,
+                        "score_policy_with_skill": _summary_score_policy(data),
+                        "standard_metrics": _summary_standard_metrics(data),
+                        "custom_only": _summaries_are_custom_only([data]),
+                        "not_applicable_with_skill": not_applicable_list(data.get("not_applicable_metrics")),
+                    }
+                    wo_summary = agent_dir / "without-skill" / "summary.json"
+                    if wo_summary.exists():
+                        try:
+                            wo_data = json.loads(wo_summary.read_text(encoding="utf-8"))
+                            if isinstance(wo_data, dict):
+                                root_meta[agent_name]["custom_only"] = _summaries_are_custom_only([data, wo_data])
+                            wo_scores = _summary_scores(
+                                wo_data,
+                                allow_missing_status=allow_missing_status,
+                            )
+                            wo_overall = (
+                                _summary_overall(wo_data)
+                                if isinstance(wo_data, dict) and _summary_is_scoreable(wo_data, allow_missing_status)
+                                else None
+                            )
+                            if (wo_scores or wo_overall is not None) and (
+                                _effective_compare_policy(
+                                    root_meta[agent_name]["score_policy_with_skill"], root_with[agent_name]
+                                )
+                                == _effective_compare_policy(_summary_score_policy(wo_data), wo_scores)
+                            ):
+                                root_without[agent_name] = wo_scores
+                                root_meta[agent_name].update(
+                                    {
+                                        "overall_without_skill": wo_overall,
+                                        "score_policy_without_skill": _summary_score_policy(wo_data),
+                                        "not_applicable_without_skill": not_applicable_list(
+                                            wo_data.get("not_applicable_metrics")
+                                        ),
+                                    }
+                                )
+                        except (ValueError, OSError):
+                            pass
+        if root_with:
+            agent_with, agent_without, agent_meta = root_with, root_without, root_meta
+            break
+
+    if not agent_with:
+        console.print("[red]No agent results found. Run skillevaluator evaluate first.[/red]")
+        return 1
+
+    agents = sorted(agent_with)
+    # Custom-only agents are compared by their grader's own overall, as in the
+    # canonical report. Standard agents must share one policy and metric set.
+    standard_agents = [agent for agent in agents if not agent_meta[agent].get("custom_only")]
+    comparison_policies = {
+        _effective_compare_policy(agent_meta[agent].get("score_policy_with_skill"), agent_with[agent])
+        for agent in standard_agents
+    }
+    if len(comparison_policies) > 1:
+        console.print(
+            "[red]Cannot compare overall scores across agents with different score policies. "
+            "Rerun the agents under one policy.[/red]"
+        )
+        return 1
+    comparison_metric_sets = {agent_meta[agent].get("standard_metrics") for agent in standard_agents}
+    if len(comparison_metric_sets) > 1:
+        console.print(
+            "[red]Cannot compare overall scores across agents scored on different metric sets. "
+            "Rerun the agents with one metric set.[/red]"
+        )
+        return 1
+    display_metrics, overall_metrics = _display_metrics(agent_with)
+
+    table = Table(show_header=True, header_style="bold dim", box=SIMPLE, padding=(0, 1), show_edge=False, expand=True)
+    table.add_column("Evaluator", style="white", min_width=18, no_wrap=True)
+    for agent in agents:
+        table.add_column(f"{escape_markup(agent)}\nscore", justify="right", min_width=7)
+        if agent in agent_without:
+            table.add_column("\nlift", justify="right", min_width=7)
+
+    for metric in display_metrics:
+        row: list[str | Text] = [Text(strip_terminal_controls(metric))]
+        for agent in agents:
+            with_score = _safe_score(agent_with[agent], metric)
+            row.append(
+                Text(f"{with_score:.2f}", style=f"bold {_score_style(with_score)}")
+                if with_score is not None
+                else Text("-", style="dim")
+            )
+            if agent in agent_without:
+                without_score = _safe_score(agent_without[agent], metric)
+                delta = with_score - without_score if with_score is not None and without_score is not None else None
+                if delta is None:
+                    row.append(Text("-", style="dim"))
+                elif delta > 0:
+                    row.append(Text(f"+{delta:.2f}", style="green"))
+                elif delta < 0:
+                    row.append(Text(f"{delta:.2f}", style="red"))
+                else:
+                    row.append(Text("  -", style="dim"))
+        table.add_row(*row)
+
+    table.add_row(*[""] * (1 + sum(2 if agent in agent_without else 1 for agent in agents)))
+    overall_row: list[str | Text] = [Text("Overall", style="bold")]
+    lift_json_agents: list[str] = []
+    for agent in agents:
+        meta = agent_meta[agent]
+        with_avg = _overall_score_for_display(
+            agent_with[agent],
+            overall_metrics,
+            persisted_overall=meta.get("overall_with_skill"),
+            score_policy=meta.get("score_policy_with_skill"),
+        )
+        overall_row.append(
+            Text(f"{with_avg:.2f}", style=f"bold {_score_style(with_avg)}")
+            if with_avg is not None
+            else Text("-", style="dim")
+        )
+        if agent in agent_without:
+            without_avg = _overall_score_for_display(
+                agent_without[agent],
+                overall_metrics,
+                persisted_overall=meta.get("overall_without_skill"),
+                score_policy=meta.get("score_policy_without_skill"),
+            )
+            uses_lift_json, shared_lift = _shared_dimension_overall_lift(
+                agent_with[agent], agent_without[agent], overall_metrics, meta
+            )
+            if uses_lift_json and shared_lift is not None:
+                lift_json_agents.append(agent)
+                overall_row.append(_lift_text(shared_lift))
+            elif uses_lift_json or with_avg is None or without_avg is None:
+                overall_row.append(Text("-", style="dim"))
+            else:
+                delta = with_avg - without_avg
+                delta_text = f"+{delta:.2f}" if delta > 0 else f"{delta:.2f}"
+                delta_style = "bold green" if delta > 0 else ("bold red" if delta < 0 else "bold dim")
+                overall_row.append(Text(delta_text, style=delta_style))
+    table.add_row(*overall_row)
+
+    console.print()
+    console.print(
+        Panel(
+            table,
+            title=Text.from_markup(f"[bold]Skill Evaluation - {escape_markup(skill_path.name)}[/bold]", emoji=False),
+            border_style="cyan",
+            padding=(1, 1),
+        )
+    )
+    console.print()
+    for agent in agents:
+        meta = agent_meta[agent]
+        # Pad before escaping so escape backslashes do not count toward the column width.
+        run_line = f"{agent:<16s} {meta['timestamp']} (Harbor, {meta.get('num_trials', '?')} trials)"
+        console.print(f"  [dim]{escape_markup(run_line)}[/dim]")
+    if lift_json_agents:
+        console.print(
+            f"  [dim]Overall lift for {escape_markup(', '.join(lift_json_agents))} compares only the "
+            "dimensions both arms scored, as in lift.json and the reports.[/dim]"
+        )
+    console.print()
+    return 0
+
+
+def _shared_dimension_overall_lift(
+    with_scores: dict[str, float],
+    without_scores: dict[str, float],
+    metrics: tuple[str, ...],
+    meta: dict[str, Any],
+) -> tuple[bool, float | None]:
+    """Return the canonical standard-policy Overall lift when shared metrics differ."""
+    shared_not_applicable = sorted(
+        {*meta.get("not_applicable_with_skill", ()), *meta.get("not_applicable_without_skill", ())}
+    )
+    if (
+        not shared_not_applicable
+        or metrics != DEFAULT_METRICS
+        or meta.get("score_policy_with_skill") != DEFAULT_SCORE_POLICY
+        or meta.get("score_policy_without_skill") != DEFAULT_SCORE_POLICY
+    ):
+        return False, None
+    agent_path = meta.get("path")
+    if not isinstance(agent_path, str) or not agent_path:
+        return True, None
+    try:
+        lift_data = json.loads((Path(agent_path) / "lift.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True, None
+    if not isinstance(lift_data, dict) or not isinstance(lift_data.get("overall"), dict):
+        return True, None
+    return True, _finite_numeric(lift_data["overall"].get("delta"))
+
+
+def _lift_text(delta: float) -> Text:
+    delta_text = f"+{delta:.2f}" if delta > 0 else f"{delta:.2f}"
+    delta_style = "bold green" if delta > 0 else ("bold red" if delta < 0 else "bold dim")
+    return Text(delta_text, style=delta_style)
+
+
+def _summary_scores(data: dict[str, Any], *, allow_missing_status: bool = False) -> dict[str, float]:
+    if not isinstance(data, dict):
+        return {}
+    if not _summary_is_scoreable(data, allow_missing_status):
+        return {}
+    scores: dict[str, float] = {}
+    raw_scores = data.get("scores", data)
+    if isinstance(raw_scores, dict):
+        for key, value in raw_scores.items():
+            numeric = _unit_interval_score(value) if key in DEFAULT_METRICS else _finite_numeric(value)
+            if numeric is not None:
+                scores[str(key)] = numeric
+    custom_scores = data.get("custom_scores")
+    if isinstance(custom_scores, dict):
+        for key, value in custom_scores.items():
+            if (numeric := _finite_numeric(value)) is not None:
+                scores[f"custom: {key}"] = numeric
+    return scores
+
+
+def _summary_is_scoreable(data: dict[str, Any], allow_missing_status: bool) -> bool:
+    status = data.get("execution_status")
+    return status == "succeeded" or (allow_missing_status and status is None)
+
+
+def _finite_numeric(value: object) -> float | None:
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except OverflowError:
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def _summary_overall(data: dict[str, Any]) -> float | None:
+    return _unit_interval_score(data.get("overall_score"))
+
+
+def _summary_score_policy(data: dict[str, Any]) -> str | None:
+    value = data.get("score_policy")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _summary_standard_metrics(data: dict[str, Any]) -> frozenset[str]:
+    """Return the standard metric set one condition summary declares."""
+    metrics = data.get("metrics")
+    if isinstance(metrics, list):
+        return frozenset(str(metric) for metric in metrics)
+    metric_set = data.get("metric_set")
+    if metric_set == DEFAULT_METRIC_SET:
+        return frozenset(DEFAULT_METRICS)
+    if metric_set == LEGACY_METRIC_SET:
+        return frozenset(LEGACY_METRICS)
+    if metric_set == CUSTOM_ONLY_METRIC_SET:
+        return frozenset()
+    scores = data.get("scores")
+    return frozenset(metric for metric in DEFAULT_METRICS if isinstance(scores, dict) and metric in scores)
+
+
+def _summaries_are_custom_only(summaries: list[dict[str, Any]]) -> bool:
+    """Return whether every condition of an agent is scored only by its custom grader.
+
+    Recorded policies win; without them, no condition may declare standard metrics.
+    """
+    recorded = {policy for summary in summaries if (policy := _summary_score_policy(summary))}
+    if recorded:
+        return recorded == {CUSTOM_SCORE_POLICY}
+    return not any(_summary_standard_metrics(summary) for summary in summaries)
+
+
+def _effective_compare_policy(policy: object, scores: dict[str, float]) -> str:
+    """Treat unversioned complete SkillEvaluator summaries as historical scores."""
+    if isinstance(policy, str) and policy.strip():
+        return policy.strip()
+    if any(metric in scores for metric in DEFAULT_METRICS):
+        return LEGACY_SCORE_POLICY if set(DEFAULT_METRICS).issubset(scores) else PARTIAL_SCORE_POLICY
+    return CUSTOM_SCORE_POLICY
+
+
+def _display_metrics(agent_with: dict[str, dict[str, float]]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    has_default_scores = any(any(metric in scores for metric in DEFAULT_METRICS) for scores in agent_with.values())
+    if has_default_scores:
+        default_metrics = (
+            DEFAULT_METRICS if any("security" in scores for scores in agent_with.values()) else LEGACY_METRICS
+        )
+        custom_metrics = tuple(
+            sorted(metric for scores in agent_with.values() for metric in scores if metric.startswith("custom: "))
+        )
+        return (*default_metrics, *custom_metrics), default_metrics
+    metrics = tuple(sorted({metric for scores in agent_with.values() for metric in scores}))
+    return metrics, metrics
+
+
+def _safe_score(scores: dict[str, float], metric: str) -> float | None:
+    return _finite_numeric(scores.get(metric))
+
+
+def _unit_interval_score(value: object) -> float | None:
+    """Return a finite score in the documented 0.0 to 1.0 range."""
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except OverflowError:
+        return None
+    return numeric if math.isfinite(numeric) and 0.0 <= numeric <= 1.0 else None
+
+
+def _overall_score_for_display(
+    scores: dict[str, float],
+    metrics: tuple[str, ...],
+    *,
+    persisted_overall: object = None,
+    score_policy: object = DEFAULT_SCORE_POLICY,
+) -> float | None:
+    """Honor persisted score truth before inferring a policy from metric names."""
+    recorded_overall = _unit_interval_score(persisted_overall)
+
+    if score_policy == DEFAULT_SCORE_POLICY:
+        score = overall_score_from_metrics(scores, metrics)
+        if score is not None:
+            return score
+
+    if recorded_overall is not None:
+        return recorded_overall
+
+    if score_policy == LEGACY_SCORE_POLICY or (score_policy is None and metrics == DEFAULT_METRICS):
+        values = tuple(_safe_score(scores, metric) for metric in metrics)
+        if values and all(value is not None for value in values):
+            return round(sum(value for value in values if value is not None) / len(values), 4)
+
+    if score_policy is None:
+        return overall_score_from_metrics(scores, metrics)
+    return None
+
+
+def _score_style(score: float) -> str:
+    if score >= 0.8:
+        return "green"
+    if score >= 0.5:
+        return "yellow"
+    return "red"
+
+
+__all__ = [
+    "compare_results",
+    "create_dataset",
+    "doctor",
+    "evaluate",
+    "harbor_view",
+    "init_custom_grader",
+    "init_harbor_task",
+    "parse_agents",
+    "parse_environment_kwargs",
+    "run_feedback_chat",
+    "validate_evals",
+    "view_results",
+]

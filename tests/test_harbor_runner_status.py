@@ -1,0 +1,2852 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Harbor subprocess completion is not sufficient proof of successful trials."""
+
+from __future__ import annotations
+
+import contextlib
+import importlib
+import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from collections.abc import Callable
+from pathlib import Path
+
+import pytest
+
+from skillevaluator.tier3.harbor import collector, runner
+
+
+def test_published_execution_errors_are_redacted_bounded_and_counted() -> None:
+    github_token = "ghp_" + ("A" * 36)
+    errors = [f"launch failed with {github_token} " + ("x" * 65_536)]
+    errors.extend(f"distinct launch error {index}" for index in range(300))
+
+    published, total = runner._published_execution_errors(errors)
+
+    assert total == 301
+    assert len(published) == runner.PUBLISHED_EXECUTION_ERRORS_MAX
+    assert all(len(error) <= runner.PUBLISHED_EXECUTION_ERROR_MAX_CHARS for error in published)
+    assert github_token not in json.dumps(published)
+    assert "<redacted>" in published[0]
+
+
+def test_published_execution_errors_bound_serialized_multibyte_sample() -> None:
+    github_token = "ghp_" + ("A" * 36)
+    errors = [
+        f"launch {index}: {github_token}\x1b[2J" + ("😀" * 2_048)
+        for index in range(runner.PUBLISHED_EXECUTION_ERRORS_MAX)
+    ]
+
+    published, total = runner._published_execution_errors(errors)
+    serialized = json.dumps(published, indent=2).encode("utf-8")
+
+    assert total == runner.PUBLISHED_EXECUTION_ERRORS_MAX
+    assert len(serialized) <= 64 * 1024
+    assert len(published) < total
+    assert github_token.encode() not in serialized
+    assert b"\\u001b" not in serialized
+    assert b"[2J" in serialized
+
+
+def test_published_execution_errors_count_distinct_details_beyond_truncation() -> None:
+    shared_prefix = "x" * (runner.PUBLISHED_EXECUTION_ERROR_MAX_CHARS * 2)
+
+    published, total = runner._published_execution_errors([f"{shared_prefix}-first", f"{shared_prefix}-second"])
+
+    assert total == 2
+    assert len(published) == 1
+
+
+def test_launch_error_overlay_preserves_hidden_collector_count_and_adds_new_diagnostics() -> None:
+    result = {
+        "execution_status": "failed",
+        "execution_errors": ["shared visible error"],
+        "execution_error_details_total": 302,
+        "execution_error_details_shown": 1,
+        "execution_error_details_truncated": True,
+        "error": ["shared visible error"],
+    }
+
+    runner._merge_launch_execution_errors(
+        result,
+        ["shared visible error", "new launch diagnostic"],
+    )
+
+    assert result["execution_status"] == "failed"
+    assert result["execution_errors"] == ["shared visible error", "new launch diagnostic"]
+    assert result["execution_error_details_total"] == 303
+    assert result["execution_error_details_shown"] == 2
+    assert result["execution_error_details_truncated"] is True
+    assert result["error"] == ["shared visible error"]
+
+
+@pytest.mark.parametrize(
+    ("declared_total", "expected_total", "expected_truncated"),
+    [
+        (True, 2, False),
+        (-1, 2, False),
+        (1.5, 2, False),
+        ((1 << 60), (1 << 53) - 1, True),
+    ],
+    ids=["bool", "negative", "float", "above-json-safe-integer"],
+)
+def test_launch_error_overlay_bounds_declared_integer_metadata(
+    declared_total: object,
+    expected_total: int,
+    expected_truncated: bool,
+) -> None:
+    result = {
+        "execution_errors": ["collector diagnostic"],
+        "execution_error_details_total": declared_total,
+        "execution_error_details_truncated": False,
+    }
+
+    runner._merge_launch_execution_errors(result, ["launch diagnostic"])
+
+    assert result["execution_error_details_total"] == expected_total
+    assert result["execution_error_details_shown"] == 2
+    assert result["execution_error_details_truncated"] is expected_truncated
+
+
+@pytest.mark.parametrize("return_code", [0, 7])
+def test_bounded_harbor_process_preserves_exit_and_combined_diagnostic_tail(
+    return_code: int,
+) -> None:
+    script = (
+        "import os; "
+        "os.write(1, b'old-prefix-' + b'x' * 256); "
+        "os.write(2, b'|useful-stderr-tail|'); "
+        f"raise SystemExit({return_code})"
+    )
+
+    result = runner._run_bounded_harbor_process(
+        [sys.executable, "-c", script],
+        env=dict(os.environ),
+        cwd=Path.cwd(),
+        stdin_text=None,
+        timeout_seconds=5,
+        max_output_bytes=4096,
+        diagnostic_tail_chars=64,
+        secret_values=set(),
+    )
+
+    assert result.returncode == return_code
+    assert result.output_exceeded is False
+    assert len(result.output_tail) <= 64
+    assert result.output_tail.endswith("|useful-stderr-tail|")
+
+
+def test_bounded_harbor_process_redacts_before_retaining_diagnostic_tail() -> None:
+    secret = "SYNTHETIC_SECRET_ABCDEF"
+    script = f"import os; os.write(2, {('X' + secret + '|' + secret + '!' * 8).encode()!r})"
+
+    result = runner._run_bounded_harbor_process(
+        [sys.executable, "-c", script],
+        env=dict(os.environ),
+        cwd=Path.cwd(),
+        stdin_text=None,
+        timeout_seconds=5,
+        max_output_bytes=4096,
+        diagnostic_tail_chars=43,
+        secret_values={secret},
+    )
+
+    assert result.returncode == 0
+    assert result.output_exceeded is False
+    assert secret not in result.output_tail
+    assert all(secret[index:] not in result.output_tail for index in range(len(secret) - 3))
+    assert result.output_tail.endswith("!" * 8)
+
+
+def test_bounded_harbor_process_drops_partial_secret_at_output_limit() -> None:
+    secret = "SYNTHETIC_SECRET_ABCDEF"
+    prefix = "ordinary-prefix|"
+    accepted_secret_prefix = secret[:-3]
+    script = f"import os,time; os.write(2, {(prefix + secret + '|overflow').encode()!r}); time.sleep(30)"
+
+    result = runner._run_bounded_harbor_process(
+        [sys.executable, "-c", script],
+        env=dict(os.environ),
+        cwd=Path.cwd(),
+        stdin_text=None,
+        timeout_seconds=5,
+        max_output_bytes=len((prefix + accepted_secret_prefix).encode()),
+        diagnostic_tail_chars=128,
+        secret_values={secret},
+    )
+
+    assert result.output_exceeded is True
+    assert accepted_secret_prefix not in result.output_tail
+    assert all(secret[index:-3] not in result.output_tail for index in range(len(secret) - 6))
+
+
+def test_bounded_harbor_process_timeout_includes_blocked_stdin_delivery() -> None:
+    started = time.monotonic()
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        runner._run_bounded_harbor_process(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            env=dict(os.environ),
+            cwd=Path.cwd(),
+            stdin_text="x" * (1024 * 1024),
+            timeout_seconds=0.1,
+            max_output_bytes=4096,
+            diagnostic_tail_chars=128,
+            secret_values=set(),
+        )
+
+    assert time.monotonic() - started < 3
+
+
+def test_bounded_harbor_process_contains_tree_after_stdin_delivery_error() -> None:
+    started = time.monotonic()
+
+    with pytest.raises(RuntimeError, match="stdin delivery failed"):
+        runner._run_bounded_harbor_process(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            env=dict(os.environ),
+            cwd=Path.cwd(),
+            stdin_text="\udcff",
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            diagnostic_tail_chars=128,
+            secret_values=set(),
+        )
+
+    assert time.monotonic() - started < 3
+
+
+def test_bounded_harbor_process_timeout_preserves_redacted_diagnostic_tail(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    secret = "synthetic-timeout-secret"
+    ready_path = tmp_path / "diagnostic-ready"
+    script = (
+        "import os,pathlib,time;"
+        f"os.write(2,{f'useful timeout diagnostic {secret}'.encode()!r});"
+        f"pathlib.Path({str(ready_path)!r}).touch();"
+        "time.sleep(30)"
+    )
+    real_popen = runner.subprocess.Popen
+
+    def ready_popen(*args: object, **kwargs: object) -> object:
+        process = real_popen(*args, **kwargs)
+        # This test needs emitted output, not a guarantee that Python starts
+        # within 100 ms on a loaded runner. Leave the real output pipe unread.
+        deadline = time.monotonic() + 10
+        try:
+            while not ready_path.exists():
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError("diagnostic fixture did not become ready")
+                time.sleep(0.01)
+        except BaseException:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+            if process.stdout is not None:
+                process.stdout.close()
+            raise
+        return process
+
+    monkeypatch.setattr(runner.subprocess, "Popen", ready_popen)
+
+    with pytest.raises(RuntimeError, match="timed out") as raised:
+        runner._run_bounded_harbor_process(
+            [sys.executable, "-c", script],
+            env=dict(os.environ),
+            cwd=Path.cwd(),
+            stdin_text=None,
+            timeout_seconds=0.1,
+            max_output_bytes=4096,
+            diagnostic_tail_chars=128,
+            secret_values={secret},
+        )
+
+    detail = str(raised.value)
+    assert "useful timeout diagnostic" in detail
+    assert secret not in detail
+    assert "redacted" in detail.lower()
+
+
+def test_bounded_harbor_process_redacts_secret_created_by_timeout_message() -> None:
+    secret = "Harbor run timed out after 0.1 seconds"
+
+    with pytest.raises(runner._HarborRunTimeoutError) as raised:
+        runner._run_bounded_harbor_process(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            env=dict(os.environ),
+            cwd=Path.cwd(),
+            stdin_text=None,
+            timeout_seconds=0.1,
+            max_output_bytes=4096,
+            diagnostic_tail_chars=128,
+            secret_values={secret},
+        )
+
+    detail = str(raised.value)
+    assert secret not in detail
+    assert "redacted" in detail.lower()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX cleanup for the red-state fallback")
+@pytest.mark.parametrize("failed_start", [1, 2])
+def test_bounded_harbor_process_owns_cleanup_during_thread_start(
+    monkeypatch: pytest.MonkeyPatch,
+    failed_start: int,
+) -> None:
+    real_popen = runner.subprocess.Popen
+    processes: list[object] = []
+    started_threads: list[threading.Thread] = []
+    start_count = 0
+
+    def tracked_popen(*args: object, **kwargs: object) -> object:
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    real_thread_start = threading.Thread.start
+
+    def failing_thread_start(thread: threading.Thread) -> None:
+        nonlocal start_count
+        start_count += 1
+        if start_count == failed_start:
+            raise RuntimeError("synthetic thread exhaustion")
+        real_thread_start(thread)
+        started_threads.append(thread)
+
+    monkeypatch.setattr(runner.subprocess, "Popen", tracked_popen)
+    monkeypatch.setattr(threading.Thread, "start", failing_thread_start)
+
+    try:
+        with pytest.raises(RuntimeError, match="synthetic thread exhaustion"):
+            runner._run_bounded_harbor_process(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                env=dict(os.environ),
+                cwd=Path.cwd(),
+                stdin_text="payload",
+                timeout_seconds=5,
+                max_output_bytes=4096,
+                diagnostic_tail_chars=128,
+                secret_values=set(),
+            )
+
+        assert len(processes) == 1
+        assert processes[0].poll() is not None  # type: ignore[attr-defined]
+        assert all(not thread.is_alive() for thread in started_threads)
+    finally:
+        for process in processes:
+            if process.poll() is None:  # type: ignore[attr-defined]
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)  # type: ignore[attr-defined]
+            with contextlib.suppress(Exception):
+                process.wait(timeout=5)  # type: ignore[attr-defined]
+            for stream_name in ("stdin", "stdout"):
+                stream = getattr(process, stream_name, None)
+                if stream is not None:
+                    with contextlib.suppress(OSError):
+                        stream.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process-group verification")
+@pytest.mark.parametrize("failure_mode", ["output", "timeout"])
+def test_bounded_harbor_process_failure_reaps_descendants(
+    tmp_path: Path,
+    failure_mode: str,
+) -> None:
+    child_pid_path = tmp_path / f"{failure_mode}-child-pid"
+    child_marker = tmp_path / f"{failure_mode}-child-survived"
+    child_script = (
+        "import pathlib,signal,time;"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        "time.sleep(1);"
+        f"pathlib.Path({str(child_marker)!r}).write_text('survived')"
+    )
+    parent_script = (
+        "import os,pathlib,subprocess,sys,time;"
+        f"child=subprocess.Popen([{sys.executable!r},'-c',{child_script!r}]);"
+        f"pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid));"
+        + ("os.write(1,b'a'*3000);os.write(2,b'b'*3000);" if failure_mode == "output" else "")
+        + "time.sleep(30)"
+    )
+
+    started = time.monotonic()
+    if failure_mode == "timeout":
+        with pytest.raises(RuntimeError, match="timed out"):
+            runner._run_bounded_harbor_process(
+                [sys.executable, "-c", parent_script],
+                env=dict(os.environ),
+                cwd=Path.cwd(),
+                stdin_text=None,
+                timeout_seconds=1,
+                max_output_bytes=4096,
+                diagnostic_tail_chars=128,
+                secret_values=set(),
+            )
+    else:
+        result = runner._run_bounded_harbor_process(
+            [sys.executable, "-c", parent_script],
+            env=dict(os.environ),
+            cwd=Path.cwd(),
+            stdin_text=None,
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            diagnostic_tail_chars=128,
+            secret_values=set(),
+        )
+        assert result.output_exceeded is True
+    assert time.monotonic() - started < 3
+
+    child_pid = int(child_pid_path.read_text(encoding="ascii"))
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(child_pid, signal.SIGKILL)
+        pytest.fail("Harbor descendant survived process-tree containment")
+    time.sleep(1.05)
+    assert not child_marker.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process-group verification")
+def test_bounded_harbor_process_cancellation_reaps_descendants(tmp_path: Path) -> None:
+    child_pid_path = tmp_path / "cancelled-child-pid"
+    child_marker = tmp_path / "cancelled-child-survived"
+    child_script = (
+        "import pathlib,signal,time;"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        "time.sleep(1);"
+        f"pathlib.Path({str(child_marker)!r}).write_text('survived')"
+    )
+    parent_script = (
+        "import pathlib,subprocess,sys,time;"
+        f"child=subprocess.Popen([{sys.executable!r},'-c',{child_script!r}]);"
+        f"pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid));"
+        "time.sleep(30)"
+    )
+    cancellation = runner._HarborRunCancellation()
+
+    def cancel_once_child_started() -> None:
+        deadline = time.monotonic() + 10
+        while not child_pid_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        cancellation.requested.set()
+
+    canceller = threading.Thread(target=cancel_once_child_started, daemon=True)
+    canceller.start()
+    with pytest.raises(runner._HarborRunCancelledError):
+        runner._run_bounded_harbor_process(
+            [sys.executable, "-c", parent_script],
+            env=dict(os.environ),
+            cwd=Path.cwd(),
+            stdin_text=None,
+            timeout_seconds=None,
+            max_output_bytes=4096,
+            diagnostic_tail_chars=128,
+            secret_values=set(),
+            cancellation=cancellation,
+        )
+    canceller.join(timeout=5)
+
+    child_pid = int(child_pid_path.read_text(encoding="ascii"))
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(child_pid, signal.SIGKILL)
+        pytest.fail("Harbor descendant survived cancellation")
+    time.sleep(1.05)
+    assert not child_marker.exists()
+
+
+def _sigterm_handling_harbor_script(ready_path: Path, *, on_sigterm: list[str]) -> str:
+    """Stand-in Harbor CLI that reports readiness and handles SIGTERM itself."""
+    handler = "".join(f"    {line}\n" for line in on_sigterm)
+    return (
+        "import pathlib,signal,sys,time\n"
+        "def stop(*_):\n"
+        f"{handler}"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        f"pathlib.Path({str(ready_path)!r}).write_text('ready')\n"
+        "time.sleep(120)\n"
+    )
+
+
+def _cancel_when_ready(
+    ready_path: Path,
+    cancellation: runner._HarborRunCancellation,
+    *,
+    force_after_seconds: float | None = None,
+) -> threading.Thread:
+    def cancel() -> None:
+        deadline = time.monotonic() + 30
+        while not ready_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        cancellation.requested.set()
+        if force_after_seconds is not None:
+            time.sleep(force_after_seconds)
+            cancellation.forced.set()
+
+    canceller = threading.Thread(target=cancel, daemon=True)
+    canceller.start()
+    return canceller
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX SIGTERM delivery")
+def test_bounded_harbor_process_cancellation_lets_harbor_finish_cleanup(tmp_path: Path) -> None:
+    # Harbor maps SIGTERM to KeyboardInterrupt and then stops its trial
+    # environments. Cancellation must wait for that instead of killing the
+    # group after the short timeout grace.
+    ready_path = tmp_path / "ready"
+    cleanup_marker = tmp_path / "cleanup-finished"
+    script = _sigterm_handling_harbor_script(
+        ready_path,
+        on_sigterm=[
+            "time.sleep(0.5)",
+            f"pathlib.Path({str(cleanup_marker)!r}).write_text('done')",
+            "sys.exit(0)",
+        ],
+    )
+    cancellation = runner._HarborRunCancellation()
+    canceller = _cancel_when_ready(ready_path, cancellation)
+
+    with pytest.raises(runner._HarborRunCancelledError) as exc_info:
+        runner._run_bounded_harbor_process(
+            [sys.executable, "-c", script],
+            env=dict(os.environ),
+            cwd=tmp_path,
+            stdin_text=None,
+            timeout_seconds=None,
+            max_output_bytes=4096,
+            diagnostic_tail_chars=128,
+            secret_values=set(),
+            cancellation=cancellation,
+        )
+    canceller.join(timeout=5)
+
+    assert cleanup_marker.read_text(encoding="utf-8") == "done"
+    assert not getattr(exc_info.value, "__notes__", [])
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX SIGTERM delivery")
+@pytest.mark.parametrize("ending", ["forced", "grace-expired"])
+def test_bounded_harbor_process_cancellation_kills_harbor_that_ignores_sigterm(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    ending: str,
+) -> None:
+    ready_path = tmp_path / "ready"
+    script = _sigterm_handling_harbor_script(ready_path, on_sigterm=["pass"])
+    if ending == "forced":
+        # A second Ctrl+C must not wait out the cleanup grace period.
+        monkeypatch.setattr(runner, "_HARBOR_RUN_CANCEL_GRACE_SECONDS", 300.0)
+        force_after_seconds: float | None = 0.2
+    else:
+        monkeypatch.setattr(runner, "_HARBOR_RUN_CANCEL_GRACE_SECONDS", 0.3)
+        force_after_seconds = None
+    cancellation = runner._HarborRunCancellation()
+    canceller = _cancel_when_ready(ready_path, cancellation, force_after_seconds=force_after_seconds)
+    started = time.monotonic()
+
+    with pytest.raises(runner._HarborRunCancelledError) as exc_info:
+        runner._run_bounded_harbor_process(
+            [sys.executable, "-c", script],
+            env=dict(os.environ),
+            cwd=tmp_path,
+            stdin_text=None,
+            timeout_seconds=None,
+            max_output_bytes=4096,
+            diagnostic_tail_chars=128,
+            secret_values=set(),
+            cancellation=cancellation,
+        )
+    canceller.join(timeout=5)
+
+    # The stand-in sleeps for 120 s, so returning sooner proves SIGKILL.
+    assert time.monotonic() - started < 60
+    assert not getattr(exc_info.value, "__notes__", [])
+
+
+def test_bounded_harbor_process_never_launches_after_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    launched: list[object] = []
+    monkeypatch.setattr(runner.subprocess, "Popen", lambda *args, **_kwargs: launched.append(args))
+    cancellation = runner._HarborRunCancellation()
+    cancellation.requested.set()
+
+    with pytest.raises(runner._HarborRunCancelledError):
+        runner._run_bounded_harbor_process(
+            [sys.executable, "-c", "pass"],
+            env=dict(os.environ),
+            cwd=Path.cwd(),
+            stdin_text=None,
+            timeout_seconds=None,
+            max_output_bytes=4096,
+            diagnostic_tail_chars=128,
+            secret_values=set(),
+            cancellation=cancellation,
+        )
+
+    assert launched == []
+
+
+def test_run_harbor_checks_cancellation_before_refreshing_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    refreshed: list[object] = []
+
+    def refresh(*args: object, **kwargs: object) -> None:
+        refreshed.append((args, kwargs))
+
+    def launch(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Harbor launched after cancellation")
+
+    monkeypatch.setattr(runner, "refresh_host_vertex_adc_environment", refresh)
+    monkeypatch.setattr(runner, "_run_bounded_harbor_process", launch)
+    cancellation = runner._HarborRunCancellation()
+    cancellation.requested.set()
+
+    with pytest.raises(runner._HarborRunCancelledError):
+        runner._run_harbor(
+            dataset=tmp_path / "dataset",
+            agent="opencode",
+            job_name="demo-opencode-with",
+            env_mode="docker",
+            model="nvidia/openai/gpt-oss-120b",
+            jobs_dir=tmp_path / "jobs",
+            run_env={},
+            n_attempts=1,
+            n_concurrent=1,
+            timeout_multiplier=1.0,
+            override_cpus=None,
+            override_memory_mb=None,
+            override_storage_mb=None,
+            cancellation=cancellation,
+        )
+
+    assert refreshed == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows taskkill tree verification")
+@pytest.mark.parametrize("failure_mode", ["output", "timeout"])
+def test_bounded_harbor_process_failure_reaps_windows_descendants(
+    tmp_path: Path,
+    failure_mode: str,
+) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    child_pid_path = tmp_path / f"{failure_mode}-windows-child-pid"
+    child_marker = tmp_path / f"{failure_mode}-windows-child-survived"
+    child_script = f"import pathlib,time;time.sleep(1);pathlib.Path({str(child_marker)!r}).write_text('survived')"
+    parent_script = (
+        "import os,pathlib,subprocess,sys,time;"
+        f"child=subprocess.Popen([{sys.executable!r},'-c',{child_script!r}]);"
+        f"pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid));"
+        + ("os.write(1,b'a'*3000);os.write(2,b'b'*3000);" if failure_mode == "output" else "")
+        + "time.sleep(30)"
+    )
+
+    if failure_mode == "timeout":
+        with pytest.raises(RuntimeError, match="timed out"):
+            runner._run_bounded_harbor_process(
+                [sys.executable, "-c", parent_script],
+                env=dict(os.environ),
+                cwd=Path.cwd(),
+                stdin_text=None,
+                timeout_seconds=1,
+                max_output_bytes=4096,
+                diagnostic_tail_chars=128,
+                secret_values=set(),
+            )
+    else:
+        result = runner._run_bounded_harbor_process(
+            [sys.executable, "-c", parent_script],
+            env=dict(os.environ),
+            cwd=Path.cwd(),
+            stdin_text=None,
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            diagnostic_tail_chars=128,
+            secret_values=set(),
+        )
+        assert result.output_exceeded is True
+
+    child_pid = int(child_pid_path.read_text(encoding="ascii"))
+    process_query_limited_information = 0x1000
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        handle = kernel32.OpenProcess(
+            process_query_limited_information,
+            False,
+            child_pid,
+        )
+        if not handle:
+            break
+        kernel32.CloseHandle(handle)
+        time.sleep(0.01)
+    else:
+        pytest.fail("Harbor descendant survived Windows process-tree containment")
+    time.sleep(1.05)
+    assert not child_marker.exists()
+
+
+def test_windows_tree_cleanup_uses_verified_system32_taskkill_despite_path_and_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    system_directory = tmp_path / "trusted" / "System32"
+    system_directory.mkdir(parents=True)
+    trusted_taskkill = system_directory / "taskkill.exe"
+    trusted_taskkill.write_bytes(b"trusted")
+    decoy_directory = tmp_path / "decoy"
+    decoy_directory.mkdir()
+    decoy_taskkill = decoy_directory / "taskkill.exe"
+    decoy_taskkill.write_bytes(b"decoy")
+    monkeypatch.chdir(decoy_directory)
+    monkeypatch.setenv("PATH", str(decoy_directory))
+    monkeypatch.setattr(runner, "_windows_system_directory", lambda: system_directory, raising=False)
+
+    class WindowsOs:
+        name = "nt"
+
+    class FakeProcess:
+        def __init__(self, *, pid: int, returncode: int | None) -> None:
+            self.pid = pid
+            self.returncode = returncode
+            self.killed = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            if self.returncode is None:
+                self.returncode = -9
+            return self.returncode
+
+    launched: list[list[str]] = []
+    taskkill_process = FakeProcess(pid=99, returncode=0)
+
+    def fake_popen(command: list[str], **_kwargs: object) -> FakeProcess:
+        launched.append(command)
+        return taskkill_process
+
+    root_process = FakeProcess(pid=4242, returncode=None)
+    monkeypatch.setattr(runner, "os", WindowsOs())
+    monkeypatch.setattr(runner.subprocess, "Popen", fake_popen)
+
+    runner._terminate_harbor_process_tree(root_process)  # type: ignore[arg-type]
+
+    assert len(launched) == 1
+    selected_taskkill = Path(launched[0][0])
+    assert selected_taskkill.is_absolute()
+    assert selected_taskkill.resolve() == trusted_taskkill.resolve()
+    assert selected_taskkill.resolve() != decoy_taskkill.resolve()
+
+
+def test_windows_tree_cleanup_fails_closed_when_taskkill_misses_an_exited_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class WindowsOs:
+        name = "nt"
+
+    class FakeProcess:
+        def __init__(self, *, pid: int, returncode: int | None) -> None:
+            self.pid = pid
+            self.returncode = returncode
+            self.killed = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return int(self.returncode or 0)
+
+    taskkill_process = FakeProcess(pid=99, returncode=1)
+    root_process = FakeProcess(pid=4242, returncode=0)
+    monkeypatch.setattr(runner, "os", WindowsOs())
+    monkeypatch.setattr(runner, "_verified_windows_taskkill_path", lambda: Path("/trusted/taskkill.exe"))
+    monkeypatch.setattr(runner.subprocess, "Popen", lambda *_args, **_kwargs: taskkill_process)
+
+    with pytest.raises(RuntimeError, match="process-tree cleanup could not be confirmed"):
+        runner._terminate_harbor_process_tree(root_process)  # type: ignore[arg-type]
+
+    assert root_process.killed is False
+
+
+class _SimulatedClock:
+    """Stands in for the ``time`` module so a simulated ``taskkill`` can take "seconds" without sleeping."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(time, name)
+
+
+class _SimulatedWindowsProcess:
+    """A process that exits ``exits_after`` simulated seconds after it is created, and at once when killed."""
+
+    def __init__(
+        self,
+        clock: _SimulatedClock,
+        *,
+        pid: int,
+        exits_after: float,
+        on_wait: Callable[[int], None] | None = None,
+    ) -> None:
+        self.clock = clock
+        self.pid = pid
+        self.returncode: int | None = None
+        self.exits_at = clock.now + exits_after
+        self.killed = False
+        self.on_wait = on_wait
+        self.wait_timeouts: list[float | None] = []
+
+    def poll(self) -> int | None:
+        if self.returncode is None and self.clock.now >= self.exits_at:
+            self.returncode = -9 if self.killed else 0
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True
+        self.exits_at = self.clock.now
+
+    def wait(self, timeout: float | None = None) -> int:
+        assert timeout is not None, "a Windows tree cleanup wait must be bounded"
+        self.wait_timeouts.append(timeout)
+        if self.on_wait is not None:
+            self.on_wait(len(self.wait_timeouts))
+        if self.poll() is None:
+            if self.clock.now + timeout < self.exits_at:
+                self.clock.now += timeout
+                raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+            self.clock.now = max(self.clock.now, self.exits_at)
+            self.returncode = -9 if self.killed else 0
+        return int(self.returncode or 0)
+
+
+def _simulate_windows_tree_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    taskkill_exits_after: float,
+    on_taskkill_wait: Callable[[int], None] | None = None,
+) -> tuple[_SimulatedClock, _SimulatedWindowsProcess, _SimulatedWindowsProcess]:
+    class WindowsOs:
+        name = "nt"
+
+    clock = _SimulatedClock()
+    taskkill_process = _SimulatedWindowsProcess(
+        clock, pid=99, exits_after=taskkill_exits_after, on_wait=on_taskkill_wait
+    )
+    root_process = _SimulatedWindowsProcess(clock, pid=4242, exits_after=0.0)
+    monkeypatch.setattr(runner, "os", WindowsOs())
+    monkeypatch.setattr(runner, "time", clock)
+    monkeypatch.setattr(runner, "_verified_windows_taskkill_path", lambda: Path("/trusted/taskkill.exe"))
+    monkeypatch.setattr(runner.subprocess, "Popen", lambda *_args, **_kwargs: taskkill_process)
+    return clock, taskkill_process, root_process
+
+
+@pytest.mark.parametrize("taskkill_finishes", [True, False])
+def test_windows_tree_cleanup_gives_taskkill_longer_than_a_plain_reap(
+    monkeypatch: pytest.MonkeyPatch,
+    taskkill_finishes: bool,
+) -> None:
+    """taskkill looks the task tree up before it kills it, which can outlast the budget for reaping an
+    already-signalled process. Cut short, it leaves the tree running and hides the run's own error."""
+    reap_seconds = runner._HARBOR_RUN_REAP_SECONDS
+    poll_seconds = runner._HARBOR_RUN_CANCEL_POLL_SECONDS
+    budget_seconds = runner._HARBOR_WINDOWS_TREE_KILL_SECONDS
+    clock, taskkill_process, root_process = _simulate_windows_tree_cleanup(
+        monkeypatch,
+        taskkill_exits_after=2 * reap_seconds if taskkill_finishes else float("inf"),
+    )
+    started = clock.now
+
+    if taskkill_finishes:
+        runner._terminate_harbor_process_tree(root_process)  # type: ignore[arg-type]
+
+        assert taskkill_process.killed is False
+        # It waited past the plain reap budget, in short slices rather than one blocking call.
+        assert clock.now - started == pytest.approx(2 * reap_seconds)
+        assert len(taskkill_process.wait_timeouts) > 1
+        assert max(taskkill_process.wait_timeouts) <= poll_seconds
+    else:
+        # A taskkill that never returns is still stopped, and cleanup still fails closed.
+        with pytest.raises(RuntimeError, match="process-tree cleanup could not be confirmed"):
+            runner._terminate_harbor_process_tree(root_process)  # type: ignore[arg-type]
+
+        assert taskkill_process.killed is True
+        # It waited out the whole tree-kill budget before giving up, then reaped on the short budget.
+        assert clock.now - started == pytest.approx(budget_seconds, abs=poll_seconds)
+        assert taskkill_process.wait_timeouts[-1] == reap_seconds
+        assert max(taskkill_process.wait_timeouts[:-1]) <= poll_seconds
+    # The root is reaped either way, on the short budget.
+    assert root_process.wait_timeouts == [reap_seconds]
+
+
+def test_windows_tree_cleanup_waits_out_a_slow_taskkill_when_cancellation_is_not_forced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first Ctrl+C alone must not shorten the wait: the cancel path passes ``end_grace``, but it is unset."""
+    budget_seconds = runner._HARBOR_WINDOWS_TREE_KILL_SECONDS
+    slow_seconds = budget_seconds - 5.0
+    clock, taskkill_process, root_process = _simulate_windows_tree_cleanup(
+        monkeypatch, taskkill_exits_after=slow_seconds
+    )
+    started = clock.now
+    cancellation = runner._HarborRunCancellation()
+    cancellation.requested.set()
+
+    runner._terminate_harbor_process_tree(
+        root_process,  # type: ignore[arg-type]
+        grace_seconds=runner._HARBOR_RUN_CANCEL_GRACE_SECONDS,
+        end_grace=cancellation.forced,
+    )
+
+    assert taskkill_process.killed is False
+    assert clock.now - started == pytest.approx(slow_seconds)
+    assert root_process.wait_timeouts == [runner._HARBOR_RUN_REAP_SECONDS]
+
+
+@pytest.mark.parametrize("forced_when", ["before-cleanup", "while-taskkill-runs"])
+def test_windows_tree_cleanup_stops_waiting_for_taskkill_once_cancellation_is_forced(
+    monkeypatch: pytest.MonkeyPatch,
+    forced_when: str,
+) -> None:
+    """A second Ctrl+C says "skip wait". The 30 s taskkill budget must not outlast it, and a taskkill that was
+    cut off has not confirmed the tree is gone, so cleanup still fails closed."""
+    cancellation = runner._HarborRunCancellation()
+    cancellation.requested.set()
+    slices_before_forced = 3
+
+    def second_ctrl_c(wait_count: int) -> None:
+        if forced_when == "while-taskkill-runs" and wait_count == slices_before_forced:
+            cancellation.forced.set()
+
+    clock, taskkill_process, root_process = _simulate_windows_tree_cleanup(
+        monkeypatch,
+        taskkill_exits_after=float("inf"),
+        on_taskkill_wait=second_ctrl_c,
+    )
+    if forced_when == "before-cleanup":
+        cancellation.forced.set()
+    started = clock.now
+    poll_seconds = runner._HARBOR_RUN_CANCEL_POLL_SECONDS
+
+    with pytest.raises(RuntimeError, match="process-tree cleanup could not be confirmed") as exc_info:
+        runner._terminate_harbor_process_tree(
+            root_process,  # type: ignore[arg-type]
+            grace_seconds=runner._HARBOR_RUN_CANCEL_GRACE_SECONDS,
+            end_grace=cancellation.forced,
+        )
+
+    expected_slices = 1 if forced_when == "before-cleanup" else slices_before_forced
+    # Noticed within a poll slice of the second Ctrl+C, nowhere near the 30 s budget.
+    assert clock.now - started == pytest.approx(expected_slices * poll_seconds)
+    assert clock.now - started < runner._HARBOR_WINDOWS_TREE_KILL_SECONDS / 10
+    assert isinstance(exc_info.value.__cause__, subprocess.TimeoutExpired)
+    # taskkill is stopped and reaped on the short budget, and so is the root.
+    assert taskkill_process.killed is True
+    assert taskkill_process.wait_timeouts[-1] == runner._HARBOR_RUN_REAP_SECONDS
+    assert root_process.wait_timeouts == [runner._HARBOR_RUN_REAP_SECONDS]
+
+
+def test_windows_tree_cleanup_keeps_a_taskkill_that_finishes_despite_forced_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forcing only stops waiting on a taskkill that is still running; one that finishes is a verified cleanup."""
+    _clock, taskkill_process, root_process = _simulate_windows_tree_cleanup(
+        monkeypatch, taskkill_exits_after=runner._HARBOR_RUN_CANCEL_POLL_SECONDS / 2
+    )
+    forced = threading.Event()
+    forced.set()
+
+    runner._terminate_harbor_process_tree(
+        root_process,  # type: ignore[arg-type]
+        grace_seconds=runner._HARBOR_RUN_CANCEL_GRACE_SECONDS,
+        end_grace=forced,
+    )
+
+    assert taskkill_process.killed is False
+    assert taskkill_process.returncode == 0
+    assert root_process.wait_timeouts == [runner._HARBOR_RUN_REAP_SECONDS]
+
+
+@pytest.mark.parametrize("candidate_kind", ["missing", "directory"])
+def test_windows_tree_cleanup_rejects_unverified_system32_taskkill(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    candidate_kind: str,
+) -> None:
+    system_directory = tmp_path / "trusted" / "System32"
+    system_directory.mkdir(parents=True)
+    if candidate_kind == "directory":
+        (system_directory / "taskkill.exe").mkdir()
+    monkeypatch.setattr(runner, "_windows_system_directory", lambda: system_directory, raising=False)
+
+    class WindowsOs:
+        name = "nt"
+
+    class FakeProcess:
+        def __init__(self, *, pid: int, returncode: int | None) -> None:
+            self.pid = pid
+            self.returncode = returncode
+            self.killed = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            if self.returncode is None:
+                self.returncode = -9
+            return self.returncode
+
+    launched: list[list[str]] = []
+
+    def fake_popen(command: list[str], **_kwargs: object) -> FakeProcess:
+        launched.append(command)
+        return FakeProcess(pid=99, returncode=0)
+
+    root_process = FakeProcess(pid=4242, returncode=None)
+    monkeypatch.setattr(runner, "os", WindowsOs())
+    monkeypatch.setattr(runner.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(RuntimeError, match="process-tree cleanup could not be confirmed"):
+        runner._terminate_harbor_process_tree(root_process)  # type: ignore[arg-type]
+
+    assert launched == []
+    assert root_process.killed is True
+
+
+@pytest.mark.parametrize("configured_concurrency", [1, 3, 4])
+def test_agent_pair_treats_concurrency_as_a_global_condition_cap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    configured_concurrency: int,
+) -> None:
+    lock = threading.Lock()
+    active_budget = 0
+    maximum_active_budget = 0
+    launched: list[tuple[str, int]] = []
+
+    def _run_harbor(**kwargs: object) -> tuple[bool, str]:
+        nonlocal active_budget, maximum_active_budget
+        budget = int(kwargs["n_concurrent"])
+        with lock:
+            active_budget += budget
+            maximum_active_budget = max(maximum_active_budget, active_budget)
+            launched.append((str(kwargs["job_name"]), budget))
+        time.sleep(0.05)
+        with lock:
+            active_budget -= budget
+        return True, ""
+
+    monkeypatch.setattr(runner, "_run_harbor", _run_harbor)
+
+    errors = runner._run_agent_pair(
+        skill_name="demo",
+        agent="opencode",
+        model="nvidia/openai/gpt-oss-120b",
+        env_mode="docker",
+        with_skill=tmp_path / "with",
+        baseline=tmp_path / "without",
+        jobs_dir=tmp_path / "jobs",
+        run_env={},
+        n_attempts=1,
+        n_concurrent=configured_concurrency,
+        timeout_multiplier=1.0,
+        override_cpus=None,
+        override_memory_mb=None,
+        override_storage_mb=None,
+        expected_trials=4,
+    )
+
+    assert errors == []
+    assert {name for name, _budget in launched} == {"demo-opencode-with", "demo-opencode-without"}
+    assert maximum_active_budget <= configured_concurrency
+
+
+def test_agent_pair_assigns_the_full_concurrency_budget_when_baseline_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    budgets: list[int] = []
+    monkeypatch.setattr(
+        runner,
+        "_run_harbor",
+        lambda **kwargs: budgets.append(int(kwargs["n_concurrent"])) or (True, ""),
+    )
+
+    errors = runner._run_agent_pair(
+        skill_name="demo",
+        agent="opencode",
+        model="nvidia/openai/gpt-oss-120b",
+        env_mode="docker",
+        with_skill=tmp_path / "with",
+        baseline=None,
+        jobs_dir=tmp_path / "jobs",
+        run_env={},
+        n_attempts=1,
+        n_concurrent=4,
+        timeout_multiplier=1.0,
+        override_cpus=None,
+        override_memory_mb=None,
+        override_storage_mb=None,
+        expected_trials=4,
+    )
+
+    assert errors == []
+    assert budgets == [4]
+
+
+@pytest.mark.parametrize(
+    ("env_mode", "agent", "import_path"),
+    [
+        (
+            "docker",
+            "codex",
+            "skillevaluator.tier3.harbor.local_agents:SkillEvaluatorNvidiaBuildCodex",
+        ),
+        (
+            "docker",
+            "claude-code",
+            "skillevaluator.tier3.harbor.local_agents:SkillEvaluatorNvidiaBuildClaudeCode",
+        ),
+        (
+            "local",
+            "codex",
+            "skillevaluator.tier3.harbor.local_agents:SkillEvaluatorLocalNvidiaBuildCodex",
+        ),
+        (
+            "local",
+            "claude-code",
+            "skillevaluator.tier3.harbor.local_agents:SkillEvaluatorLocalNvidiaBuildClaudeCode",
+        ),
+    ],
+)
+def test_stop_on_pass_preserves_nvidia_build_agent_import_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    env_mode: str,
+    agent: str,
+    import_path: str,
+) -> None:
+    launches: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        runner,
+        "_run_harbor",
+        lambda **kwargs: launches.append(kwargs) or (True, ""),
+    )
+    monkeypatch.setattr(runner, "_job_passed", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(runner, "_merge_attempt_jobs", lambda *_args, **_kwargs: None)
+
+    errors = runner._run_agent_pair(
+        skill_name="demo",
+        agent=agent,
+        model="nvidia/nemotron-3.5-lightning-30b-a3b",
+        env_mode=env_mode,
+        with_skill=tmp_path / "with",
+        baseline=None,
+        jobs_dir=tmp_path / "jobs",
+        run_env={},
+        n_attempts=2,
+        n_concurrent=1,
+        timeout_multiplier=1.0,
+        override_cpus=None,
+        override_memory_mb=None,
+        override_storage_mb=None,
+        expected_trials=2,
+        agent_import_path=import_path,
+        stop_on_pass=True,
+        task_names=["case-001"],
+        verifier_env={"SKILL_EVAL_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}"},
+    )
+
+    assert errors == []
+    assert len(launches) == 1
+    assert launches[0]["agent_import_path"] == import_path
+    assert launches[0]["include_task_names"] == ["case-001"]
+    assert launches[0]["verifier_env"] == {
+        "SKILL_EVAL_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}",
+    }
+
+
+@pytest.mark.parametrize("stop_on_pass", [False, True])
+def test_agent_pair_launches_nothing_after_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stop_on_pass: bool,
+) -> None:
+    cancellation = runner._HarborRunCancellation()
+    launched: list[str] = []
+
+    def _run_harbor(**kwargs: object) -> tuple[bool, str]:
+        assert kwargs["cancellation"] is cancellation
+        # Mirrors the gate at the top of the real _run_harbor.
+        cancellation.raise_if_requested()
+        launched.append(str(kwargs["job_name"]))
+        # Ctrl+C arrives while the first Harbor job runs.
+        cancellation.requested.set()
+        raise runner._HarborRunCancelledError("interrupted")
+
+    monkeypatch.setattr(runner, "_run_harbor", _run_harbor)
+    monkeypatch.setattr(runner, "_job_passed", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(runner, "_merge_attempt_jobs", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(runner._HarborRunCancelledError):
+        runner._run_agent_pair(
+            skill_name="demo",
+            agent="opencode",
+            model="nvidia/openai/gpt-oss-120b",
+            env_mode="docker",
+            with_skill=tmp_path / "with",
+            baseline=tmp_path / "without",
+            jobs_dir=tmp_path / "jobs",
+            run_env={},
+            n_attempts=2,
+            n_concurrent=1,
+            timeout_multiplier=1.0,
+            override_cpus=None,
+            override_memory_mb=None,
+            override_storage_mb=None,
+            expected_trials=2,
+            stop_on_pass=stop_on_pass,
+            task_names=["case-001"],
+            cancellation=cancellation,
+        )
+
+    assert len(launched) == 1
+    assert "-with" in launched[0]
+
+
+_UNSAFE_LINK = r"symlink|reparse"
+
+
+@pytest.mark.parametrize("link_kind", ["directory", "dangling"])
+def test_merge_attempt_jobs_rejects_linked_whole_job_root(tmp_path: Path, link_kind: str) -> None:
+    target = tmp_path / "real-job"
+    if link_kind == "directory":
+        target.mkdir()
+    job_link = tmp_path / "attempt-001"
+    job_link.symlink_to(target, target_is_directory=True)
+    aggregate_dir = tmp_path / "aggregate"
+
+    with pytest.raises(ValueError, match=r"non-linked|symlink|reparse"):
+        runner._merge_attempt_jobs([job_link], aggregate_dir)
+
+    assert not aggregate_dir.exists()
+
+
+def test_merge_attempt_jobs_rejects_mocked_reparse_whole_job_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_dir = tmp_path / "attempt-001"
+    job_dir.mkdir()
+    detect_link = runner._job_path_is_link_or_reparse
+
+    def mocked_reparse(path: Path, metadata: object) -> bool:
+        return path == job_dir or detect_link(path, metadata)
+
+    monkeypatch.setattr(runner, "_job_path_is_link_or_reparse", mocked_reparse)
+
+    with pytest.raises(ValueError, match="non-linked"):
+        runner._merge_attempt_jobs([job_dir], tmp_path / "aggregate")
+
+
+def test_merge_attempt_jobs_rejects_non_directory_whole_job_root(tmp_path: Path) -> None:
+    job_file = tmp_path / "attempt-001"
+    job_file.write_text("not a job", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="non-linked directory"):
+        runner._merge_attempt_jobs([job_file], tmp_path / "aggregate")
+
+
+@pytest.mark.parametrize("artifact_kind", ["symlink", "hardlink"])
+def test_merge_attempt_jobs_rejects_forged_root_result(tmp_path: Path, artifact_kind: str) -> None:
+    job_dir = tmp_path / "attempt-001"
+    job_dir.mkdir()
+    forged = tmp_path / "forged-result.json"
+    forged.write_text('{"n_total_trials": 999, "stats": {}}', encoding="utf-8")
+    result = job_dir / "result.json"
+    try:
+        if artifact_kind == "symlink":
+            result.symlink_to(forged)
+        else:
+            result.hardlink_to(forged)
+    except OSError as exc:  # pragma: no cover - filesystem policy
+        pytest.skip(f"{artifact_kind} creation unavailable: {exc}")
+
+    with pytest.raises(ValueError, match=r"symlink|reparse|hard.?link|multiple links"):
+        runner._merge_attempt_jobs([job_dir], tmp_path / "aggregate")
+
+
+def test_merge_attempt_jobs_rejects_root_result_source_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secure_copy = importlib.import_module("skillevaluator.tier3.harbor.secure_copy")
+    job_dir = tmp_path / "attempt-001"
+    job_dir.mkdir()
+    result = job_dir / "result.json"
+    result.write_text('{"n_total_trials": 1, "stats": {}}', encoding="utf-8")
+    aggregate_dir = tmp_path / "aggregate"
+    aggregate_dir.mkdir()
+    marker = aggregate_dir / "keep.txt"
+    marker.write_text("old aggregate", encoding="utf-8")
+    original = secure_copy._build_tree_manifest
+
+    def validate_then_replace(source: Path, *args: object, **kwargs: object):
+        manifest = original(source, *args, **kwargs)
+        if Path(source).resolve() == job_dir.resolve():
+            result.unlink()
+            result.write_text('{"n_total_trials": 999, "stats": {}}', encoding="utf-8")
+        return manifest
+
+    monkeypatch.setattr(secure_copy, "_build_tree_manifest", validate_then_replace)
+
+    with pytest.raises(ValueError, match="source changed after validation"):
+        runner._merge_attempt_jobs([job_dir], aggregate_dir)
+
+    assert marker.read_text(encoding="utf-8") == "old aggregate"
+
+
+def test_merge_attempt_jobs_rejects_regular_root_directory_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_dir = tmp_path / "attempt-001"
+    job_dir.mkdir()
+    (job_dir / "result.json").write_text('{"n_total_trials": 1, "stats": {}}', encoding="utf-8")
+    aggregate_dir = tmp_path / "aggregate"
+    aggregate_dir.mkdir()
+    marker = aggregate_dir / "keep.txt"
+    marker.write_text("old aggregate", encoding="utf-8")
+    original_copy = runner.copytree_secure
+    replaced = False
+
+    def replace_root_then_copy(source: Path, destination: Path, **kwargs: object) -> None:
+        nonlocal replaced
+        if not replaced and Path(source) == job_dir:
+            replaced = True
+            job_dir.rename(tmp_path / "original-job")
+            job_dir.mkdir()
+            (job_dir / "result.json").write_text('{"n_total_trials": 999, "stats": {}}', encoding="utf-8")
+        original_copy(source, destination, **kwargs)
+
+    monkeypatch.setattr(runner, "copytree_secure", replace_root_then_copy)
+
+    with pytest.raises(ValueError, match="root changed during snapshot"):
+        runner._merge_attempt_jobs([job_dir], aggregate_dir)
+
+    assert marker.read_text(encoding="utf-8") == "old aggregate"
+
+
+def _write_multistep_attempt_job(
+    job_dir: Path,
+    *,
+    root_score: float,
+    step_scores: tuple[float, ...],
+    failed: bool = False,
+) -> Path:
+    trial = job_dir / "case-001_attempt001"
+    for index, score in enumerate(step_scores, start=1):
+        verifier = trial / "steps" / f"step-{index}" / "verifier"
+        verifier.mkdir(parents=True)
+        (verifier / "reward.json").write_text(json.dumps({"overall": score}), encoding="utf-8")
+    result: dict[str, object] = {
+        "trial_name": trial.name,
+        "task_name": "case-001",
+        "verifier_result": {"rewards": {"overall": root_score}},
+        "step_results": [
+            {"step_name": f"step-{index}", "verifier_result": {"rewards": {"overall": score}}}
+            for index, score in enumerate(step_scores, start=1)
+        ],
+    }
+    if failed:
+        result["exception_info"] = {
+            "exception_type": "TaskFailure",
+            "exception_message": "attempt crashed",
+        }
+    (trial / "result.json").write_text(json.dumps(result), encoding="utf-8")
+    _write_successful_job_result(job_dir, trial.name)
+    return trial
+
+
+def _write_successful_job_result(job_dir: Path, trial_name: str) -> None:
+    (job_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "n_total_trials": 1,
+                "stats": {
+                    "n_trials": 1,
+                    "n_errors": 0,
+                    "evals": {
+                        "demo": {
+                            "n_trials": 1,
+                            "n_errors": 0,
+                            "reward_stats": {"overall": {"1.0": [trial_name]}},
+                        }
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_job_passed_uses_authoritative_multistep_root_reward(tmp_path: Path) -> None:
+    job_dir = tmp_path / "job"
+    _write_multistep_attempt_job(job_dir, root_score=0.5, step_scores=(1.0, 0.0))
+
+    assert runner._job_passed(job_dir, 0.75) is False
+    rewards = collector._extract_rewards(job_dir)
+    assert len(rewards) == 1
+    assert collector._average_overall(rewards) == 0.5
+
+
+def test_job_passed_accepts_passing_authoritative_multistep_root_reward(tmp_path: Path) -> None:
+    job_dir = tmp_path / "job"
+    _write_multistep_attempt_job(job_dir, root_score=0.8, step_scores=(0.0, 0.0))
+
+    assert runner._job_passed(job_dir, 0.75) is True
+
+
+def test_job_passed_rejects_failed_trial_even_with_passing_rewards(tmp_path: Path) -> None:
+    job_dir = tmp_path / "job"
+    _write_multistep_attempt_job(job_dir, root_score=1.0, step_scores=(1.0,), failed=True)
+
+    assert runner._job_passed(job_dir, 0.75) is False
+
+
+def test_job_passed_rejects_failed_job_result_even_with_passing_reward(tmp_path: Path) -> None:
+    job_dir = tmp_path / "job"
+    _write_multistep_attempt_job(job_dir, root_score=1.0, step_scores=(1.0,))
+    job_result = json.loads((job_dir / "result.json").read_text(encoding="utf-8"))
+    job_result["stats"]["n_errors"] = 1
+    (job_dir / "result.json").write_text(json.dumps(job_result), encoding="utf-8")
+
+    assert runner._job_passed(job_dir, 0.75) is False
+
+
+def test_job_passed_preserves_legacy_single_step_reward(tmp_path: Path) -> None:
+    job_dir = tmp_path / "job"
+    trial_name = "case-001_attempt001"
+    verifier = job_dir / trial_name / "verifier"
+    verifier.mkdir(parents=True)
+    (verifier / "reward.json").write_text(json.dumps({"overall": 0.9}), encoding="utf-8")
+    _write_successful_job_result(job_dir, trial_name)
+
+    assert runner._job_passed(job_dir, 0.75) is True
+
+
+def test_merge_attempt_jobs_rejects_symlinked_trial_directory(tmp_path: Path) -> None:
+    outside = tmp_path / "outside-trial"
+    outside.mkdir()
+    (outside / "host-secret.txt").write_text("secret", encoding="utf-8")
+    job_dir = tmp_path / "attempt-001"
+    job_dir.mkdir()
+    trial_link = job_dir / "case-001__trial"
+    trial_link.symlink_to(outside, target_is_directory=True)
+    aggregate_dir = tmp_path / "aggregate"
+
+    with pytest.raises(ValueError, match=_UNSAFE_LINK):
+        runner._merge_attempt_jobs([job_dir], aggregate_dir)
+
+    assert not (aggregate_dir / f"{job_dir.name}__{trial_link.name}" / "host-secret.txt").exists()
+    assert not (aggregate_dir / "result.json").exists()
+
+
+def test_merge_attempt_jobs_rejects_symlinked_trial_file(tmp_path: Path) -> None:
+    outside = tmp_path / "host-secret.txt"
+    outside.write_text("secret", encoding="utf-8")
+    job_dir = tmp_path / "attempt-001"
+    trial_dir = job_dir / "case-001__trial"
+    trial_dir.mkdir(parents=True)
+    (trial_dir / "artifact.txt").symlink_to(outside)
+    aggregate_dir = tmp_path / "aggregate"
+
+    with pytest.raises(ValueError, match=_UNSAFE_LINK):
+        runner._merge_attempt_jobs([job_dir], aggregate_dir)
+
+    assert not (aggregate_dir / f"{job_dir.name}__{trial_dir.name}" / "artifact.txt").exists()
+    assert not (aggregate_dir / "result.json").exists()
+
+
+def test_merge_attempt_jobs_rejects_nested_directory_link_like_reparse_point(tmp_path: Path) -> None:
+    outside = tmp_path / "outside-artifacts"
+    outside.mkdir()
+    (outside / "host-secret.txt").write_text("secret", encoding="utf-8")
+    job_dir = tmp_path / "attempt-001"
+    nested = job_dir / "case-001__trial" / "artifacts"
+    nested.mkdir(parents=True)
+    linked_dir = nested / "external"
+    linked_dir.symlink_to(outside, target_is_directory=True)
+    aggregate_dir = tmp_path / "aggregate"
+
+    with pytest.raises(ValueError, match=_UNSAFE_LINK):
+        runner._merge_attempt_jobs([job_dir], aggregate_dir)
+
+    copied_secret = aggregate_dir / f"{job_dir.name}__case-001__trial" / "artifacts" / "external" / "host-secret.txt"
+    assert not copied_secret.exists()
+    assert not (aggregate_dir / "result.json").exists()
+
+
+def test_merge_attempt_jobs_preserves_regular_trial_artifacts(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+    from uuid import UUID
+
+    from harbor.models.job.result import JobResult, JobStats
+    from harbor.models.trial.result import TrialResult
+    from harbor.viewer.scanner import JobScanner
+
+    job_dir = tmp_path / "attempt-001"
+    trial_dir = job_dir / "case-001__trial"
+    artifacts = trial_dir / "artifacts"
+    artifacts.mkdir(parents=True)
+    (artifacts / "output.txt").write_text("expected", encoding="utf-8")
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    trial_result = TrialResult.model_validate(
+        {
+            "id": UUID(int=2),
+            "task_name": "nvidia/skillevaluator-case-001",
+            "trial_name": trial_dir.name,
+            "trial_uri": trial_dir.as_uri(),
+            "task_id": {"path": str(job_dir / "task" / "case-001")},
+            "source": "with",
+            "task_checksum": "harbor-0.22-aggregate-fixture",
+            "config": {
+                "task": {"path": str(job_dir / "task" / "case-001"), "source": "with"},
+                "trial_name": trial_dir.name,
+                "trials_dir": str(job_dir),
+            },
+            "agent_info": {
+                "name": "opencode",
+                "version": "test",
+                "model_info": {"name": "test-model"},
+            },
+            "agent_result": {"n_input_tokens": 7, "n_cache_tokens": 2, "n_output_tokens": 3},
+            "verifier_result": {"rewards": {"reward": 1.0}},
+            "started_at": now,
+            "finished_at": now,
+        }
+    )
+    source_job_result = JobResult(
+        id=UUID(int=1),
+        started_at=now,
+        updated_at=now,
+        finished_at=now,
+        n_total_trials=1,
+        stats=JobStats.from_trial_results([trial_result], n_total_trials=1),
+        # Harbor 0.22 currently persists completed TrialResults in each trial
+        # directory while this root list can remain empty.
+        trial_results=[],
+    )
+    (job_dir / "result.json").write_text(source_job_result.model_dump_json(indent=2), encoding="utf-8")
+    (trial_dir / "result.json").write_text(trial_result.model_dump_json(indent=2), encoding="utf-8")
+    (trial_dir / "config.json").write_text(trial_result.config.model_dump_json(indent=2), encoding="utf-8")
+    aggregate_dir = tmp_path / "aggregate"
+
+    runner._merge_attempt_jobs([job_dir], aggregate_dir)
+
+    merged_trial = aggregate_dir / f"{job_dir.name}__{trial_dir.name}"
+    assert (merged_trial / "artifacts" / "output.txt").read_text(encoding="utf-8") == "expected"
+    merged_result = json.loads((aggregate_dir / "result.json").read_text(encoding="utf-8"))
+    reward_names = [
+        name
+        for eval_stats in merged_result["stats"]["evals"].values()
+        for name in eval_stats["reward_stats"]["reward"]["1.0"]
+    ]
+    assert reward_names == [merged_trial.name]
+    scanner = JobScanner(tmp_path)
+    parsed_result = scanner.get_job_result(aggregate_dir.name)
+    parsed_config = scanner.get_job_config(aggregate_dir.name)
+    assert parsed_result is not None
+    assert parsed_result.n_total_trials == 1
+    assert parsed_result.stats.n_completed_trials == 1
+    assert len(parsed_result.trial_results) == parsed_result.stats.n_completed_trials
+    assert scanner.list_trials(aggregate_dir.name) == [merged_trial.name]
+    parsed_trial = scanner.get_trial_result(aggregate_dir.name, merged_trial.name)
+    assert parsed_trial is not None
+    assert parsed_trial.trial_name == merged_trial.name
+    assert parsed_trial.trial_uri == merged_trial.as_uri()
+    assert parsed_trial.config.trial_name == merged_trial.name
+    assert parsed_trial.config.trials_dir == aggregate_dir
+    assert parsed_result.trial_results[0] == parsed_trial
+    assert parsed_config is not None
+    assert parsed_config.job_name == aggregate_dir.name
+
+
+def test_merge_attempt_jobs_normalizes_mixed_naive_and_aware_timestamps(tmp_path: Path) -> None:
+    from harbor.viewer.scanner import JobScanner
+
+    job_dir = tmp_path / "attempt-001"
+    _write_current_harbor_attempt(
+        job_dir,
+        trial_name="case-001__trial",
+        root_completed=1,
+    )
+    root_result_path = job_dir / "result.json"
+    root_result = json.loads(root_result_path.read_text(encoding="utf-8"))
+    root_result.update(
+        {
+            "started_at": "2026-08-25T19:00:00",
+            "updated_at": "2026-08-25T19:01:00",
+            "finished_at": "2026-08-25T19:01:00",
+        }
+    )
+    root_result_path.write_text(json.dumps(root_result, indent=2), encoding="utf-8")
+    aggregate_dir = tmp_path / "aggregate"
+
+    runner._merge_attempt_jobs([job_dir], aggregate_dir)
+
+    merged = JobScanner(tmp_path).get_job_result(aggregate_dir.name)
+    assert merged is not None
+    assert merged.started_at.tzinfo is not None
+    assert merged.updated_at.tzinfo is not None
+    assert merged.finished_at is not None
+    assert merged.finished_at.tzinfo is not None
+    assert merged.started_at <= merged.updated_at
+
+
+def _write_current_harbor_attempt(
+    job_dir: Path,
+    *,
+    trial_name: str,
+    root_completed: int,
+    root_total: int = 1,
+    result_id: int = 20,
+    task_selector: str = "case",
+    task_name: str | None = None,
+    reward: float = 1.0,
+) -> None:
+    from datetime import UTC, datetime
+    from uuid import UUID
+
+    from harbor.models.job.result import JobResult, JobStats
+    from harbor.models.trial.result import TrialResult
+
+    trial_dir = job_dir / trial_name
+    trial_dir.mkdir(parents=True)
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    trial_result = TrialResult.model_validate(
+        {
+            "id": UUID(int=result_id),
+            "task_name": task_name or f"nvidia/{trial_name}",
+            "trial_name": trial_name,
+            "trial_uri": trial_dir.as_uri(),
+            "task_id": {"path": str(job_dir / "task" / task_selector)},
+            "source": "with",
+            "task_checksum": "harbor-0.22-aggregate-fixture",
+            "config": {
+                "task": {"path": str(job_dir / "task" / task_selector), "source": "with"},
+                "trial_name": trial_name,
+                "trials_dir": str(job_dir),
+            },
+            "agent_info": {
+                "name": "opencode",
+                "version": "test",
+                "model_info": {"name": "test-model"},
+            },
+            "agent_result": {},
+            "verifier_result": {"rewards": {"reward": reward}},
+            "started_at": now,
+            "finished_at": now,
+        }
+    )
+    root_results = [trial_result] if root_completed else []
+    root_stats = (
+        JobStats.from_trial_results(root_results, n_total_trials=root_total)
+        if root_completed
+        else JobStats(n_pending_trials=root_total)
+    )
+    source_job_result = JobResult(
+        id=UUID(int=result_id + 1),
+        started_at=now,
+        updated_at=now,
+        finished_at=now if root_completed == root_total else None,
+        n_total_trials=root_total,
+        stats=root_stats,
+        trial_results=[],
+    )
+    (job_dir / "result.json").write_text(source_job_result.model_dump_json(indent=2), encoding="utf-8")
+    (trial_dir / "result.json").write_text(trial_result.model_dump_json(indent=2), encoding="utf-8")
+    (trial_dir / "config.json").write_text(trial_result.config.model_dump_json(indent=2), encoding="utf-8")
+
+
+def test_merge_attempt_jobs_accepts_completed_child_ahead_of_stale_root_stats(tmp_path: Path) -> None:
+    from harbor.viewer.scanner import JobScanner
+
+    job_dir = tmp_path / "demo-with-case-attempt001"
+    _write_current_harbor_attempt(
+        job_dir,
+        trial_name="case-001__trial",
+        root_completed=0,
+    )
+    aggregate_dir = tmp_path / "aggregate"
+
+    runner._merge_attempt_jobs([job_dir], aggregate_dir)
+
+    merged = JobScanner(tmp_path).get_job_result(aggregate_dir.name)
+    assert merged is not None
+    assert merged.stats.n_completed_trials == 1
+    assert merged.stats.n_pending_trials == 0
+    assert merged.finished_at is not None
+
+
+def test_merge_attempt_jobs_rejects_root_completed_count_without_valid_child(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+    from uuid import UUID
+
+    from harbor.models.job.result import JobResult, JobStats
+
+    job_dir = tmp_path / "demo-with-case-attempt001"
+    job_dir.mkdir()
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    result = JobResult(
+        id=UUID(int=30),
+        started_at=now,
+        updated_at=now,
+        finished_at=now,
+        n_total_trials=1,
+        stats=JobStats(n_completed_trials=1),
+        trial_results=[],
+    )
+    (job_dir / "result.json").write_text(result.model_dump_json(indent=2), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="completed 1 trials but retained 0"):
+        runner._merge_attempt_jobs([job_dir], tmp_path / "aggregate")
+
+
+@pytest.mark.parametrize(
+    ("job_name", "trial_name"),
+    [
+        ("s" * 180 + "-attempt001", "case-" + "t" * 120),
+        ("技" * 70 + "-attempt001", "例" * 70),
+    ],
+)
+def test_merge_attempt_jobs_bounds_long_aggregate_trial_names_by_utf8_bytes(
+    tmp_path: Path,
+    job_name: str,
+    trial_name: str,
+) -> None:
+    from harbor.viewer.scanner import JobScanner
+
+    job_dir = tmp_path / job_name
+    _write_current_harbor_attempt(job_dir, trial_name=trial_name, root_completed=1)
+    aggregate_dir = tmp_path / "aggregate"
+
+    runner._merge_attempt_jobs([job_dir], aggregate_dir)
+
+    merged_names = JobScanner(tmp_path).list_trials(aggregate_dir.name)
+    assert len(merged_names) == 1
+    assert len(merged_names[0].encode("utf-8")) <= 224
+    assert "attempt001" in merged_names[0]
+
+
+def test_long_stop_on_pass_merge_carries_runner_attempt_ordinal_into_collection(tmp_path: Path) -> None:
+    selector = "selector-attempt9"
+    logical_entry_id = "logical-attempt7"
+    jobs_dir = tmp_path / "jobs"
+    job_name = f"{'s' * 170}-opencode-with-{selector}-attempt002"
+    job_dir = jobs_dir / job_name
+    _write_current_harbor_attempt(
+        job_dir,
+        trial_name=f"{selector}__AbCd123",
+        root_completed=1,
+        task_selector=selector,
+        task_name="publisher/display-attempt5",
+        reward=1.0,
+    )
+    runner._merge_attempt_jobs([job_dir], jobs_dir / "demo-opencode-with")
+
+    result = collector.collect_harbor_results(
+        skill_name="demo",
+        agents=["opencode"],
+        output_dir=tmp_path / "results",
+        jobs_dir=jobs_dir,
+        skip_baseline=True,
+        n_attempts=3,
+        stop_on_pass=True,
+        expected_cases=1,
+        expected_case_ids=[logical_entry_id],
+        case_id_by_task_selector={selector: logical_entry_id},
+    )
+
+    assert result["execution_status"] == "failed"
+    assert result["expected_attempts"] == 2
+    assert result["scored_attempts"] == 1
+    assert any("Missing scored attempts" in error for error in result["execution_errors"])
+
+
+def test_merge_attempt_jobs_long_name_digest_avoids_cross_source_collisions(tmp_path: Path) -> None:
+    job_name = "s" * 180 + "-attempt001"
+    trial_name = "case-" + "t" * 120
+    first = tmp_path / "first" / job_name
+    second = tmp_path / "second" / job_name
+    _write_current_harbor_attempt(first, trial_name=trial_name, root_completed=1, result_id=40)
+    _write_current_harbor_attempt(second, trial_name=trial_name, root_completed=1, result_id=50)
+    aggregate_dir = tmp_path / "aggregate"
+
+    runner._merge_attempt_jobs([first, second], aggregate_dir)
+
+    merged_names = sorted(path.name for path in aggregate_dir.iterdir() if path.is_dir())
+    assert len(merged_names) == 2
+    assert len(set(merged_names)) == 2
+    assert all(len(name.encode("utf-8")) <= 224 for name in merged_names)
+
+
+def test_merge_attempt_jobs_rebuilds_cancel_retry_token_and_cost_stats(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+    from uuid import UUID
+
+    from harbor.models.job.result import JobResult, JobStats
+    from harbor.models.trial.result import TrialResult
+    from harbor.viewer.scanner import JobScanner
+
+    job_dir = tmp_path / "attempt-001"
+    trial_dir = job_dir / "case-001__cancelled"
+    trial_dir.mkdir(parents=True)
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    trial_result = TrialResult.model_validate(
+        {
+            "id": UUID(int=4),
+            "task_name": "nvidia/skillevaluator-case-001",
+            "trial_name": trial_dir.name,
+            "trial_uri": trial_dir.as_uri(),
+            "task_id": {"path": str(job_dir / "task" / "case-001")},
+            "source": "with",
+            "task_checksum": "harbor-0.22-cancelled-fixture",
+            "config": {
+                "task": {"path": str(job_dir / "task" / "case-001"), "source": "with"},
+                "trial_name": trial_dir.name,
+                "trials_dir": str(job_dir),
+            },
+            "agent_info": {
+                "name": "opencode",
+                "version": "test",
+                "model_info": {"name": "test-model"},
+            },
+            "agent_result": {
+                "n_input_tokens": 123,
+                "n_cache_tokens": 4,
+                "n_output_tokens": 5,
+                "cost_usd": 0.25,
+            },
+            "verifier_result": None,
+            "exception_info": {
+                "exception_type": "CancelledError",
+                "exception_message": "cancelled",
+                "exception_traceback": "",
+                "occurred_at": now,
+            },
+            "started_at": now,
+            "finished_at": now,
+        }
+    )
+    source_stats = JobStats.from_trial_results([trial_result], n_total_trials=1, n_retries=2)
+    source_job_result = JobResult(
+        id=UUID(int=3),
+        started_at=now,
+        updated_at=now,
+        finished_at=now,
+        n_total_trials=1,
+        stats=source_stats,
+        trial_results=[],
+    )
+    (job_dir / "result.json").write_text(source_job_result.model_dump_json(indent=2), encoding="utf-8")
+    (trial_dir / "result.json").write_text(trial_result.model_dump_json(indent=2), encoding="utf-8")
+    (trial_dir / "config.json").write_text(trial_result.config.model_dump_json(indent=2), encoding="utf-8")
+    aggregate_dir = tmp_path / "aggregate"
+
+    runner._merge_attempt_jobs([job_dir], aggregate_dir)
+
+    merged = JobScanner(tmp_path).get_job_result(aggregate_dir.name)
+    assert merged is not None
+    assert merged.stats.n_completed_trials == 1
+    assert merged.stats.n_errored_trials == 1
+    assert merged.stats.n_cancelled_trials == 1
+    assert merged.stats.n_retries == 2
+    assert merged.stats.n_input_tokens == 123
+    assert merged.stats.n_cache_tokens == 4
+    assert merged.stats.n_output_tokens == 5
+    assert merged.stats.cost_usd == 0.25
+    assert len(merged.trial_results) == 1
+
+
+@pytest.mark.parametrize("with_job_result", [True, False])
+def test_merge_attempt_jobs_preserves_config_only_interrupted_trials(
+    tmp_path: Path,
+    with_job_result: bool,
+) -> None:
+    from datetime import UTC, datetime
+    from uuid import UUID
+
+    from harbor.models.job.result import JobResult, JobStats
+    from harbor.models.trial.config import TrialConfig
+    from harbor.viewer.scanner import JobScanner
+
+    job_dir = tmp_path / "attempt-001"
+    trial_dir = job_dir / "case-001__interrupted"
+    trial_dir.mkdir(parents=True)
+    trial_config = TrialConfig.model_validate(
+        {
+            "task": {"path": str(job_dir / "task" / "case-001"), "source": "with"},
+            "trial_name": trial_dir.name,
+            "trials_dir": str(job_dir),
+        }
+    )
+    (trial_dir / "config.json").write_text(trial_config.model_dump_json(indent=2), encoding="utf-8")
+    if with_job_result:
+        now = datetime(2026, 8, 25, tzinfo=UTC)
+        source_job_result = JobResult(
+            id=UUID(int=5),
+            started_at=now,
+            updated_at=now,
+            finished_at=now,
+            n_total_trials=1,
+            stats=JobStats(n_pending_trials=1),
+            trial_results=[],
+        )
+        (job_dir / "result.json").write_text(source_job_result.model_dump_json(indent=2), encoding="utf-8")
+    aggregate_dir = tmp_path / "aggregate"
+
+    runner._merge_attempt_jobs([job_dir], aggregate_dir)
+
+    scanner = JobScanner(tmp_path)
+    merged = scanner.get_job_result(aggregate_dir.name)
+    assert merged is not None
+    assert merged.n_total_trials == 1
+    assert merged.stats.n_completed_trials == 0
+    assert merged.stats.n_pending_trials == 1
+    assert merged.trial_results == []
+    assert merged.finished_at is None
+    merged_trial_name = f"{job_dir.name}__{trial_dir.name}"
+    assert scanner.list_trials(aggregate_dir.name) == [merged_trial_name]
+    assert scanner.get_trial_result(aggregate_dir.name, merged_trial_name) is None
+    rewritten_config = scanner.get_trial_config(aggregate_dir.name, merged_trial_name)
+    assert rewritten_config is not None
+    assert rewritten_config.trial_name == merged_trial_name
+    assert rewritten_config.trials_dir == aggregate_dir
+
+
+def test_merge_attempt_jobs_ignores_tmpdir_inside_attempt_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_dir = tmp_path / "attempt-001"
+    trial_dir = job_dir / "case-001__trial"
+    trial_dir.mkdir(parents=True)
+    (trial_dir / "artifact.txt").write_text("expected", encoding="utf-8")
+    monkeypatch.setattr(runner.tempfile, "tempdir", str(job_dir))
+    aggregate_dir = tmp_path / "aggregate"
+
+    runner._merge_attempt_jobs([job_dir], aggregate_dir)
+
+    assert (aggregate_dir / f"{job_dir.name}__{trial_dir.name}" / "artifact.txt").read_text() == "expected"
+    assert not list(tmp_path.glob(".aggregate-merge-*"))
+
+
+# Synthetic, low-entropy credential so secret scanners do not flag the fixture.
+_LOCAL_CODEX_KEY = "sk-codex-codex-codex"
+_LOCAL_CODEX_AUTH = json.dumps({"OPENAI_API_KEY": _LOCAL_CODEX_KEY})
+
+
+def _declare_trial_steps(job_dir: Path, trial_name: str, step_names: list[str], *, in_root: bool = False) -> None:
+    """Turn a fixture trial into a multi-step one that declares ``step_names``.
+
+    ``in_root`` moves the trial result into the attempt root's ``trial_results``
+    entry, which the merge reads when the trial's own result is missing.
+    """
+    trial_result_path = job_dir / trial_name / "result.json"
+    payload = json.loads(trial_result_path.read_text(encoding="utf-8"))
+    payload["agent_result"] = None
+    payload["step_results"] = [{"step_name": name} for name in step_names]
+    if not in_root:
+        trial_result_path.write_text(json.dumps(payload), encoding="utf-8")
+        return
+    trial_result_path.unlink()
+    root_result_path = job_dir / "result.json"
+    root_payload = json.loads(root_result_path.read_text(encoding="utf-8"))
+    root_payload["trial_results"] = [payload]
+    root_result_path.write_text(json.dumps(root_payload), encoding="utf-8")
+
+
+# Single-step trials keep agent logs in <trial>/agent. Harbor's multi-step
+# trials move them into <trial>/steps/<step>/agent after each step, and a step
+# name may span several path components ("phase/author").
+@pytest.mark.parametrize(
+    ("step_root", "declared_in"),
+    [
+        (".", None),
+        ("steps/step-1", None),
+        ("steps/step-1", "trial"),
+        ("steps/phase/author", "trial"),
+        ("steps/phase/author", "root"),
+    ],
+)
+@pytest.mark.parametrize("auth_layout", ["secrets-link", "host-link", "regular-file"])
+@pytest.mark.parametrize("descriptor_backend", [False, True])
+def test_merge_attempt_jobs_omits_leftover_local_codex_credential_dirs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    step_root: str,
+    declared_in: str | None,
+    auth_layout: str,
+    descriptor_backend: bool,
+) -> None:
+    secure_copy = importlib.import_module("skillevaluator.tier3.harbor.secure_copy")
+    if descriptor_backend and not secure_copy._DESCRIPTOR_BACKEND:
+        pytest.skip("descriptor-relative copying unavailable")
+    monkeypatch.setattr(secure_copy, "_DESCRIPTOR_BACKEND", descriptor_backend)
+    job_dir = tmp_path / "attempt-001"
+    trial_name = "case-001__trial"
+    _write_current_harbor_attempt(job_dir, trial_name=trial_name, root_completed=1)
+    if declared_in is not None:
+        step_name = step_root.removeprefix("steps/")
+        _declare_trial_steps(job_dir, trial_name, [step_name], in_root=declared_in == "root")
+    trial_dir = job_dir / trial_name
+    # Harbor's Codex agent writes (or uploads the host's) auth.json into
+    # codex-secrets and links codex-home/auth.json to it. Local mode keeps both
+    # under the trial agent dir, and a skipped best-effort cleanup leaves them.
+    agent_dir = trial_dir / step_root / "agent"
+    codex_home = agent_dir / "codex-home"
+    codex_secrets = agent_dir / "codex-secrets"
+    codex_home.mkdir(parents=True)
+    codex_secrets.mkdir()
+    secret_auth = codex_secrets / "auth.json"
+    secret_auth.write_text(_LOCAL_CODEX_AUTH, encoding="utf-8")
+    auth = codex_home / "auth.json"
+    if auth_layout == "regular-file":
+        auth.write_text(_LOCAL_CODEX_AUTH, encoding="utf-8")
+    else:
+        link_target = secret_auth
+        if auth_layout == "host-link":
+            link_target = tmp_path / "host-auth.json"
+            link_target.write_text(_LOCAL_CODEX_AUTH, encoding="utf-8")
+        try:
+            auth.symlink_to(link_target)
+        except OSError as exc:  # pragma: no cover - filesystem policy
+            pytest.skip(f"file symlinks unavailable: {exc}")
+    (codex_home / "config.toml").write_text("private config\n", encoding="utf-8")
+    retained = {
+        "agent/trajectory.json": '{"messages": []}',
+        "agent/codex.txt": "codex output\n",
+        "verifier/reward.json": '{"reward": 1.0}',
+        "artifacts/output.txt": "expected output\n",
+        # The same names outside the trial agent dir are ordinary evidence.
+        "artifacts/agent/codex-home/example.txt": "authored artifact\n",
+        "artifacts/agent/codex-secrets/example.txt": "authored artifact\n",
+    }
+    for relative, contents in retained.items():
+        path = trial_dir / step_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents, encoding="utf-8")
+    aggregate_dir = tmp_path / "aggregate"
+
+    runner._merge_attempt_jobs([job_dir], aggregate_dir)
+
+    merged_trial = aggregate_dir / f"{job_dir.name}__{trial_name}"
+    merged_step = merged_trial / step_root
+    assert not (merged_step / "agent" / "codex-home").exists()
+    assert not (merged_step / "agent" / "codex-secrets").exists()
+    for relative, contents in retained.items():
+        assert (merged_step / relative).read_text(encoding="utf-8") == contents
+    leaked = [
+        path.relative_to(aggregate_dir).as_posix()
+        for path in aggregate_dir.rglob("*")
+        if path.is_file() and _LOCAL_CODEX_KEY in path.read_text(encoding="utf-8", errors="ignore")
+    ]
+    assert leaked == []
+    merged_result = json.loads((merged_trial / "result.json").read_text(encoding="utf-8"))
+    assert merged_result["verifier_result"]["rewards"] == {"reward": 1.0}
+    if declared_in is not None:
+        assert [step["step_name"] for step in merged_result["step_results"]] == [step_root.removeprefix("steps/")]
+    # The source attempt is left as it was; only the aggregate omits the dirs.
+    assert auth.is_symlink() is (auth_layout != "regular-file")
+    assert auth.read_text(encoding="utf-8") == _LOCAL_CODEX_AUTH
+    assert secret_auth.read_text(encoding="utf-8") == _LOCAL_CODEX_AUTH
+    assert (codex_home / "config.toml").read_text(encoding="utf-8") == "private config\n"
+
+
+def test_merge_attempt_jobs_codex_exclusions_track_local_codex_runtime_dirs() -> None:
+    from harbor.models.trial.paths import EnvironmentPaths
+
+    from skillevaluator.tier3.harbor.local_agents import (
+        SkillEvaluatorLocalCodex,
+        SkillEvaluatorLocalNvidiaBuildCodex,
+    )
+
+    for agent_class in (SkillEvaluatorLocalCodex, SkillEvaluatorLocalNvidiaBuildCodex):
+        runtime_dirs = (agent_class._REMOTE_CODEX_HOME, agent_class._REMOTE_CODEX_SECRETS_DIR)
+        assert {path.parent for path in runtime_dirs} == {EnvironmentPaths.agent_dir}
+        assert {path.name for path in runtime_dirs} == runner._LOCAL_CODEX_PRIVATE_AGENT_DIRS
+
+
+@pytest.mark.parametrize(
+    "relative_auth",
+    [
+        "agent/auth.json",
+        "codex-home/auth.json",
+        "codex-secrets/auth.json",
+        "agent/codex-home-other/auth.json",
+        "agent/codex-secrets-other/auth.json",
+        "artifacts/agent/codex-home/auth.json",
+        "artifacts/agent/codex-secrets/auth.json",
+        "steps/codex-home/auth.json",
+        "steps/agent/codex-home/auth.json",
+        "steps/step-1/codex-home/auth.json",
+        "steps/step-1/agent/codex-home-other/auth.json",
+        "steps/step-1/artifacts/agent/codex-home/auth.json",
+        "steps/step-1/nested/agent/codex-home/auth.json",
+        "steps/phase/author/nested/agent/codex-home/auth.json",
+        "steps/phase/author/artifacts/agent/codex-secrets/auth.json",
+        "steps/other/author/agent/codex-home/auth.json",
+        "steps/x/agent/agent/codex-home/auth.json",
+        "agent/steps/step-1/agent/codex-home/auth.json",
+        "other/step-1/agent/codex-home/auth.json",
+    ],
+)
+def test_merge_attempt_jobs_rejects_auth_links_outside_trial_codex_dirs(
+    tmp_path: Path,
+    relative_auth: str,
+) -> None:
+    job_dir = tmp_path / "attempt-001"
+    trial_dir = job_dir / "case-001__trial"
+    auth = trial_dir / relative_auth
+    auth.parent.mkdir(parents=True)
+    # Declared step names extend the exclusion only to their own agent dirs;
+    # names that would leave the steps dir are not trusted.
+    declared_steps = ["phase/author", "../agent", "x/../x/agent", "/abs"]
+    (trial_dir / "result.json").write_text(
+        json.dumps({"step_results": [{"step_name": name} for name in declared_steps]}),
+        encoding="utf-8",
+    )
+    host_auth = tmp_path / "host-auth.json"
+    host_auth.write_text("private\n", encoding="utf-8")
+    try:
+        auth.symlink_to(host_auth)
+    except OSError as exc:  # pragma: no cover - filesystem policy
+        pytest.skip(f"file symlinks unavailable: {exc}")
+    aggregate_dir = tmp_path / "aggregate"
+    aggregate_dir.mkdir()
+    marker = aggregate_dir / "keep.txt"
+    marker.write_text("old aggregate", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=_UNSAFE_LINK):
+        runner._merge_attempt_jobs([job_dir], aggregate_dir)
+
+    assert sorted(path.name for path in aggregate_dir.iterdir()) == ["keep.txt"]
+    assert marker.read_text(encoding="utf-8") == "old aggregate"
+    assert host_auth.read_text(encoding="utf-8") == "private\n"
+
+
+def test_merge_attempt_jobs_preserves_existing_aggregate_on_unsafe_source(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    safe_job = tmp_path / "attempt-001"
+    safe_trial = safe_job / "case-001__trial"
+    safe_trial.mkdir(parents=True)
+    (safe_trial / "safe.txt").write_text("staged first", encoding="utf-8")
+    unsafe_job = tmp_path / "attempt-002"
+    unsafe_trial = unsafe_job / "case-001__trial"
+    unsafe_trial.mkdir(parents=True)
+    (unsafe_trial / "unsafe").symlink_to(outside, target_is_directory=True)
+    aggregate_dir = tmp_path / "aggregate"
+    aggregate_dir.mkdir()
+    marker = aggregate_dir / "keep.txt"
+    marker.write_text("old aggregate", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=_UNSAFE_LINK):
+        runner._merge_attempt_jobs([safe_job, unsafe_job], aggregate_dir)
+
+    assert marker.read_text(encoding="utf-8") == "old aggregate"
+    assert not (aggregate_dir / f"{safe_job.name}__{safe_trial.name}").exists()
+    assert not (aggregate_dir / f"{unsafe_job.name}__{unsafe_trial.name}").exists()
+    assert not list(tmp_path.glob(".aggregate-merge-*"))
+
+
+def test_merge_attempt_jobs_preserves_existing_aggregate_when_private_staging_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_dir = tmp_path / "attempt-001"
+    job_dir.mkdir()
+    aggregate_dir = tmp_path / "aggregate"
+    aggregate_dir.mkdir()
+    marker = aggregate_dir / "keep.txt"
+    marker.write_text("old aggregate", encoding="utf-8")
+
+    def fail_private_staging(*_args: object, **_kwargs: object) -> None:
+        raise OSError("injected temp failure")
+
+    monkeypatch.setattr(runner.tempfile, "TemporaryDirectory", fail_private_staging)
+
+    with pytest.raises(OSError, match="injected temp failure"):
+        runner._merge_attempt_jobs([job_dir], aggregate_dir)
+
+    assert marker.read_text(encoding="utf-8") == "old aggregate"
+
+
+@pytest.mark.parametrize("relationship", ["aggregate-in-job", "job-in-aggregate"])
+def test_merge_attempt_jobs_rejects_source_destination_overlap(tmp_path: Path, relationship: str) -> None:
+    if relationship == "aggregate-in-job":
+        job_dir = tmp_path / "attempt-001"
+        job_dir.mkdir()
+        aggregate_dir = job_dir / "aggregate"
+    else:
+        aggregate_dir = tmp_path / "aggregate"
+        job_dir = aggregate_dir / "attempt-001"
+        job_dir.mkdir(parents=True)
+    marker = job_dir / "keep.txt"
+    marker.write_text("source", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must not overlap"):
+        runner._merge_attempt_jobs([job_dir], aggregate_dir)
+
+    assert marker.read_text(encoding="utf-8") == "source"
+
+
+@pytest.mark.parametrize(
+    "task_toml",
+    [
+        "[agent]\ntimeout_sec = 300.0\n\n[verifier]\ntimeout_sec = 600.0\n",
+        "[agent]\ntimeout_sec = 300.0\n",
+        (
+            "[agent]\ntimeout_sec = 300.0\n\n"
+            '[[steps]]\nname = "first"\n\n'
+            '[[steps]]\nname = "second"\n[steps.agent]\ntimeout_sec = 450.0\n'
+        ),
+        "[verifier]\ntimeout_sec = 600.0\n",
+    ],
+    ids=("single-step", "native-verifier-default", "multi-step", "unbounded-agent"),
+)
+def test_run_harbor_defers_to_harbor_phase_timeouts_without_outer_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    task_toml: str,
+) -> None:
+    dataset = tmp_path / "dataset"
+    for index in range(5):
+        task = dataset / f"case-{index}"
+        task.mkdir(parents=True)
+        (task / "task.toml").write_text(task_toml, encoding="utf-8")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(runner, "build_harbor_run_command", lambda **_kwargs: ["harbor", "run"])
+
+    def completed_run(command: list[str], **kwargs: object) -> runner._BoundedHarborProcessResult:
+        del command
+        captured.update(kwargs)
+        return runner._BoundedHarborProcessResult(
+            returncode=1,
+            output_tail="expected test stop",
+            output_exceeded=False,
+        )
+
+    monkeypatch.setattr(runner, "_run_bounded_harbor_process", completed_run)
+
+    ok, _detail = runner._run_harbor(
+        dataset=dataset,
+        agent="opencode",
+        job_name="demo-opencode-with",
+        env_mode="docker",
+        model="nvidia/openai/gpt-oss-120b",
+        jobs_dir=tmp_path / "jobs",
+        run_env={},
+        n_attempts=3,
+        n_concurrent=2,
+        timeout_multiplier=1.5,
+        override_cpus=None,
+        override_memory_mb=None,
+        override_storage_mb=None,
+        expected_trials=15,
+    )
+
+    assert ok is False
+    assert captured["timeout_seconds"] is None
+
+
+def _run(
+    monkeypatch: pytest.MonkeyPatch,
+    jobs_dir: Path,
+    job_name: str = "demo-opencode-with",
+    expected_total_trials: int | None = None,
+) -> tuple[bool, str]:
+    monkeypatch.setattr(
+        runner,
+        "build_harbor_run_command",
+        lambda **_kwargs: [sys.executable, "-c", "pass"],
+    )
+    kwargs = {"expected_total_trials": expected_total_trials} if expected_total_trials is not None else {}
+    return runner._run_harbor(
+        dataset=jobs_dir / "dataset",
+        agent="opencode",
+        job_name=job_name,
+        env_mode="docker",
+        model="nvidia/openai/gpt-oss-120b",
+        jobs_dir=jobs_dir,
+        run_env={},
+        n_attempts=1,
+        n_concurrent=1,
+        timeout_multiplier=1.0,
+        override_cpus=None,
+        override_memory_mb=None,
+        override_storage_mb=None,
+        **kwargs,
+    )
+
+
+def _write_job_result(jobs_dir: Path, stats: dict[str, object], *, total: int = 1) -> None:
+    job_dir = jobs_dir / "demo-opencode-with"
+    job_dir.mkdir(parents=True)
+    (job_dir / "result.json").write_text(
+        json.dumps({"n_total_trials": total, "stats": stats}),
+        encoding="utf-8",
+    )
+
+
+def test_run_harbor_fails_closed_with_redacted_tail_on_output_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    secret = "synthetic-runner-overflow-secret"
+    monkeypatch.setattr(
+        runner,
+        "_run_bounded_harbor_process",
+        lambda *_args, **_kwargs: runner._BoundedHarborProcessResult(
+            returncode=-9,
+            output_tail=f"useful failure tail containing {secret}",
+            output_exceeded=True,
+        ),
+    )
+
+    ok, detail = runner._run_harbor(
+        dataset=tmp_path / "dataset",
+        agent="opencode",
+        job_name="demo-opencode-with",
+        env_mode="docker",
+        model="nvidia/model",
+        jobs_dir=tmp_path,
+        run_env={"API_KEY": secret},
+        n_attempts=1,
+        n_concurrent=1,
+        timeout_multiplier=1.0,
+        override_cpus=None,
+        override_memory_mb=None,
+        override_storage_mb=None,
+    )
+
+    assert ok is False
+    assert "output exceeded" in detail
+    assert "useful failure tail" in detail
+    assert secret not in detail
+    assert "redacted" in detail.lower()
+
+
+@pytest.mark.parametrize(
+    "proxy_uri",
+    [
+        "https://runner-user:runner-password@proxy.invalid:8443",
+        "https://runner%2Duser:runner%2Dpassword@proxy.invalid:8443",
+        "runner-user:runner-password@proxy.invalid:8443",
+    ],
+    ids=["uri", "percent-encoded", "schemeless"],
+)
+def test_run_harbor_redacts_detached_proxy_components_and_persisted_launch_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    proxy_uri: str,
+) -> None:
+    exposed = ("runner-user", "runner-password")
+    captured_secret_values: set[str] = set()
+
+    def bounded_process(*_args: object, **kwargs: object) -> runner._BoundedHarborProcessResult:
+        captured_secret_values.update(kwargs["secret_values"])  # type: ignore[arg-type]
+        return runner._BoundedHarborProcessResult(
+            returncode=7,
+            output_tail=f"proxy rejected {exposed[0]} with {exposed[1]}",
+            output_exceeded=False,
+        )
+
+    monkeypatch.setattr(
+        runner,
+        "build_harbor_run_command",
+        lambda **_kwargs: [sys.executable, "-c", "pass"],
+    )
+    monkeypatch.setattr(runner, "_run_bounded_harbor_process", bounded_process)
+
+    ok, detail = runner._run_harbor(
+        dataset=tmp_path / "dataset",
+        agent="opencode",
+        job_name="demo-opencode-with",
+        env_mode="docker",
+        model="nvidia/model",
+        jobs_dir=tmp_path,
+        run_env={"HTTPS_PROXY": proxy_uri},
+        n_attempts=1,
+        n_concurrent=1,
+        timeout_multiplier=1.0,
+        override_cpus=None,
+        override_memory_mb=None,
+        override_storage_mb=None,
+    )
+
+    assert ok is False
+    assert set(exposed) <= captured_secret_values
+    assert all(value not in detail for value in exposed)
+
+    persisted = {"execution_status": "failed", "execution_errors": []}
+    runner._merge_launch_execution_errors(persisted, [f"launch failed: {detail}"])
+    persisted_path = tmp_path / "persisted-launch-error.json"
+    persisted_path.write_text(json.dumps(persisted), encoding="utf-8")
+    persisted_text = persisted_path.read_text(encoding="utf-8")
+    assert all(value not in persisted_text for value in exposed)
+
+
+def test_run_harbor_real_subprocess_redacts_percent_decoded_proxy_components(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        runner,
+        "build_harbor_run_command",
+        lambda **_kwargs: [
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.write('proxy rejected process-user with process-password\\n'); raise SystemExit(7)",
+        ],
+    )
+
+    ok, detail = runner._run_harbor(
+        dataset=tmp_path / "dataset",
+        agent="opencode",
+        job_name="demo-opencode-with",
+        env_mode="docker",
+        model="nvidia/model",
+        jobs_dir=tmp_path,
+        run_env={
+            "HTTPS_PROXY": "https://process%2Duser:process%2Dpassword@proxy.invalid:8443",
+        },
+        n_attempts=1,
+        n_concurrent=1,
+        timeout_multiplier=1.0,
+        override_cpus=None,
+        override_memory_mb=None,
+        override_storage_mb=None,
+    )
+
+    assert ok is False
+    assert "proxy rejected" in detail
+    assert "process-user" not in detail
+    assert "process-password" not in detail
+
+
+@pytest.mark.parametrize("failure_path", ["nonzero", "output-limit", "timeout"])
+def test_run_harbor_redacts_detached_proxy_components_on_failure_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure_path: str,
+) -> None:
+    proxy_uri = "https://failure-user:failure-password@proxy.invalid:8443"
+    diagnostic = "proxy failure for failure-user with failure-password"
+
+    def bounded_process(*_args: object, **_kwargs: object) -> runner._BoundedHarborProcessResult:
+        if failure_path == "timeout":
+            raise runner._HarborRunTimeoutError(f"Harbor run timed out. Last output: {diagnostic}")
+        return runner._BoundedHarborProcessResult(
+            returncode=7 if failure_path == "nonzero" else -9,
+            output_tail=diagnostic,
+            output_exceeded=failure_path == "output-limit",
+        )
+
+    monkeypatch.setattr(
+        runner,
+        "build_harbor_run_command",
+        lambda **_kwargs: [sys.executable, "-c", "pass"],
+    )
+    monkeypatch.setattr(runner, "_run_bounded_harbor_process", bounded_process)
+
+    ok, detail = runner._run_harbor(
+        dataset=tmp_path / "dataset",
+        agent="opencode",
+        job_name="demo-opencode-with",
+        env_mode="docker",
+        model="nvidia/model",
+        jobs_dir=tmp_path,
+        run_env={"HTTPS_PROXY": proxy_uri},
+        n_attempts=1,
+        n_concurrent=1,
+        timeout_multiplier=1.0,
+        override_cpus=None,
+        override_memory_mb=None,
+        override_storage_mb=None,
+    )
+
+    assert ok is False
+    assert "failure-user" not in detail
+    assert "failure-password" not in detail
+
+
+def test_run_harbor_reports_timeout_after_bounded_runner_contains_tree(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        runner,
+        "_run_bounded_harbor_process",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(runner._HarborRunTimeoutError("Harbor run timed out")),
+    )
+
+    ok, detail = _run(monkeypatch, tmp_path)
+
+    assert ok is False
+    assert detail == "Harbor run timed out"
+
+
+@pytest.mark.parametrize(
+    ("secret", "bounded_result"),
+    [
+        (
+            "safety",
+            runner._BoundedHarborProcessResult(
+                returncode=-9,
+                output_tail="ordinary overflow tail",
+                output_exceeded=True,
+            ),
+        ),
+        (
+            "harbor run exited 7",
+            runner._BoundedHarborProcessResult(
+                returncode=7,
+                output_tail="",
+                output_exceeded=False,
+            ),
+        ),
+        (
+            "result.json",
+            runner._BoundedHarborProcessResult(
+                returncode=0,
+                output_tail="",
+                output_exceeded=False,
+            ),
+        ),
+    ],
+)
+def test_run_harbor_redacts_secrets_created_by_final_diagnostic_assembly(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    secret: str,
+    bounded_result: runner._BoundedHarborProcessResult,
+) -> None:
+    monkeypatch.setattr(
+        runner,
+        "build_harbor_run_command",
+        lambda **_kwargs: [sys.executable, "-c", "pass"],
+    )
+    monkeypatch.setattr(runner, "_run_bounded_harbor_process", lambda *_args, **_kwargs: bounded_result)
+
+    ok, detail = runner._run_harbor(
+        dataset=tmp_path / "dataset",
+        agent="opencode",
+        job_name="demo-opencode-with",
+        env_mode="docker",
+        model="nvidia/model",
+        jobs_dir=tmp_path,
+        run_env={"API_KEY": secret},
+        n_attempts=1,
+        n_concurrent=1,
+        timeout_multiplier=1.0,
+        override_cpus=None,
+        override_memory_mb=None,
+        override_storage_mb=None,
+    )
+
+    assert ok is False
+    assert secret not in detail
+    assert "redacted" in detail.lower()
+
+
+def test_run_harbor_uses_collision_safe_marker_for_synthesized_secret(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    synthesized_secret = "<redacted>"
+    monkeypatch.setattr(
+        runner,
+        "build_harbor_run_command",
+        lambda **_kwargs: [sys.executable, "-c", "pass"],
+    )
+    monkeypatch.setattr(
+        runner,
+        "_run_bounded_harbor_process",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(runner._HarborRunTimeoutError("Harbor run timed out")),
+    )
+
+    ok, detail = runner._run_harbor(
+        dataset=tmp_path / "dataset",
+        agent="opencode",
+        job_name="demo-opencode-with",
+        env_mode="docker",
+        model="nvidia/model",
+        jobs_dir=tmp_path,
+        run_env={
+            "FIRST_API_KEY": "Harbor run timed out",
+            "SECOND_API_KEY": synthesized_secret,
+        },
+        n_attempts=1,
+        n_concurrent=1,
+        timeout_multiplier=1.0,
+        override_cpus=None,
+        override_memory_mb=None,
+        override_storage_mb=None,
+    )
+
+    assert ok is False
+    assert "Harbor run timed out" not in detail
+    assert synthesized_secret not in detail
+
+
+def _complete_stats(**overrides: object) -> dict[str, object]:
+    stats: dict[str, object] = {
+        "n_trials": 1,
+        "n_errors": 0,
+        "evals": {
+            "codex__model___harbor-tasks": {
+                "n_trials": 1,
+                "n_errors": 0,
+                "reward_stats": {"reward": {"1.0": ["case-001__abc"]}},
+            }
+        },
+    }
+    stats.update(overrides)
+    return stats
+
+
+def test_run_harbor_rejects_missing_job_result(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    ok, detail = _run(monkeypatch, tmp_path)
+
+    assert ok is False
+    assert "result.json" in detail
+
+
+def test_run_harbor_rejects_zero_trials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _write_job_result(tmp_path, _complete_stats(n_trials=0, evals={}), total=0)
+
+    ok, detail = _run(monkeypatch, tmp_path)
+
+    assert ok is False
+    assert "zero trials" in detail
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"n_errors": 1}, "1 errored"),
+        ({"n_trials": 0}, "completed 0/1"),
+        ({"n_trials": 2}, "completed 2/1"),
+    ],
+)
+def test_run_harbor_rejects_non_successful_trial_states(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    overrides: dict[str, object],
+    expected: str,
+) -> None:
+    _write_job_result(tmp_path, _complete_stats(**overrides))
+
+    ok, detail = _run(monkeypatch, tmp_path)
+
+    assert ok is False
+    assert expected in detail
+
+
+def test_run_harbor_accepts_complete_successful_job(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _write_job_result(tmp_path, _complete_stats())
+
+    assert _run(monkeypatch, tmp_path) == (True, "")
+
+
+def test_run_harbor_accepts_pinned_harbor_0132_job_stats(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    stats = _complete_stats()
+    stats.pop("n_trials")
+    stats.pop("n_errors")
+    stats.update(
+        {
+            "n_completed_trials": 1,
+            "n_errored_trials": 0,
+            "n_running_trials": 0,
+            "n_pending_trials": 0,
+            "n_cancelled_trials": 0,
+            "n_retries": 0,
+        }
+    )
+    _write_job_result(tmp_path, stats)
+
+    assert _run(monkeypatch, tmp_path) == (True, "")
+
+
+@pytest.mark.parametrize(
+    ("counter", "expected"),
+    [
+        ("n_errored_trials", "1 errored"),
+        ("n_running_trials", "1 running"),
+        ("n_pending_trials", "1 pending"),
+        ("n_cancelled_trials", "1 cancelled"),
+    ],
+)
+def test_run_harbor_rejects_incomplete_pinned_harbor_0132_job_stats(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    counter: str,
+    expected: str,
+) -> None:
+    stats = _complete_stats()
+    stats.pop("n_trials")
+    stats.pop("n_errors")
+    stats.update(
+        {
+            "n_completed_trials": 1,
+            "n_errored_trials": 0,
+            "n_running_trials": 0,
+            "n_pending_trials": 0,
+            "n_cancelled_trials": 0,
+            "n_retries": 0,
+        }
+    )
+    stats[counter] = 1
+    _write_job_result(tmp_path, stats)
+
+    ok, detail = _run(monkeypatch, tmp_path)
+
+    assert ok is False
+    assert expected in detail
+
+
+def test_job_result_must_match_requested_trial_count(tmp_path: Path) -> None:
+    _write_job_result(tmp_path, _complete_stats())
+
+    ok, detail = runner._validate_harbor_job_result(
+        tmp_path,
+        "demo-opencode-with",
+        expected_trials=2,
+    )
+
+    assert ok is False
+    assert "declared 1 trials; expected 2" in detail
+
+
+@pytest.mark.parametrize(
+    ("stats", "expected"),
+    [
+        ({"n_trials": True, "n_errors": 0, "evals": {}}, "invalid n_trials"),
+        ({"n_trials": 1, "n_errors": -1, "evals": {}}, "invalid n_errors"),
+        ({"n_trials": 1, "n_errors": 0, "evals": {}}, "no evaluation statistics"),
+        (
+            {
+                "n_trials": 1,
+                "n_errors": 0,
+                "evals": {"eval": {"n_trials": 0, "n_errors": 0, "reward_stats": {}}},
+            },
+            "account for 0/1",
+        ),
+        (
+            {
+                "n_trials": 1,
+                "n_errors": 0,
+                "evals": {"eval": {"n_trials": 1, "n_errors": 0, "reward_stats": {}}},
+            },
+            "no scored trial names",
+        ),
+    ],
+)
+def test_run_harbor_rejects_incomplete_real_harbor_statistics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stats: dict[str, object],
+    expected: str,
+) -> None:
+    _write_job_result(tmp_path, stats)
+
+    ok, detail = _run(monkeypatch, tmp_path)
+
+    assert ok is False
+    assert expected in detail
+
+
+def test_run_harbor_rejects_reward_coverage_shortfall(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    stats = _complete_stats()
+    stats["n_trials"] = 2
+    stats["evals"] = {
+        "eval": {
+            "n_trials": 2,
+            "n_errors": 0,
+            "reward_stats": {"reward": {"1.0": ["case-001__abc"]}},
+        }
+    }
+    _write_job_result(tmp_path, stats, total=2)
+
+    ok, detail = _run(monkeypatch, tmp_path)
+
+    assert ok is False
+    assert "cover 1/2" in detail
+
+
+def test_run_harbor_rejects_duplicate_rewarded_trial_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    stats = _complete_stats()
+    stats["evals"] = {
+        "eval": {
+            "n_trials": 1,
+            "n_errors": 0,
+            "reward_stats": {"reward": {"1.0": ["case-001__abc", "case-001__abc"]}},
+        }
+    }
+    _write_job_result(tmp_path, stats)
+
+    ok, detail = _run(monkeypatch, tmp_path)
+
+    assert ok is False
+    assert "duplicate rewarded trial names" in detail

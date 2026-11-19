@@ -1,0 +1,7 @@
+# 需求台账：Tier 1
+
+引用已对照 `main` 分支 `2ec6364f` 提交核对。实时观测保留自 2026 年 11 月基于 `f83c2edc` 的运行结果，并非在 `2ec6364f` 上重跑。
+
+| # | 需求 | 代码 | 文档 | 测试 | 证据 | 状态 |
+|---|---|---|---|---|---|---|
+| T1 | 无 LLM 密钥时，语义分析器显示为失败、扫描显示为不完整；使用 `--no-llm` 时，语义分析器显示为已禁用 | `validators/security.py`、`skillspector_provenance.py`、`tier_workflows.py` | `tier1-validation.mdx` | `tests/validators/test_security.py`、`tests/validators/test_security_reference_caveats.py`、`tests/reporting/test_reporters.py`、`tests/cli/test_tier_workflows.py` | `main` 上的实时 `tier1`：未配置提供方时，输出 `llm skipped: No LLM provider configured; set SKILL_EVAL_LLM_PROVIDER and its API key to include LLM checks.`；使用 `--no-llm` 时，输出 `llm skipped: LLM checks disabled by --no-llm.`。两种情况均输出 `Tier 1: 11 of 11 checks passed; 0 failed, 0 incomplete, 0 skipped, 2 N/A` 和 `Publication eligibility: Incomplete`。选择提供方但未提供其密钥，于 2026-11-16 在 `8f1caf689d` 上以干净环境并设置 `SKILL_EVAL_LLM_PROVIDER=openai` 重跑：`tier1` 以退出码 1 结束，无扫描结果、无报告，输出 `Error: OPENAI_API_KEY or SKILL_EVAL_LLM_API_KEY is required.` 和 `To run static Tier 1 checks only, add --no-llm.`；`nv_build` 和 `anthropic` 同样中止，分别输出 `Error: NVIDIA_API_KEY is required for the selected provider.` 和 `Error: ANTHROPIC_API_KEY is required for the selected provider.` | 部分满足：原因文本能区分两种成因，但 Security Scan 行在两种情况下都显示 PASS，且两次运行都不计为不完整检查。无密钥的解读仅适用于未配置提供方的情况：已选择提供方但缺少其密钥时，运行在任何结果产生前即中止（退出码 1），因此没有分析器显示为失败 |

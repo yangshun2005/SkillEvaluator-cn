@@ -1,0 +1,113 @@
+---
+title: "Run your first check"
+sidebar-title: "Quickstart"
+description: "Get a bundled skill, run a quality check, and read the saved result. No API key required."
+---
+
+Get a quality score and findings for a complete example skill.
+[Install SkillEvaluator](/skills/skillevaluator/installation#install) first,
+then return here. The lightweight installation is enough; this check needs no API key, GPU, or Docker.
+
+<Steps toc={true}>
+
+### Get the example
+
+You need Git to download the example.
+
+```bash title="Clone the repository"
+git clone --depth 1 https://github.com/NVIDIA/SkillEvaluator.git
+cd SkillEvaluator
+```
+
+The bundled `text-analyzer` skill includes instructions and a working script.
+Keep this terminal open for the following commands.
+
+### Run without an LLM
+
+```bash title="Score the bundled skill"
+skillevaluator quality-check \
+  src/skillevaluator/tier3/reference_skills/text-analyzer \
+  -r cli -r json -o reports/first-quality
+```
+
+The check runs offline with your installed CLI.
+
+### Read your result
+
+The terminal shows your **score out of 100**, **A–F grade**, and findings to fix.
+The default minimum quality score is **70**. Open the saved JSON result at:
+
+```text title="Your saved report"
+reports/first-quality/skillevaluator-quality.json
+```
+
+<Note>
+  This is a quality check. Security scanners and live agents have not run,
+  so the report's overall publication status remains **INCOMPLETE** even when
+  the quality check passes.
+</Note>
+
+</Steps>
+
+## Check your own skill
+
+Replace the sample path with the directory containing your `SKILL.md`.
+Keep the report output outside that directory:
+
+```bash title="Run from the same checkout"
+skillevaluator quality-check ./my-skill \
+  -r cli -r json -o reports/my-skill-quality
+```
+
+## Use NVIDIA Build
+
+Want model feedback on the instructions? Add a rubric review for the same skill.
+
+<Accordion title="Set up a key and run a rubric review">
+  Add the `llm` extra using [Installation Options](/skills/skillevaluator/installation-options#choosing-extras),
+  or choose the [all-tier installation](/skills/skillevaluator/installation#all-tiers) first.
+
+  1. Sign in to [NVIDIA Build](https://build.nvidia.com/) and complete the
+     Developer Program enrollment prompts.
+  2. On a model page, choose **Get API Key** and copy your key. See the
+     [API Catalog quickstart](https://docs.api.nvidia.com/nim/docs/api-quickstart)
+     for the account setup steps and the
+     [access FAQ](https://docs.api.nvidia.com/nim/docs/product) for eligibility and limits.
+  3. In the same terminal, replace the example key and run:
+
+  ```bash title="Add model-backed feedback"
+  export SKILL_EVAL_LLM_PROVIDER=nv_build
+  export NVIDIA_API_KEY='nvapi-...'
+  skillevaluator rubric-eval \
+    src/skillevaluator/tier3/reference_skills/text-analyzer \
+    -r cli -r json -o reports/first-build
+  ```
+
+  Read the rubric feedback in the terminal or open
+  `reports/first-build/skillevaluator-rubric.json`.
+  Scores can vary between calls. This reviews the instructions; it does not
+  run an agent with the skill. No local GPU or Docker is needed.
+
+  For other providers or model overrides, see
+  [Providers & Credentials](/skills/skillevaluator/configuration).
+</Accordion>
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Run a live comparison" icon="flask" href="/skills/skillevaluator/tier3-live-evaluation">
+    Measure whether a skill improves an agent's task results.
+  </Card>
+  <Card title="Add automatic checks" icon="code-branch" href="/skills/skillevaluator/repository-integration">
+    Start with a GitHub or GitLab CI template.
+  </Card>
+  <Card title="Run full static validation" icon="shield" href="/skills/skillevaluator/installation-options#system-tools">
+    Check scanner setup for Semgrep, SkillSpector, and Gitleaks, then run Tier 1.
+  </Card>
+  <Card title="Try a guided experiment" icon="terminal" href="/skills/skillevaluator/starter-demo">
+    Change the example, introduce a regression, and compare real outputs.
+  </Card>
+</CardGroup>
+
+Find overlapping skills with [Tier 2](/skills/skillevaluator/tier2-deduplication),
+or learn more about your [reports](/skills/skillevaluator/reports).

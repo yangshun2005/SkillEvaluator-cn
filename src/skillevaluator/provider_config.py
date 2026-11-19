@@ -1,0 +1,891 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Public LLM and embedding provider configuration."""
+
+from __future__ import annotations
+
+import datetime
+import ipaddress
+import math
+import os
+import re
+import shutil
+import subprocess
+import time
+import unicodedata
+from collections.abc import Callable, Iterator, Mapping, MutableMapping
+from contextlib import contextmanager
+from dataclasses import dataclass
+from urllib.parse import quote, unquote_to_bytes, urlsplit, urlunsplit
+
+import idna
+
+CREDENTIAL_SOURCE_ADC = "ADC"
+CREDENTIAL_SOURCE_ENV = "SKILL_EVAL_LLM_CREDENTIAL_SOURCE"
+CREDENTIAL_EXPIRY_ENV = "SKILL_EVAL_LLM_CREDENTIAL_EXPIRY"
+GOOGLE_ADC_TOKEN_LIFETIME_SEC = 3600.0
+_ADC_MIN_REMAINING_LIFETIME_SEC = 30.0
+_ADC_MAX_SAFETY_MARGIN_SEC = 300.0
+_ADC_SAFETY_MARGIN_FRACTION = 0.1
+ADC_DISCOVERY_ENV_VARS: frozenset[str] = frozenset(
+    {
+        "CLOUDSDK_CONFIG",
+        "CLOUDSDK_CORE_PROJECT",
+        "GCP_PROJECT",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CLOUD_PROJECT",
+    }
+)
+_ADC_TOKEN_EXPIRY_BY_TOKEN: dict[str, float] = {}
+OPENAI_BASE_URL = "https://api.openai.com/v1"
+PUBLIC_NVIDIA_BUILD_BASE_URL = "https://integrate.api.nvidia.com/v1"
+_PROVIDER_SETUP_URL = "https://docs.nvidia.com/skills/skillevaluator/configuration"
+
+# Pinned frontier chat defaults (not floating aliases like ``gpt-5`` / ``claude-opus-latest``).
+# Harbor ``templates/eval.py`` cannot import this module — keep its local
+# ``DEFAULT_JUDGE_MODELS`` in sync via the drift test in
+# ``tests/tier3/test_judge_parse_robustness.py``.
+CHAT_DEFAULT_OPENAI = "gpt-6.1-sol"
+CHAT_DEFAULT_ANTHROPIC = "claude-opus-5-5"
+CHAT_DEFAULT_BEDROCK = "us.anthropic.claude-opus-5-5"
+CHAT_DEFAULT_NVIDIA = "nvidia/nemotron-3.5-lightning-30b-a3b"
+# Gateway catalog IDs are independent of native-provider model names. Operators
+# can override these defaults without changing the configured endpoint or key.
+CHAT_DEFAULT_GATEWAY = "nvidia/nvidia/nemotron-3-super-120b-long-ctx"
+# Lower-cost OpenAI alternative for ``SKILL_EVAL_LLM_MODEL`` overrides.
+CHAT_CHEAP_OPENAI = "gpt-5.4-mini"
+
+CHAT_DEFAULT_MODELS = {
+    "openai": CHAT_DEFAULT_OPENAI,
+    "anthropic": CHAT_DEFAULT_ANTHROPIC,
+    "nv_build": CHAT_DEFAULT_NVIDIA,
+    "bedrock": CHAT_DEFAULT_BEDROCK,
+    "openai-compatible": CHAT_DEFAULT_GATEWAY,
+}
+# SkillSpector sends its own structured-output requests, so its defaults move
+# only to models the pinned SkillSpector release supports, not with the chat
+# defaults. Every entry is a literal so a chat-default bump cannot move it.
+# An explicit ``SKILL_EVAL_LLM_MODEL`` still reaches SkillSpector.
+SKILLSPECTOR_DEFAULT_MODELS = {
+    "openai": "gpt-6.1-sol",
+    "anthropic": "claude-opus-5-5",
+    "bedrock": "us.anthropic.claude-opus-5-5",
+    "nv_build": "nvidia/nemotron-3.5-lightning-30b-a3b",
+    "openai-compatible": "nvidia/nvidia/nemotron-3-super-120b-long-ctx",
+}
+SKILLSPECTOR_DEFAULT_REASONING_EFFORT = "medium"
+# Agent harnesses have separate model defaults with their required capabilities.
+# OpenCode keeps its own literal so a gateway chat-default change does not move it.
+GATEWAY_AGENT_DEFAULT_MODELS = {
+    "codex": "openai/openai/gpt-6.1-sol",
+    "claude-code": "aws/anthropic/bedrock-claude-opus-5-5",
+    "opencode": "nvidia/nvidia/nemotron-3-super-120b-long-ctx",
+}
+# OpenCode drives OpenAI through a Chat Completions tool loop, and GPT-6.1 Sol
+# supports tool calls only on the Responses API.
+OPENCODE_OPENAI_DEFAULT_MODEL = "gpt-5.6-sol"
+EMBEDDING_DEFAULT_NVIDIA = "nvidia/nemotron-3-embed-1b"
+EMBEDDING_DEFAULT_GATEWAY = "nvidia/nvidia/nemotron-3-embed-1b"
+_EMBEDDING_DEFAULT_MODELS = {
+    "openai": "text-embedding-3-small",
+    "nv_build": EMBEDDING_DEFAULT_NVIDIA,
+    "openai-compatible": EMBEDDING_DEFAULT_GATEWAY,
+}
+_SUPPORTED_PROVIDERS = frozenset({"openai", "anthropic", "nv_build", "bedrock", "openai-compatible"})
+_ANTHROPIC_DNS_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+_ANTHROPIC_INTERNAL_LABEL_RE = re.compile(r"^[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$")
+_ANTHROPIC_IPV6_ZONE_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
+_ANTHROPIC_PATH_SAFE = "/:@!$&'()*+,;=-._~%"
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_HEX_DIGIT_BYTES = frozenset(b"0123456789abcdefABCDEF")
+_UNRESERVED_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+_NO_CUSTOM_TEMPERATURE_MODEL_IDS = frozenset({"claude-mythos-preview"})
+_ANTHROPIC_BEDROCK_PREFIX_RE = re.compile(r"^(?:(?:[a-z]{2}|global)\.)?anthropic\.")
+# Gateway catalogs can put vendor words before the model name, as in
+# ``aws/anthropic/bedrock-claude-opus-5-5``.
+_GATEWAY_LEAF_PREFIX_RE = re.compile(r"^(?:[a-z]+-)+?(?=(?:claude|gpt)-)")
+_VERSIONED_CLAUDE_MODEL_RE = re.compile(
+    r"^claude-[a-z][a-z-]*-(?P<major>\d+)"
+    r"(?:-(?P<minor>\d{1,2}))?"
+    r"(?:-(?:\d{8}|latest))?"
+    r"(?:-v\d+)?(?::\d+)?$"
+)
+# Output-token ceilings. OpenAI recommends reserving at least 25K tokens for
+# reasoning plus output on its reasoning models. Other models keep the role's
+# own limit, at most MAX_COMPLETION_TOKENS. The Anthropic SDK also caps
+# non-streaming requests per model (8,192 for Claude Opus 4 and 4.1), and the
+# shared client clamps to that cap.
+MAX_COMPLETION_TOKENS = 16384
+REASONING_MAX_COMPLETION_TOKENS = 32768
+# Claude 5.5 safety classifiers can decline benign security content. The
+# native Claude API then retries the request on this model in the same call.
+ANTHROPIC_REFUSAL_FALLBACK_MODEL = "claude-opus-4-8"
+ANTHROPIC_SERVER_SIDE_FALLBACK_BETA = "server-side-fallback-2026-07-01"
+# The Claude API accepts only some fallback targets for a given request model
+# and answers HTTP 400 "'<fallback>' is not a valid fallback target for
+# '<model>'" otherwise. This variable overrides the target, or turns the
+# server-side fallback off with one of the values below.
+ANTHROPIC_REFUSAL_FALLBACK_MODEL_ENV = "SKILL_EVAL_LLM_REFUSAL_FALLBACK_MODEL"
+_REFUSAL_FALLBACK_DISABLED_VALUES = frozenset({"none", "off", "disabled", "false", "0"})
+
+
+def anthropic_refusal_fallback_model(model: str, environ: Mapping[str, str] | None = None) -> str | None:
+    """Return the server-side refusal fallback target for ``model``, or ``None`` for no fallback.
+
+    ``SKILL_EVAL_LLM_REFUSAL_FALLBACK_MODEL`` replaces the built-in target; ``none``,
+    ``off``, ``disabled``, ``false`` or ``0`` (any case) turns the fallback off. An
+    empty value counts as unset. A target equal to ``model`` is never sent.
+    """
+    value = str((os.environ if environ is None else environ).get(ANTHROPIC_REFUSAL_FALLBACK_MODEL_ENV, "")).strip()
+    if value.casefold() in _REFUSAL_FALLBACK_DISABLED_VALUES:
+        return None
+    target = value or ANTHROPIC_REFUSAL_FALLBACK_MODEL
+    return None if target == str(model or "").strip() else target
+
+
+def _model_leaf(model: str) -> str:
+    """Return a normalized model ID for capability checks only."""
+    leaf = str(model or "").strip().casefold().rsplit("/", 1)[-1]
+    leaf = _GATEWAY_LEAF_PREFIX_RE.sub("", leaf, count=1)
+    return _ANTHROPIC_BEDROCK_PREFIX_RE.sub("", leaf, count=1)
+
+
+def _claude_version(model: str) -> tuple[int, int] | None:
+    """Return the ``(major, minor)`` version of a Claude model ID, or ``None``."""
+    match = _VERSIONED_CLAUDE_MODEL_RE.fullmatch(_model_leaf(model))
+    if match is None:
+        return None
+    return int(match.group("major")), int(match.group("minor") or 0)
+
+
+def is_openai_reasoning_model(model: str) -> bool:
+    """Return whether ``model`` is a GPT-5 or GPT-6 reasoning model."""
+    return _model_leaf(model).startswith(("gpt-5", "gpt-6"))
+
+
+def is_gpt6_model(model: str) -> bool:
+    """Return whether ``model`` is a GPT-6 model."""
+    return _model_leaf(model).startswith("gpt-6")
+
+
+def is_claude_5_5_or_later(model: str) -> bool:
+    """Return whether ``model`` is a Claude 5.5 or later model."""
+    version = _claude_version(model)
+    return version is not None and version >= (5, 5)
+
+
+def _supports_custom_temperature(model: str) -> bool:
+    """Return whether ``model`` accepts a non-default temperature value."""
+    if is_openai_reasoning_model(model) or _model_leaf(model) in _NO_CUSTOM_TEMPERATURE_MODEL_IDS:
+        return False
+    version = _claude_version(model)
+    return version is None or version < (4, 7)
+
+
+def completion_token_limit(model: str, max_tokens: int) -> int:
+    """Return ``max_tokens`` raised to the reasoning ceiling for OpenAI reasoning models."""
+    return max(max_tokens, REASONING_MAX_COMPLETION_TOKENS) if is_openai_reasoning_model(model) else max_tokens
+
+
+def effective_reasoning_effort(provider: str, model: str, effort: str | None) -> str | None:
+    """Return the reasoning effort SkillEvaluator sends for ``model`` on ``provider``.
+
+    GPT-6 models get one on every provider except Bedrock, and Claude 5.5 or
+    later gets one on every ``anthropic`` endpoint, including a custom
+    ``ANTHROPIC_BASE_URL``. Bedrock and OpenAI-compatible Claude routes can
+    reject the field, so they and all other models keep their default effort.
+    """
+    if provider == "anthropic":
+        supported = is_claude_5_5_or_later(model)
+    else:
+        supported = provider != "bedrock" and is_gpt6_model(model)
+    return effort if supported else None
+
+
+def skillspector_reasoning_effort(model: str) -> str | None:
+    """Return the SkillSpector reasoning effort SkillEvaluator sets for ``model``.
+
+    Only GPT-6 models get one. Claude models behind OpenAI-compatible gateways
+    can reject the parameter, so their effort stays at the model default.
+    """
+    return SKILLSPECTOR_DEFAULT_REASONING_EFFORT if is_gpt6_model(model) else None
+
+
+class ProviderConfigurationError(ValueError):
+    """Raised when a selected public provider is not fully configured."""
+
+
+@dataclass(frozen=True)
+class ProviderConfig:
+    """Resolved provider values safe to pass to the relevant SDK."""
+
+    provider: str
+    model: str
+    api_key: str | None
+    base_url: str | None
+    litellm_model: str
+    region: str | None = None
+    credential_env: str | None = None
+    base_url_env: str | None = None
+    credential_expiry: float | None = None
+
+    def child_environment(self) -> dict[str, str]:
+        """Return this provider's public credential settings for a child process."""
+        environment: dict[str, str] = {}
+        if self.credential_env and self.credential_env != "ADC" and self.api_key:
+            environment[self.credential_env] = self.api_key
+        if self.provider == "openai" and self.api_key:
+            environment["OPENAI_API_KEY"] = self.api_key
+
+        if self.base_url_env and self.base_url:
+            environment[self.base_url_env] = self.base_url
+        elif self.provider == "openai" and self.base_url:
+            environment["OPENAI_BASE_URL"] = self.base_url
+        elif self.provider == "anthropic" and self.base_url:
+            environment["ANTHROPIC_BASE_URL"] = self.base_url
+        elif self.provider == "openai-compatible" and self.base_url:
+            environment["SKILL_EVAL_LLM_BASE_URL"] = self.base_url
+        elif self.provider == "bedrock" and self.region:
+            environment["AWS_REGION"] = self.region
+
+        return environment
+
+
+def _normalize_expiry_epoch(expiry: object) -> float | None:
+    """Convert a credential expiry value into a UTC epoch timestamp."""
+    if expiry is None or isinstance(expiry, bool):
+        return None
+    if isinstance(expiry, (int, float)):
+        return float(expiry)
+    if isinstance(expiry, datetime.datetime):
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=datetime.UTC)
+        return float(expiry.timestamp())
+    if isinstance(expiry, str):
+        raw = expiry.strip()
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+        try:
+            parsed_dt = datetime.datetime.fromisoformat(raw)
+            if parsed_dt.tzinfo is None:
+                parsed_dt = parsed_dt.replace(tzinfo=datetime.UTC)
+            return float(parsed_dt.timestamp())
+        except ValueError:
+            return None
+    return None
+
+
+def get_adc_token_expiry(token: str | None) -> float | None:
+    """Return the recorded UTC epoch expiry for an ADC token, if known."""
+    if not token:
+        return None
+    return _ADC_TOKEN_EXPIRY_BY_TOKEN.get(token)
+
+
+def compute_adc_job_timeout(
+    *,
+    expiry_epoch: float | None = None,
+    now_epoch: float | None = None,
+    configured_timeout_sec: str | float | None = None,
+) -> float:
+    """Compute the maximum safe Harbor job duration for an ADC access token."""
+    now = time.time() if now_epoch is None else float(now_epoch)
+    remaining = (float(expiry_epoch) - now) if expiry_epoch is not None else GOOGLE_ADC_TOKEN_LIFETIME_SEC
+    if remaining <= _ADC_MIN_REMAINING_LIFETIME_SEC:
+        raise ValueError(
+            f"Vertex AI ADC access token has only {remaining:.1f}s remaining; "
+            "refresh credentials before running Harbor."
+        )
+    safety_margin = min(
+        _ADC_MAX_SAFETY_MARGIN_SEC,
+        max(_ADC_MIN_REMAINING_LIFETIME_SEC, _ADC_SAFETY_MARGIN_FRACTION * remaining),
+    )
+    effective_ceiling = max(1.0, remaining - safety_margin)
+    if configured_timeout_sec is not None and str(configured_timeout_sec).strip():
+        try:
+            parsed = float(str(configured_timeout_sec).strip())
+        except ValueError:
+            return effective_ceiling
+        if not math.isfinite(parsed) or parsed <= 0:
+            return effective_ceiling
+        return min(parsed, effective_ceiling)
+    return effective_ceiling
+
+
+def sync_refreshed_adc_persistent_env(
+    persistent_env: object,
+    *,
+    fresh_token: str | None,
+) -> bool:
+    """Scrub host-only ADC expiry metadata from a container _persistent_env and update OPENAI_API_KEY."""
+    if not isinstance(persistent_env, MutableMapping):
+        return False
+    persistent_env.pop(CREDENTIAL_EXPIRY_ENV, None)
+    if fresh_token and str(persistent_env.get("OPENAI_API_KEY", "")).strip():
+        persistent_env["OPENAI_API_KEY"] = fresh_token
+        return True
+    return False
+
+
+@contextmanager
+def _scoped_adc_discovery_environ(*sources: Mapping[str, str] | None) -> Iterator[None]:
+    """Temporarily populate missing ADC discovery env vars in os.environ."""
+    restorations: dict[str, str | None] = {}
+    try:
+        for key in ADC_DISCOVERY_ENV_VARS:
+            if os.environ.get(key, "").strip():
+                continue
+            for source in sources:
+                if source and (val := source.get(key, "").strip()):
+                    restorations[key] = os.environ.get(key)
+                    os.environ[key] = val
+                    break
+        yield
+    finally:
+        for key, previous in restorations.items():
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
+
+
+def _is_vertex_openapi_endpoint(base_url: str | None) -> bool:
+    """Return whether the base URL points to a Vertex AI Agent Platform OpenAPI endpoint."""
+    if not isinstance(base_url, str) or not base_url.strip():
+        return False
+    clean = base_url.strip()
+    if "\\" in clean or any(character in clean for character in ("?", "#", ";")):
+        return False
+    try:
+        endpoint = urlsplit(clean)
+        port = endpoint.port
+    except (TypeError, ValueError):
+        return False
+    if (
+        endpoint.scheme.casefold() != "https"
+        or endpoint.hostname is None
+        or endpoint.username is not None
+        or endpoint.password is not None
+        or port not in {None, 443}
+    ):
+        return False
+    host = endpoint.hostname.casefold()
+    if not re.fullmatch(r"(?:[a-z0-9]+-[a-z0-9]+(?:-[a-z0-9]+)?-)?aiplatform\.googleapis\.com", host):
+        return False
+    path = endpoint.path.rstrip("/")
+    return bool(re.fullmatch(r"/v1(?:beta[0-9]+)?/projects/[^/]+/locations/[^/]+/endpoints/openapi", path))
+
+
+def _parse_vertex_openapi_metadata(base_url: str) -> tuple[str | None, str | None]:
+    """Extract project ID and location from a Vertex AI OpenAPI base URL."""
+    if not isinstance(base_url, str) or not base_url.strip():
+        return None, None
+    try:
+        endpoint = urlsplit(base_url.strip())
+        match = re.search(r"/projects/([^/]+)/locations/([^/]+)/endpoints/openapi", endpoint.path)
+        if match:
+            return match.group(1), match.group(2)
+    except Exception:
+        pass
+    return None, None
+
+
+def _get_google_access_token(
+    timeout_seconds: float = 10.0,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> str | None:
+    """Acquire Google Cloud access token via google.auth or gcloud CLI."""
+    with _scoped_adc_discovery_environ(environ):
+        try:
+            import google.auth
+            import google.auth.transport.requests
+
+            credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+            request = google.auth.transport.requests.Request()
+            credentials.refresh(request)
+            if getattr(credentials, "token", None):
+                token = str(credentials.token)
+                expiry_epoch = _normalize_expiry_epoch(getattr(credentials, "expiry", None))
+                if expiry_epoch is not None:
+                    _ADC_TOKEN_EXPIRY_BY_TOKEN[token] = expiry_epoch
+                return token
+        except Exception:
+            pass
+
+        gcloud_path = shutil.which("gcloud")
+        if gcloud_path:
+            for args in (
+                [gcloud_path, "auth", "application-default", "print-access-token"],
+                [gcloud_path, "auth", "print-access-token"],
+            ):
+                try:
+                    proc = subprocess.run(
+                        args,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout_seconds,
+                        check=False,
+                        env=dict(os.environ),
+                    )
+                    if proc.returncode == 0 and proc.stdout.strip():
+                        return proc.stdout.strip()
+                except Exception:
+                    pass
+
+    return None
+
+
+def refresh_host_vertex_adc_environment(
+    env: MutableMapping[str, str],
+    *,
+    fallback_env: Mapping[str, str] | None = None,
+    base_url_override: str | None = None,
+    require_existing_api_key: bool = False,
+    require_refresh: bool = False,
+    fail_on_expired: bool = False,
+    update_os_environ: bool = False,
+    token_getter: Callable[[], str | None] | None = None,
+) -> str | None:
+    """Refresh OPENAI_API_KEY in-place when provenance is ADC and endpoint is Vertex OpenAPI."""
+    source = env.get(CREDENTIAL_SOURCE_ENV) or (fallback_env or {}).get(CREDENTIAL_SOURCE_ENV)
+    if source != CREDENTIAL_SOURCE_ADC:
+        return None
+    if require_existing_api_key and not env.get("OPENAI_API_KEY", "").strip():
+        return None
+    base_url = (
+        base_url_override
+        or env.get("OPENAI_BASE_URL")
+        or env.get("SKILL_EVAL_LLM_BASE_URL")
+        or (fallback_env or {}).get("OPENAI_BASE_URL")
+        or (fallback_env or {}).get("SKILL_EVAL_LLM_BASE_URL")
+    )
+    if not _is_vertex_openapi_endpoint(base_url):
+        return None
+    getter = token_getter or _get_google_access_token
+    with _scoped_adc_discovery_environ(env, fallback_env):
+        fresh_token = getter()
+    now = time.time()
+    if fresh_token:
+        env["OPENAI_API_KEY"] = fresh_token
+        if update_os_environ:
+            os.environ["OPENAI_API_KEY"] = fresh_token
+        expiry_epoch = get_adc_token_expiry(fresh_token)
+        if expiry_epoch is not None:
+            env[CREDENTIAL_EXPIRY_ENV] = str(expiry_epoch)
+            if update_os_environ:
+                os.environ[CREDENTIAL_EXPIRY_ENV] = str(expiry_epoch)
+            if fail_on_expired and expiry_epoch <= now:
+                raise RuntimeError("Refreshed Google ADC access token is already expired.")
+        else:
+            env.pop(CREDENTIAL_EXPIRY_ENV, None)
+            if update_os_environ:
+                os.environ.pop(CREDENTIAL_EXPIRY_ENV, None)
+        return fresh_token
+
+    if require_refresh:
+        raise RuntimeError(
+            "Failed to refresh Google ADC access token for Vertex AI OpenAPI endpoint before container execution."
+        )
+    if fail_on_expired:
+        existing_token = env.get("OPENAI_API_KEY") or (fallback_env or {}).get("OPENAI_API_KEY")
+        existing_expiry = get_adc_token_expiry(existing_token) or _normalize_expiry_epoch(
+            env.get(CREDENTIAL_EXPIRY_ENV) or (fallback_env or {}).get(CREDENTIAL_EXPIRY_ENV)
+        )
+        if existing_expiry is not None and existing_expiry <= now:
+            raise RuntimeError(
+                "Google ADC access token for Vertex AI OpenAPI endpoint has expired and token refresh failed."
+            )
+    return None
+
+
+def _build_vertex_openapi_adc_config(
+    provider: str,
+    model: str,
+    base_url: str,
+    *,
+    base_url_env: str,
+    timeout_seconds: float = 10.0,
+    environ: Mapping[str, str] | None = None,
+) -> ProviderConfig:
+    """Build a ProviderConfig using Google Application Default Credentials for Vertex OpenAPI."""
+    token = _get_google_access_token(timeout_seconds=timeout_seconds, environ=environ)
+    if not token:
+        raise ProviderConfigurationError(
+            "Vertex AI OpenAPI endpoint requires an API key or Google Application Default Credentials (ADC)."
+        )
+    return ProviderConfig(
+        provider=provider,
+        model=model,
+        api_key=token,
+        base_url=base_url,
+        litellm_model=f"openai/{model}",
+        credential_env=CREDENTIAL_SOURCE_ADC,
+        base_url_env=base_url_env,
+        credential_expiry=get_adc_token_expiry(token),
+    )
+
+
+def resolve_llm_provider(environ: Mapping[str, str] | None = None) -> ProviderConfig:
+    """Resolve the public provider used for LLM-backed checks and judging."""
+    env = _environment(environ)
+    provider = _selected_provider(env, "SKILL_EVAL_LLM_PROVIDER")
+    _validate_provider(provider, variable="SKILL_EVAL_LLM_PROVIDER")
+    configured_model = env.get("SKILL_EVAL_LLM_MODEL")
+    if configured_model is None:
+        model = CHAT_DEFAULT_MODELS[provider]
+    else:
+        model = configured_model.strip()
+        if not model:
+            raise ProviderConfigurationError("SKILL_EVAL_LLM_MODEL must be a non-empty string when set.")
+
+    if provider == "openai":
+        base_url = (env.get("SKILL_EVAL_LLM_BASE_URL") or env.get("OPENAI_BASE_URL") or OPENAI_BASE_URL).rstrip("/")
+        api_key = env.get("OPENAI_API_KEY") or env.get("SKILL_EVAL_LLM_API_KEY")
+        if _is_vertex_openapi_endpoint(base_url) and not api_key:
+            return _build_vertex_openapi_adc_config(
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                base_url_env="OPENAI_BASE_URL",
+                environ=env,
+            )
+        credential_env = "OPENAI_API_KEY" if env.get("OPENAI_API_KEY") else "SKILL_EVAL_LLM_API_KEY"
+        if not api_key:
+            raise ProviderConfigurationError("OPENAI_API_KEY or SKILL_EVAL_LLM_API_KEY is required.")
+        return ProviderConfig(
+            provider=provider,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            litellm_model=f"openai/{model}",
+            credential_env=credential_env,
+            base_url_env="OPENAI_BASE_URL",
+        )
+    if provider == "anthropic":
+        return ProviderConfig(
+            provider=provider,
+            model=model,
+            api_key=_required(env, "ANTHROPIC_API_KEY"),
+            base_url=_anthropic_base_url(env),
+            litellm_model=f"anthropic/{model}",
+            credential_env="ANTHROPIC_API_KEY",
+            base_url_env="ANTHROPIC_BASE_URL",
+        )
+    if provider == "nv_build":
+        return ProviderConfig(
+            provider=provider,
+            model=model,
+            api_key=_required(env, "NVIDIA_API_KEY"),
+            base_url=PUBLIC_NVIDIA_BUILD_BASE_URL,
+            litellm_model=f"openai/{model}",
+            credential_env="NVIDIA_API_KEY",
+        )
+    if provider == "bedrock":
+        return ProviderConfig(
+            provider=provider,
+            model=model,
+            api_key=None,
+            base_url=None,
+            litellm_model=f"bedrock/{model}",
+            region=env.get("AWS_REGION") or "us-west-2",
+        )
+
+    base_url = _required(env, "SKILL_EVAL_LLM_BASE_URL").rstrip("/")
+    api_key = env.get("SKILL_EVAL_LLM_API_KEY")
+    if _is_vertex_openapi_endpoint(base_url) and not api_key:
+        return _build_vertex_openapi_adc_config(
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            base_url_env="SKILL_EVAL_LLM_BASE_URL",
+            environ=env,
+        )
+    return ProviderConfig(
+        provider=provider,
+        model=model,
+        api_key=_required(env, "SKILL_EVAL_LLM_API_KEY"),
+        base_url=base_url,
+        litellm_model=f"openai/{model}",
+        credential_env="SKILL_EVAL_LLM_API_KEY",
+        base_url_env="SKILL_EVAL_LLM_BASE_URL",
+    )
+
+
+def resolve_embedding_provider(environ: Mapping[str, str] | None = None) -> ProviderConfig:
+    """Resolve the embedding provider used by Tier 2 semantic overlap checks."""
+    env = _environment(environ)
+    provider = (
+        env.get("SKILL_EVAL_EMBEDDING_PROVIDER")
+        or env.get("SKILL_EVAL_LLM_PROVIDER")
+        or _selected_provider(env, "SKILL_EVAL_EMBEDDING_PROVIDER")
+    ).lower()
+    if provider in {"anthropic", "bedrock"}:
+        raise ProviderConfigurationError(
+            f"SKILL_EVAL_EMBEDDING_PROVIDER is required because {provider} does not provide embeddings. "
+            "Set SKILL_EVAL_EMBEDDING_PROVIDER=nv_build|openai|openai-compatible (NVIDIA_API_KEY or "
+            "OPENAI_API_KEY supply the first two)."
+        )
+    _validate_provider(provider, variable="SKILL_EVAL_EMBEDDING_PROVIDER")
+
+    if provider == "openai":
+        return ProviderConfig(
+            provider=provider,
+            model=env.get("SKILL_EVAL_EMBEDDING_MODEL") or _EMBEDDING_DEFAULT_MODELS[provider],
+            api_key=_required(env, "OPENAI_API_KEY"),
+            base_url=(env.get("SKILL_EVAL_EMBEDDING_BASE_URL") or env.get("OPENAI_BASE_URL") or OPENAI_BASE_URL).rstrip(
+                "/"
+            ),
+            litellm_model=f"openai/{env.get('SKILL_EVAL_EMBEDDING_MODEL') or _EMBEDDING_DEFAULT_MODELS[provider]}",
+            credential_env="OPENAI_API_KEY",
+            base_url_env="OPENAI_BASE_URL",
+        )
+    if provider == "nv_build":
+        return ProviderConfig(
+            provider=provider,
+            model=env.get("SKILL_EVAL_EMBEDDING_MODEL") or _EMBEDDING_DEFAULT_MODELS[provider],
+            api_key=_required(env, "NVIDIA_API_KEY"),
+            base_url=PUBLIC_NVIDIA_BUILD_BASE_URL,
+            litellm_model=f"openai/{env.get('SKILL_EVAL_EMBEDDING_MODEL') or _EMBEDDING_DEFAULT_MODELS[provider]}",
+            credential_env="NVIDIA_API_KEY",
+        )
+
+    model = env.get("SKILL_EVAL_EMBEDDING_MODEL", _EMBEDDING_DEFAULT_MODELS[provider]).strip()
+    if not model:
+        raise ProviderConfigurationError("SKILL_EVAL_EMBEDDING_MODEL must be a non-empty string when set.")
+    return ProviderConfig(
+        provider=provider,
+        model=model,
+        api_key=env.get("SKILL_EVAL_EMBEDDING_API_KEY") or _required(env, "SKILL_EVAL_LLM_API_KEY"),
+        base_url=(env.get("SKILL_EVAL_EMBEDDING_BASE_URL") or _required(env, "SKILL_EVAL_LLM_BASE_URL")).rstrip("/"),
+        litellm_model=f"openai/{model}",
+        credential_env=(
+            "SKILL_EVAL_EMBEDDING_API_KEY"
+            if env.get("SKILL_EVAL_EMBEDDING_API_KEY", "").strip()
+            else "SKILL_EVAL_LLM_API_KEY"
+        ),
+        base_url_env="SKILL_EVAL_EMBEDDING_BASE_URL",
+    )
+
+
+def _environment(environ: Mapping[str, str] | None) -> Mapping[str, str]:
+    return os.environ if environ is None else environ
+
+
+def _required(environ: Mapping[str, str], variable: str) -> str:
+    value = environ.get(variable, "").strip()
+    if not value:
+        message = f"{variable} is required for the selected provider."
+        if variable in {"NVIDIA_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "SKILL_EVAL_LLM_API_KEY"}:
+            message += (
+                "\n\nSet it in your shell:\n"
+                f"  export {variable}='your-api-key'\n\n"
+                f"Provider setup:\n  {_PROVIDER_SETUP_URL}"
+            )
+        raise ProviderConfigurationError(message)
+    return value
+
+
+def _anthropic_base_url(environ: Mapping[str, str]) -> str | None:
+    for variable in ("SKILL_EVAL_LLM_BASE_URL", "ANTHROPIC_BASE_URL"):
+        if value := environ.get(variable):
+            return _normalize_anthropic_base_url(value, variable=variable)
+    return None
+
+
+def _normalize_anthropic_base_url(value: str, *, variable: str) -> str:
+    error = (
+        f"{variable} must be an absolute HTTP or HTTPS URL representing an API root without credentials, query, fragment, "
+        "whitespace, control characters, backslashes, an invalid authority, or a /v1/messages endpoint."
+    )
+    if "\\" in value or any(
+        character.isspace() or unicodedata.category(character) in {"Cc", "Cf", "Cs"} for character in value
+    ):
+        raise ProviderConfigurationError(error)
+    if "?" in value or "#" in value:
+        raise ProviderConfigurationError(error)
+
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        _ = parsed.port
+    except ValueError:
+        raise ProviderConfigurationError(error) from None
+
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.netloc
+        or hostname is None
+        or parsed.netloc.endswith(":")
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ProviderConfigurationError(error)
+
+    authority = _canonical_anthropic_authority(parsed.netloc, hostname)
+    path = _canonical_anthropic_path(parsed.path)
+    if authority is None or path is None:
+        raise ProviderConfigurationError(error)
+
+    path = path.rstrip("/")
+    if path.endswith("/v1/messages"):
+        raise ProviderConfigurationError(error)
+    if path.endswith("/v1"):
+        path = path.removesuffix("/v1")
+    return urlunsplit((parsed.scheme, authority, path, "", ""))
+
+
+def _canonical_anthropic_authority(netloc: str, hostname: str) -> str | None:
+    if netloc.startswith("["):
+        closing_bracket = netloc.find("]")
+        if closing_bracket < 0:
+            return None
+        literal = netloc[1:closing_bracket]
+        suffix = netloc[closing_bracket + 1 :]
+        if literal.casefold() != hostname.casefold() or (
+            suffix and (not suffix.startswith(":") or not suffix[1:].isascii() or not suffix[1:].isdigit())
+        ):
+            return None
+
+        address = literal
+        zone = ""
+        if "%" in literal:
+            address, separator, zone = literal.partition("%25")
+            if not separator or "%" in address or "%" in zone or not _ANTHROPIC_IPV6_ZONE_RE.fullmatch(zone):
+                return None
+        try:
+            ipaddress.IPv6Address(address)
+        except ValueError:
+            return None
+        return f"[{address}{'%25' + zone if zone else ''}]{suffix}"
+
+    if "%" in netloc or "[" in netloc or "]" in netloc:
+        return None
+    host = netloc
+    suffix = ""
+    if ":" in netloc:
+        host, port = netloc.rsplit(":", maxsplit=1)
+        if ":" in host or not port.isascii() or not port.isdigit():
+            return None
+        suffix = f":{port}"
+    if host.casefold() != hostname.casefold():
+        return None
+
+    if "." in hostname and all(character in "0123456789." for character in hostname):
+        try:
+            ipaddress.IPv4Address(hostname)
+        except ValueError:
+            return None
+        return f"{host}{suffix}"
+
+    trailing_dot = host.endswith(".")
+    dns_name = host.removesuffix(".")
+    if not dns_name:
+        return None
+    if dns_name.isascii() and "_" in dns_name:
+        canonical_name = dns_name.lower()
+        label_pattern = _ANTHROPIC_INTERNAL_LABEL_RE
+    else:
+        try:
+            canonical_name = idna.encode(dns_name.lower()).decode("ascii")
+        except idna.IDNAError:
+            return None
+        label_pattern = _ANTHROPIC_DNS_LABEL_RE
+    if len(canonical_name) > 253 or not all(label_pattern.fullmatch(label) for label in canonical_name.split(".")):
+        return None
+    return f"{canonical_name}{'.' if trailing_dot else ''}{suffix}"
+
+
+def _canonical_anthropic_path(path: str) -> str | None:
+    canonical: list[str] = []
+    index = 0
+    while index < len(path):
+        character = path[index]
+        if character != "%":
+            canonical.append(character)
+            index += 1
+            continue
+
+        if index + 2 >= len(path) or path[index + 1] not in _HEX_DIGITS or path[index + 2] not in _HEX_DIGITS:
+            return None
+        octet = int(path[index + 1 : index + 3], 16)
+        if octet in {0x2F, 0x5C, 0x7F} or octet < 0x20:
+            return None
+        if octet in _UNRESERVED_BYTES:
+            canonical.append(chr(octet))
+        else:
+            canonical.append(f"%{octet:02X}")
+        index += 3
+
+    canonical_path = "".join(canonical)
+    if "//" in canonical_path.rstrip("/"):
+        return None
+    decoded_octets = unquote_to_bytes(canonical_path)
+    # A decoded percent is safe as data unless it opens a second escape layer.
+    if any(
+        decoded_octets[index] == 0x25
+        and index + 2 < len(decoded_octets)
+        and decoded_octets[index + 1] in _HEX_DIGIT_BYTES
+        and decoded_octets[index + 2] in _HEX_DIGIT_BYTES
+        for index in range(len(decoded_octets))
+    ):
+        return None
+    decoded_path = decoded_octets.decode("utf-8", errors="replace")
+    if any(unicodedata.category(character) in {"Cc", "Cf", "Cs"} for character in decoded_path):
+        return None
+    if any(segment in {".", ".."} for segment in decoded_path.split("/")):
+        return None
+    return quote(canonical_path, safe=_ANTHROPIC_PATH_SAFE)
+
+
+def _selected_provider(environ: Mapping[str, str], variable: str) -> str:
+    configured = environ.get(variable, "").strip().lower()
+    if configured:
+        return configured
+    available = [
+        provider
+        for provider, credential in (
+            ("nv_build", "NVIDIA_API_KEY"),
+            ("openai", "OPENAI_API_KEY"),
+            ("anthropic", "ANTHROPIC_API_KEY"),
+        )
+        if environ.get(credential, "").strip()
+    ]
+    if len(available) > 1:
+        choices = _SUPPORTED_PROVIDERS
+        if "EMBEDDING" in variable:
+            choices = choices - {"anthropic", "bedrock"}
+        example = next(provider for provider in available if provider in choices)
+        raise ProviderConfigurationError(
+            f"{variable} is required.\n"
+            "Multiple public provider credentials are configured.\n\n"
+            f"Accepted values:\n  {', '.join(sorted(choices))}\n\n"
+            f"Choose one, for example:\n  export {variable}={example}"
+        )
+    if available:
+        return available[0]
+    alternatives = "  openai     -> OPENAI_API_KEY\n"
+    # Anthropic/Bedrock have no embedding models; do not suggest them here.
+    if "EMBEDDING" not in variable:
+        alternatives += "  anthropic  -> ANTHROPIC_API_KEY\n"
+    raise ProviderConfigurationError(
+        "No provider is configured.\n\n"
+        "For NVIDIA Build, set:\n"
+        f"  export {variable}=nv_build\n"
+        "  export NVIDIA_API_KEY='your-api-key'\n"
+        "  Get a key: https://build.nvidia.com\n\n"
+        f"Other {variable} values and their keys:\n"
+        f"{alternatives}\n"
+        f"More providers and setup options:\n  {_PROVIDER_SETUP_URL}"
+    )
+
+
+def _validate_provider(provider: str, *, variable: str) -> None:
+    if provider not in _SUPPORTED_PROVIDERS:
+        choices = ", ".join(sorted(_SUPPORTED_PROVIDERS))
+        raise ProviderConfigurationError(f"{variable} must be one of: {choices}.")

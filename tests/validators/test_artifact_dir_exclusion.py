@@ -1,0 +1,603 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Generated output dirs must be skipped, not just filtered.
+
+A skill that has been through Tier 3 accumulates hundreds of MB under
+``evals/results/``. Tier 1 must never traverse those subtrees
+(``iter_scannable_files`` pruning), never hand them to scanners that lack
+exclude flags (skillspector scans a filtered copy), and never report
+findings from them (gitleaks config allowlist, skillspector issue filter).
+Gitleaks and SkillSpector retain authored evals/ inputs while pruning their
+results/.
+Regression source: a real skill dir with 798MB / 53k artifact files took
+~25 minutes to validate and reported 270 artifact-only secret findings.
+"""
+
+import hashlib
+import json
+import os
+import re
+import tomllib
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from skillevaluator.constants import SCAN_EXCLUDED_DIRS
+from skillevaluator.utils.tool_runner import GITLEAKS_FINDINGS_EXIT_CODE, ToolResult, Tools
+from skillevaluator.validators.base import iter_scannable_files
+from skillevaluator.validators.secrets import SecretsValidator
+from skillevaluator.validators.security import SecurityValidator
+
+
+@pytest.fixture
+def skill_with_artifacts(tmp_path):
+    """A skill dir carrying Tier 3 artifact subtrees."""
+    skill = tmp_path / "my-skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: my-skill\n---\n")
+    (skill / "payload.py").write_text("import os\n")
+    junk = skill / "evals" / "results" / "20260101_000000"
+    junk.mkdir(parents=True)
+    (junk / "leak.py").write_text("password = 'hunter2'\n")
+    (skill / "results").mkdir()
+    (skill / "results" / "old.py").write_text("x = 1\n")
+    return skill
+
+
+# =============================================================================
+# iter_scannable_files MUST PRUNE, NOT POST-FILTER
+# =============================================================================
+
+
+class TestIterScannableFilesPrunes:
+    def test_returns_only_live_files(self, skill_with_artifacts):
+        found = iter_scannable_files(skill_with_artifacts, {".py"})
+        assert [f.name for f in found] == ["payload.py"]
+
+    def test_never_descends_into_excluded_dirs(self, skill_with_artifacts, monkeypatch):
+        visited: list[str] = []
+        real_scandir = os.scandir
+
+        def spy(path=".", *args, **kwargs):
+            visited.append(os.fspath(path))
+            return real_scandir(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "scandir", spy)
+        iter_scannable_files(skill_with_artifacts, {".py"})
+
+        excluded_visits = [p for p in visited if Path(p).name in SCAN_EXCLUDED_DIRS]
+        assert excluded_visits == []
+
+    def test_walks_the_tree_once_regardless_of_extension_count(self, skill_with_artifacts, monkeypatch):
+        visited: list[str] = []
+        real_scandir = os.scandir
+
+        def spy(path=".", *args, **kwargs):
+            visited.append(os.fspath(path))
+            return real_scandir(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "scandir", spy)
+        iter_scannable_files(skill_with_artifacts, {".py", ".md", ".sh", ".js", ".txt"})
+
+        root_visits = [p for p in visited if Path(p) == skill_with_artifacts]
+        assert len(root_visits) == 1
+
+    def test_file_root_still_matches_without_walk(self, tmp_path):
+        f = tmp_path / "script.py"
+        f.write_text("x = 1\n")
+        assert iter_scannable_files(f, {".py"}) == [f]
+        assert iter_scannable_files(f, {".md"}) == []
+
+    def test_endswith_semantics_preserved(self, tmp_path):
+        skill = tmp_path / "s"
+        skill.mkdir()
+        hidden = skill / ".md"
+        hidden.write_text("hidden\n")
+        regular = skill / "readme.md"
+        regular.write_text("hi\n")
+        found = {f.name for f in iter_scannable_files(skill, {".md"}, excluded_files=())}
+        assert found == {".md", "readme.md"}
+
+
+# =============================================================================
+# SKILLSPECTOR SCANS A FILTERED COPY (it has no exclude flag of its own)
+# =============================================================================
+
+
+_REVIEWED_BASELINE = (
+    'version: 2\nrules:\n  - id: "PE5"\n    path: "SKILL.md"\n    message: "*--privilege[d]*"\n'
+    '    reason: "Reviewed diagnostics container"\n'
+)
+
+
+def _clean_spector_result(*, suppression_accounting: bool = False):
+    report = {
+        "risk_assessment": {"score": 0, "severity": "LOW", "recommendation": "SAFE"},
+        "issues": [],
+        "metadata": {
+            "skillspector_version": "1.0.0",
+            "llm_requested": False,
+            "llm_available": False,
+        },
+    }
+    if suppression_accounting:
+        report.update({"suppressed_count": 0, "suppressed": []})
+    return ToolResult(success=True, stdout=json.dumps(report), stderr="", exit_code=0)
+
+
+class TestSkillspectorFilteredCopy:
+    @patch.object(Tools.skillspector, "_path", "/usr/bin/skillspector")
+    @patch.object(Tools.skillspector, "run")
+    def test_scans_copy_without_artifact_dirs(self, mock_run, skill_with_artifacts):
+        seen: dict = {}
+
+        def capture(args, **kwargs):
+            scanned = Path(args[args.index("scan") + 1])
+            seen["path"] = scanned
+            seen["has_manifest"] = (scanned / "SKILL.md").is_file()
+            seen["has_payload"] = (scanned / "payload.py").is_file()
+            seen["root_results"] = (scanned / "results").exists()
+            seen["eval_results"] = (scanned / "evals" / "results").exists()
+            return _clean_spector_result()
+
+        mock_run.side_effect = capture
+        SecurityValidator()._run_skillspector(skill_with_artifacts)
+
+        assert seen["path"] != skill_with_artifacts.resolve()
+        assert seen["path"].name == "my-skill"
+        assert seen["has_manifest"] and seen["has_payload"]
+        assert not seen["root_results"] and not seen["eval_results"]
+        assert not seen["path"].exists()  # temp copy cleaned up afterwards
+
+    @patch.object(Tools.skillspector, "_path", "/usr/bin/skillspector")
+    @patch.object(Tools.skillspector, "run")
+    def test_clean_skill_scanned_in_place(self, mock_run, tmp_path):
+        skill = tmp_path / "clean-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("---\nname: clean-skill\n---\n")
+        mock_run.return_value = _clean_spector_result()
+
+        SecurityValidator()._run_skillspector(skill)
+
+        args = mock_run.call_args.args[0]
+        assert args[args.index("scan") + 1] == str(skill.resolve())
+
+    @patch.object(Tools.skillspector, "_path", "/usr/bin/skillspector")
+    @patch.object(Tools.skillspector, "run")
+    def test_report_filter_uses_scanned_filesystem_case_semantics(self, mock_run, tmp_path: Path) -> None:
+        skill = tmp_path / "clean-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("---\nname: clean-skill\n---\n")
+        alias = skill / "benchmark.md"
+        alias.write_text("authored or generated, depending on filesystem semantics\n")
+        canonical = skill / "BENCHMARK.md"
+        data = json.loads(_clean_spector_result().stdout)
+        data["risk_assessment"] = {"score": 5, "severity": "LOW", "recommendation": "SAFE"}
+        data["issues"] = [
+            {
+                "id": "SQP-2",
+                "pattern": "Generated card warning",
+                "severity": "LOW",
+                "confidence": 1.0,
+                "finding": "Generated card includes outputs",
+                "location": {"file": "benchmark.md", "start_line": 1},
+            }
+        ]
+        mock_run.return_value = ToolResult(
+            success=True,
+            stdout=json.dumps(data),
+            stderr="",
+            exit_code=0,
+        )
+
+        result = SecurityValidator()._run_skillspector(skill)
+
+        if canonical.exists() and alias.samefile(canonical):
+            assert result.findings == []
+            assert any("ignored 1 generated artifact" in message for message in result.messages)
+        else:
+            assert len(result.findings) == 1
+            assert result.findings[0].file_path == "benchmark.md"
+
+    @patch.object(Tools.skillspector, "_path", "/usr/bin/skillspector")
+    @patch.object(Tools.skillspector, "run")
+    def test_staged_scan_preserves_shipped_bytecode_for_sc8(self, mock_run, skill_with_artifacts):
+        bytecode = skill_with_artifacts / "__pycache__" / "payload.pyc"
+        bytecode.parent.mkdir()
+        bytecode.write_bytes(b"shipped bytecode")
+        seen: dict = {}
+
+        def capture(args, **kwargs):
+            scanned = Path(args[args.index("scan") + 1])
+            seen["path"] = scanned
+            seen["has_bytecode"] = (scanned / "__pycache__" / "payload.pyc").is_file()
+            seen["has_generated_results"] = (scanned / "evals" / "results").exists()
+            if not seen["has_bytecode"]:
+                return _clean_spector_result()
+            data = json.loads(_clean_spector_result().stdout)
+            data["risk_assessment"] = {
+                "score": 51,
+                "severity": "HIGH",
+                "recommendation": "DO_NOT_INSTALL",
+            }
+            data["issues"] = [
+                {
+                    "id": "SC8",
+                    "pattern": "Shipped Python bytecode",
+                    "severity": "HIGH",
+                    "confidence": 0.95,
+                    "finding": "Compiled Python artifact",
+                    "location": {"file": "__pycache__/payload.pyc", "start_line": 1},
+                }
+            ]
+            return ToolResult(success=False, stdout=json.dumps(data), stderr="", exit_code=1)
+
+        mock_run.side_effect = capture
+        result = SecurityValidator()._run_skillspector(skill_with_artifacts)
+
+        assert seen["path"] != skill_with_artifacts.resolve()
+        assert seen["has_bytecode"] is True
+        assert seen["has_generated_results"] is False
+        assert result.status == "failed"
+        assert any(finding.check_name.endswith("(SC8)") for finding in result.findings)
+
+    @patch.object(Tools.skillspector, "_path", "/usr/bin/skillspector")
+    @patch.object(Tools.skillspector, "run")
+    def test_findings_map_back_to_original_paths(self, mock_run, skill_with_artifacts):
+        def report_on_copy(args, **kwargs):
+            scanned = args[args.index("scan") + 1]
+            data = {
+                "skill": {"name": "my-skill", "source": scanned},
+                "risk_assessment": {"score": 80, "severity": "HIGH", "recommendation": "DO_NOT_INSTALL"},
+                "issues": [
+                    {
+                        "id": "SS001",
+                        "category": "execution",
+                        "pattern": "eval-usage",
+                        "severity": "HIGH",
+                        "confidence": 1.0,
+                        "location": {"file": f"{scanned}/payload.py", "start_line": 1},
+                        "finding": "dangerous call",
+                    }
+                ],
+                "metadata": {"skillspector_version": "1.0.0"},
+            }
+            return ToolResult(success=False, stdout=json.dumps(data), stderr="", exit_code=1)
+
+        mock_run.side_effect = report_on_copy
+        result = SecurityValidator()._run_skillspector(skill_with_artifacts)
+
+        assert len(result.findings) == 1
+        assert result.findings[0].file_path == str(skill_with_artifacts.resolve() / "payload.py")
+
+    @pytest.mark.parametrize(
+        ("relative", "passes_staged_copy"),
+        [
+            ("config/skillspector-baseline.yaml", True),
+            ("evals/skillspector-baseline.yaml", True),
+            # Excluded from the staged copy, so it is outside the scan either way.
+            ("evals/results/skillspector-baseline.yaml", False),
+        ],
+    )
+    @patch.object(Tools.skillspector, "_path", "/usr/bin/skillspector")
+    @patch.object(Tools.skillspector, "run")
+    def test_in_tree_baseline_is_excluded_from_the_staged_scan(
+        self, mock_run, skill_with_artifacts, relative, passes_staged_copy
+    ):
+        """SkillSpector excludes only the --baseline file; a stale copy would be scanned as content."""
+        baseline = skill_with_artifacts / relative
+        baseline.parent.mkdir(exist_ok=True)
+        baseline.write_text(_REVIEWED_BASELINE, encoding="utf-8")
+        seen: dict = {}
+
+        def capture(args, **kwargs):
+            seen["scanned"] = Path(args[args.index("scan") + 1])
+            seen["baseline"] = Path(args[args.index("--baseline") + 1])
+            seen["baseline_is_file"] = seen["baseline"].is_file()
+            return _clean_spector_result(suppression_accounting=True)
+
+        mock_run.side_effect = capture
+        result = SecurityValidator(skillspector_baseline=baseline)._run_skillspector(skill_with_artifacts)
+
+        assert result.status == "passed", result.errors
+        assert seen["scanned"] != skill_with_artifacts.resolve()
+        expected = seen["scanned"] / relative if passes_staged_copy else baseline.resolve()
+        assert seen["baseline"] == expected
+        assert seen["baseline_is_file"] is True
+        # Reports identify the file the operator supplied without exposing a local path.
+        state = result.metadata["skillspector_baseline"]
+        assert state["file"] == "skillspector-baseline.yaml"
+        assert state["digest"] == f"sha256:{hashlib.sha256(baseline.read_bytes()).hexdigest()}"
+        assert "path" not in state
+        assert str(skill_with_artifacts) not in json.dumps(state)
+
+    @patch.object(Tools.skillspector, "_path", "/usr/bin/skillspector")
+    @patch.object(Tools.skillspector, "run")
+    def test_external_baseline_keeps_its_path_for_a_staged_scan(self, mock_run, skill_with_artifacts, tmp_path):
+        baseline = tmp_path / "approved" / "skillspector-baseline.yaml"
+        baseline.parent.mkdir()
+        baseline.write_text(_REVIEWED_BASELINE, encoding="utf-8")
+        mock_run.return_value = _clean_spector_result(suppression_accounting=True)
+
+        SecurityValidator(skillspector_baseline=baseline)._run_skillspector(skill_with_artifacts)
+
+        args = mock_run.call_args.args[0]
+        assert args[args.index("scan") + 1] != str(skill_with_artifacts.resolve())
+        assert args[args.index("--baseline") + 1] == str(baseline.resolve())
+
+    @patch.object(Tools.skillspector, "_path", "/usr/bin/skillspector")
+    @patch.object(Tools.skillspector, "run")
+    def test_in_tree_baseline_keeps_its_path_when_scanned_in_place(self, mock_run, tmp_path):
+        skill = tmp_path / "clean-skill"
+        (skill / "config").mkdir(parents=True)
+        (skill / "SKILL.md").write_text("---\nname: clean-skill\n---\n")
+        baseline = skill / "config" / "skillspector-baseline.yaml"
+        baseline.write_text(_REVIEWED_BASELINE, encoding="utf-8")
+        mock_run.return_value = _clean_spector_result(suppression_accounting=True)
+
+        SecurityValidator(skillspector_baseline=baseline)._run_skillspector(skill)
+
+        args = mock_run.call_args.args[0]
+        assert args[args.index("scan") + 1] == str(skill.resolve())
+        assert args[args.index("--baseline") + 1] == str(baseline.resolve())
+
+
+# =============================================================================
+# GITLEAKS CONFIG EXCLUDES ARTIFACT DIRS
+# =============================================================================
+
+
+# Gitleaks keeps eval definition dirs in scope: evals/ holds authored
+# evals.json, graders and task inputs, and .evals/ is scanned the same way, as
+# SkillSpector scans it. Only generated output below them is skipped.
+_AUTHORED_EVAL_DIRS = frozenset({"evals", ".evals"})
+
+
+def _gitleaks_allowlist_paths() -> list[str]:
+    config_path = SecretsValidator()._create_gitleaks_config()
+    try:
+        return tomllib.loads(config_path.read_text(encoding="utf-8"))["allowlist"]["paths"]
+    finally:
+        config_path.unlink(missing_ok=True)
+
+
+def _gitleaks_honoring_config(args: list[str], cwd: Path | None = None, **_kwargs) -> ToolResult:
+    """Stand in for ``gitleaks detect --no-git``: apply the generated config to *cwd*.
+
+    Only the config's path allowlist and its ``nvidia-api-key`` rule are
+    modeled, which is enough to show which files the real scan would read.
+    """
+    assert cwd is not None and args[args.index("--source") + 1] == "."
+    config = tomllib.loads(Path(args[args.index("--config") + 1]).read_text(encoding="utf-8"))
+    skipped_paths = [re.compile(pattern) for pattern in config["allowlist"]["paths"]]
+    rule = next(rule for rule in config["rules"] if rule["id"] == "nvidia-api-key")
+    secret = re.compile(rule["regex"])
+    findings = []
+    for path in sorted(Path(cwd).rglob("*")):
+        relative = path.relative_to(cwd).as_posix()
+        if not path.is_file() or any(pattern.search(relative) for pattern in skipped_paths):
+            continue
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if secret.search(line):
+                findings.append(
+                    {
+                        "RuleID": rule["id"],
+                        "Description": rule["description"],
+                        "File": relative,
+                        "StartLine": line_number,
+                        "Tags": rule["tags"],
+                    }
+                )
+    if not findings:
+        return ToolResult(success=True, stdout="[]", stderr="", exit_code=0)
+    return ToolResult(success=True, stdout=json.dumps(findings), stderr="", exit_code=GITLEAKS_FINDINGS_EXIT_CODE)
+
+
+def _write_files(root: Path, files: dict[str, str]) -> None:
+    for relative, text in files.items():
+        path = root.joinpath(*relative.split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+
+class TestGitleaksArtifactExclusion:
+    def test_config_allowlists_generated_dirs_but_not_authored_evals(self):
+        paths = _gitleaks_allowlist_paths()
+
+        for name in SCAN_EXCLUDED_DIRS - _AUTHORED_EVAL_DIRS:
+            pattern = f"(^|/){re.escape(name)}(/|$)"
+            assert pattern in paths, f"gitleaks allowlist missing artifact dir {name!r}"
+        for name in _AUTHORED_EVAL_DIRS:
+            pattern = f"(^|/){re.escape(name)}(/|$)"
+            assert pattern not in paths, f"gitleaks allowlist skips authored eval dir {name!r}"
+
+    @pytest.mark.parametrize(
+        ("relative", "skipped"),
+        [
+            ("evals/evals.json", False),
+            ("evals/grader.py", False),
+            ("evals/graders/check.py", False),
+            ("evals/files/input.txt", False),
+            ("evals/environment/mcp_servers.toml", False),
+            (".evals/evals.json", False),
+            ("skills/inner/evals/grader.py", False),
+            ("evals/harbor/case-001/instruction.md", False),
+            ("evals/results/run1/out.json", True),
+            ("evals/.results/run1/out.json", True),
+            (".evals/results/run1/out.json", True),
+            ("evals/versions/v1/grader.py", True),
+            ("results/run1/out.json", True),
+            ("evals/tests/test_grader.py", True),
+            ("evals/harbor/case-001/tests/grader.py", True),
+        ],
+    )
+    def test_authored_eval_files_are_scanned_and_generated_output_is_skipped(self, relative, skipped):
+        compiled = [re.compile(pattern) for pattern in _gitleaks_allowlist_paths()]
+
+        assert any(pattern.search(relative) for pattern in compiled) is skipped
+
+    @patch.object(Tools.gitleaks, "_path", "/usr/bin/gitleaks")
+    @patch.object(Tools.gitleaks, "_version", "8.30.0")
+    @patch.object(Tools.gitleaks, "run", side_effect=_gitleaks_honoring_config)
+    def test_secret_in_authored_evals_is_reported_but_not_in_eval_results(self, _mock_run, tmp_path):
+        token = "nvapi-" + "A1" * 25
+        skill = tmp_path / "eval-skill"
+        files = {
+            "SKILL.md": "---\nname: eval-skill\n---\n",
+            "evals/evals.json": json.dumps({"evals": [{"id": 1, "prompt": f"Call the API with {token}"}]}),
+            "evals/grader.py": f'API_KEY = "{token}"\n',
+            "evals/results/run1/out.json": json.dumps({"stdout": token}),
+        }
+        _write_files(skill, files)
+
+        result = SecretsValidator().validate(skill)
+
+        assert sorted(finding.file_path for finding in result.findings) == ["evals/evals.json", "evals/grader.py"]
+        assert all(finding.category == "SECRET" for finding in result.findings)
+        assert result.status == "failed"
+
+    @patch.object(Tools.gitleaks, "_path", "/usr/bin/gitleaks")
+    @patch.object(Tools.gitleaks, "_version", "8.30.0")
+    @patch.object(Tools.gitleaks, "run", side_effect=_gitleaks_honoring_config)
+    def test_plugin_skill_eval_files_are_scanned_per_skill(self, _mock_run, tmp_path):
+        token = "nvapi-" + "B2" * 25
+        plugin = tmp_path / "demo-plugin"
+        _write_files(
+            plugin,
+            {
+                ".claude-plugin/plugin.json": json.dumps({"name": "demo"}),
+                "skills/x/SKILL.md": "---\nname: x\n---\n",
+                "skills/x/evals/grader.py": f'API_KEY = "{token}"\n',
+                "skills/x/evals/results/run1/out.json": json.dumps({"stdout": token}),
+            },
+        )
+
+        result = SecretsValidator().validate(plugin)
+
+        assert [finding.file_path for finding in result.findings] == ["[x] evals/grader.py"]
+        assert result.status == "failed"
+
+
+class TestGitleaksTestPathAllowlist:
+    def test_config_skips_test_directories_not_substring_names(self):
+        config_path = SecretsValidator()._create_gitleaks_config()
+        try:
+            config = tomllib.loads(config_path.read_text())
+        finally:
+            config_path.unlink(missing_ok=True)
+
+        paths = config["allowlist"]["paths"]
+        assert r"(^|/)(tests?|examples?|fixtures?|mocks?)(/|$)" in paths
+        assert r"(.*)?test(.*)?" not in paths
+
+        compiled = [re.compile(p) for p in paths]
+
+        def skipped(relpath: str) -> bool:
+            return any(pat.search(relpath) for pat in compiled)
+
+        assert skipped("tests/helper.py")
+        assert skipped("test/helper.py")
+        assert skipped("examples/sample.json")
+        assert skipped("fixtures/data.json")
+        assert skipped("mocks/client.py")
+        assert not skipped("scripts/latest.py")
+        assert not skipped("attestation.py")
+        assert not skipped("skills/data-latest/prod.py")
+        assert not skipped("scripts/prod.py")
+        assert not skipped("contest/score.py")
+
+
+# =============================================================================
+# SKILLSPECTOR ISSUES UNDER ARTIFACT DIRS ARE DROPPED
+# =============================================================================
+
+
+class TestSkillspectorArtifactIssueFilter:
+    def test_issue_under_artifact_dir_is_filtered(self):
+        issue = {"location": {"file": "evals/results/20260101/leak.py", "start_line": 3}}
+        assert SecurityValidator._is_generated_artifact_issue(issue) is True
+
+    def test_issue_under_absolute_artifact_path_is_filtered(self):
+        issue = {"location": {"file": "/home/u/skill/evals/results/leak.py", "start_line": 3}}
+        assert SecurityValidator._is_generated_artifact_issue(issue) is True
+
+    def test_live_issue_is_kept(self):
+        issue = {"location": {"file": "scripts/deploy.py", "start_line": 3}}
+        assert SecurityValidator._is_generated_artifact_issue(issue) is False
+
+    @pytest.mark.parametrize("absolute_location", [False, True])
+    def test_generated_file_case_alias_follows_filesystem_semantics(
+        self,
+        tmp_path: Path,
+        absolute_location: bool,
+    ) -> None:
+        skill = tmp_path / "skill"
+        skill.mkdir()
+        alias = skill / "benchmark.md"
+        alias.write_text("authored or generated, depending on filesystem semantics\n")
+        canonical = skill / "BENCHMARK.md"
+        reported = alias if absolute_location else alias.relative_to(skill)
+        issue = {"location": {"file": str(reported), "start_line": 1}}
+
+        filtered = SecurityValidator._is_generated_artifact_issue(issue, source_root=skill)
+
+        if canonical.exists() and alias.samefile(canonical):
+            assert filtered is True
+        else:
+            assert filtered is False
+
+    def test_generated_directory_case_alias_follows_filesystem_semantics(self, tmp_path: Path) -> None:
+        skill = tmp_path / "skill"
+        alias = skill / "RESULTS"
+        alias.mkdir(parents=True)
+        finding = alias / "finding.md"
+        finding.write_text("authored or generated, depending on filesystem semantics\n")
+        canonical = skill / "results"
+        issue = {"location": {"file": "RESULTS/finding.md", "start_line": 1}}
+
+        filtered = SecurityValidator._is_generated_artifact_issue(issue, source_root=skill)
+
+        if canonical.exists() and alias.samefile(canonical):
+            assert filtered is True
+        else:
+            assert filtered is False
+
+    def test_generated_name_outside_source_root_is_not_filtered(self, tmp_path: Path) -> None:
+        skill = tmp_path / "skill"
+        skill.mkdir()
+        (tmp_path / "BENCHMARK.md").write_text("outside the scanned skill\n")
+        issue = {"location": {"file": "../BENCHMARK.md", "start_line": 1}}
+
+        assert SecurityValidator._is_generated_artifact_issue(issue, source_root=skill) is False
+
+    @pytest.mark.parametrize(
+        "reported_path",
+        [
+            "bad\x00/BENCHMARK.md",
+            "/tmp/bad\x00/BENCHMARK.md",
+            "bad\ud800/BENCHMARK.md",
+            "/tmp/bad\ud800/BENCHMARK.md",
+            "bad\nforged/BENCHMARK.md",
+            "bad\x1b[31m/BENCHMARK.md",
+        ],
+        ids=[
+            "relative-nul",
+            "absolute-nul",
+            "relative-surrogate",
+            "absolute-surrogate",
+            "newline",
+            "terminal-escape",
+        ],
+    )
+    def test_malformed_reported_path_is_not_filtered_or_probed(
+        self,
+        tmp_path: Path,
+        reported_path: str,
+    ) -> None:
+        skill = tmp_path / "skill"
+        skill.mkdir()
+        issue = {"location": {"file": reported_path, "start_line": 1}}
+
+        assert SecurityValidator._is_generated_artifact_issue(issue, source_root=skill) is False

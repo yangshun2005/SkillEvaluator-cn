@@ -1,0 +1,1 @@
+`code/totals.py` 在 `code/fixtures/orders.csv` 上崩溃。修复它，使格式错误的行被跳过并在 stderr 上输出警告，总计以 `TOTAL 42.50` 打印。

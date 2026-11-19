@@ -1,0 +1,4098 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""HTML reporter for standalone web reports.
+
+This reporter produces self-contained HTML files suitable for:
+- Email attachments
+- CI/CD artifacts
+- Compliance audit trails
+- Standalone report viewing
+
+Features include:
+- Professional MARSFlow-inspired styling
+- Dark mode toggle
+- JSON export functionality
+- Navigation tabs for future Tier 2/3/4 support
+- Filtering and collapsible sections
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import math
+import pkgutil
+import re
+import sys
+import unicodedata
+from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
+from functools import cache
+from importlib import resources
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, ClassVar
+from urllib.parse import urlparse
+
+from jinja2 import BaseLoader, Environment, pass_context
+
+from skillevaluator import __version__
+from skillevaluator.constants import (
+    DIMENSION_HINTS,
+    DIMENSION_MAPPING,
+    DIMENSION_VERDICT_NEUTRAL_THRESHOLD,
+    DIMENSION_VERDICT_PASS_THRESHOLD,
+    QUALITY_GRADE_THRESHOLDS,
+    SIGNAL_EVIDENCE_SOURCES,
+    TIER3_LIFT_FAIL_THRESHOLD,
+    TIER3_LIFT_PASS_THRESHOLD,
+)
+from skillevaluator.publication_evidence import result_publication_evidence_dict
+from skillevaluator.reporting.base import (
+    AGENT_EVAL_EXACT_TEXT_KEYS,
+    ReporterBase,
+    additional_errors,
+    additional_warnings,
+    agent_eval_publication_dataset_provenance,
+    agent_eval_publication_evidence_complete,
+    agent_eval_report_serialization_issue,
+    agent_eval_report_serialization_limits,
+    agent_eval_report_text_limit,
+    assess_publication,
+    assess_tier3_evidence,
+    get_skip_reason,
+    is_advisory_agent_eval_skip,
+    is_cleanly_skipped,
+    passes_required_gate,
+    publication_free_text,
+    publication_identity_present,
+    publication_semantic_text,
+    publication_target_conflict_marker,
+    publication_target_dict,
+    result_publication_target_conflict_marker,
+    result_publication_target_dict,
+    select_agent_eval_candidate,
+    source_validation_errors,
+)
+from skillevaluator.reporting.base import (
+    is_tier2_validator_name as _is_tier2_validator_name,
+)
+from skillevaluator.reporting.declarative_coverage import (
+    DENOMINATOR_NOTE,
+    attempt_denominators,
+    check_status,
+    coverage_summary,
+    declarative_coverage_groups,
+)
+from skillevaluator.reporting.diagnostic_view import build_dataset_diagnostics_view
+from skillevaluator.reporting.finding_summary import (
+    describe_issue_counts,
+    finding_counts,
+    summarize_findings,
+    summarize_messages,
+    total_issue_count,
+)
+from skillevaluator.reporting.finding_verification import finding_verification
+from skillevaluator.reporting.harbor_viewer import harbor_job_display_links, normalize_agent_eval_harbor_links
+from skillevaluator.reporting.insights_view import build_insights_view
+from skillevaluator.reporting.native_evidence import build_native_evidence
+from skillevaluator.reporting.plugin_evidence import build_plugin_evidence
+from skillevaluator.reporting.presentation import (
+    FinalRenderContext,
+    TierPresentation,
+    build_final_render_context,
+    result_execution_status,
+    success_is_not_applicable,
+)
+from skillevaluator.reporting.run_status import Status, result_status, result_tier
+from skillevaluator.reporting.telemetry_view import build_telemetry_view
+from skillevaluator.reporting.tier2_views import tier2_scope_views
+from skillevaluator.reporting.tier3_scope import (
+    completed_agent_result,
+    tolerated_baseline_agents,
+    validate_report_scope,
+)
+from skillevaluator.reporting.tier3_token_usage import token_usage_table
+from skillevaluator.reporting.trial_charts import steps_by_case_chart
+from skillevaluator.skillspector_provenance import skillspector_provenance_records
+from skillevaluator.source_identity import recorded_evaluated_source
+from skillevaluator.tier3.baseline_store import baseline_description
+from skillevaluator.tier3.dataset_provenance import dataset_provenance_display
+from skillevaluator.tier3.evidence_volume import format_evidence_volume
+from skillevaluator.tier3.version_comparison import version_comparison_lines
+
+if TYPE_CHECKING:
+    from skillevaluator.models import ValidationResult
+
+
+# SkillSpector reports ``metadata.skillspector_version`` as a bare semantic
+# version. Anything else is dropped rather than echoed into the report.
+_SKILLSPECTOR_VERSION_RE = re.compile(r"\d{1,6}\.\d{1,6}\.\d{1,6}(?:[-+][0-9A-Za-z.-]{1,64})?")
+
+# Tier 3 already enforces a 2 MiB canonical payload limit. HTML needs a
+# separate bound because script-safe escaping (``<`` -> ``\u003c``), pretty
+# diagnostics, and visible dataset fields can otherwise multiply that payload
+# many times over. Large canonical payloads are embedded once as base64 while a
+# bounded projection feeds the human-readable panels.
+_TIER3_JSON_EMBED_MAX_BYTES = 512 * 1024
+_TIER3_HTML_PREVIEW_TRIGGER_BYTES = 256 * 1024
+_TIER3_HTML_PREVIEW_CHARS = 128 * 1024
+_TIER3_HTML_PREVIEW_STRING_CHARS = 4 * 1024
+_TIER3_HTML_PREVIEW_COLLECTION_ITEMS = 64
+_TIER3_HTML_PREVIEW_PRIORITY_KEYS = ("best_agent",)
+_TIER3_PREVIEW_MARKER = "... [HTML preview truncated; download the full Tier 3 payload]"
+_TIER3_JSON_SAFE_PRIORITY_KEYS = (
+    "schema_version",
+    "verdict",
+    "execution_status",
+    # A few hundred bytes that explain a failed agent arm. Walked before the
+    # bulky keys, so the bounded HTML preview keeps every message whole.
+    "coverage_notices",
+    "summary",
+    "correct_answers",
+    "skill_name",
+    "publication_target",
+    "run_id",
+    "evaluated_at",
+    "evaluator_version",
+    "dataset_digest",
+    "dataset_digest_algorithm",
+    "benchmark_policy",
+    "attempt_policy",
+    "dataset_summary",
+    "agents",
+    "model",
+    "model_name",
+    "llm_model",
+    "with_skill",
+    "overall_score",
+    "scored_attempts",
+    "dimensions",
+    "id",
+    "score",
+    "evaluators",
+)
+_TIER3_PROBABILITY_TEXT = re.compile(r"(?:\d{1,16}(?:\.\d{0,16})?|\.\d{1,16})(?:[eE][+-]?\d{1,9})?")
+
+
+def is_tier2_validator_name(validator_name: str | None) -> bool:
+    """Compatibility wrapper for callers that imported this helper here."""
+    return _is_tier2_validator_name(validator_name)
+
+
+def _finite_number(
+    value: object,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float | None:
+    """Return a bounded finite number, rejecting booleans and shaped values."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    if minimum is not None and number < minimum:
+        return None
+    if maximum is not None and number > maximum:
+        return None
+    return number
+
+
+def _nonnegative_count(value: object) -> int:
+    return count if (count := _strict_nonnegative_count(value)) is not None else 0
+
+
+def _strict_nonnegative_count(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value.bit_length() > 63:
+        return None
+    return value
+
+
+def _json_safe_tier3_text(value: str) -> str:
+    """Normalize template-facing text and replace invalid UTF-8 surrogates."""
+    safe_value = value.encode("utf-8", errors="replace").decode("utf-8")
+    return publication_semantic_text(safe_value)
+
+
+def _json_safe_tier3_mapping_keys(value: dict[object, object]) -> Iterator[object]:
+    """Yield proof keys first without materializing an untrusted wide mapping."""
+    priority = frozenset(_TIER3_JSON_SAFE_PRIORITY_KEYS)
+    for key in _TIER3_JSON_SAFE_PRIORITY_KEYS:
+        if key in value:
+            yield key
+    for key in value:
+        if key not in priority:
+            yield key
+
+
+def _json_safe_tier3_value(
+    value: object,
+    *,
+    _depth: int = 0,
+    _active_containers: set[int] | None = None,
+    _remaining_nodes: list[int] | None = None,
+    _remaining_text_bytes: list[int] | None = None,
+    _truncated: list[bool] | None = None,
+    _max_depth: int | None = None,
+    _preserve_exact_text: bool = False,
+) -> Any:
+    """Copy untrusted Tier 3 metadata into a finite JSON-compatible shape."""
+    max_depth, max_nodes = agent_eval_report_serialization_limits()
+    if _max_depth is not None:
+        max_depth = _max_depth
+    active_containers = _active_containers if _active_containers is not None else set()
+    remaining_nodes = _remaining_nodes if _remaining_nodes is not None else [max_nodes]
+    remaining_text_bytes = (
+        _remaining_text_bytes if _remaining_text_bytes is not None else [agent_eval_report_text_limit()]
+    )
+    truncated = _truncated if _truncated is not None else [False]
+    if remaining_nodes[0] <= 0:
+        truncated[0] = True
+        return None
+    remaining_nodes[0] -= 1
+    if _depth > max_depth:
+        truncated[0] = True
+        return None
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        if len(value) > remaining_text_bytes[0]:
+            truncated[0] = True
+            return None
+        utf8_safe_value = value.encode("utf-8", errors="replace").decode("utf-8")
+        # Free text keeps line breaks and tabs, which JSON escapes losslessly;
+        # identity text keeps the strict projection used for publication keys.
+        safe_value = _json_safe_tier3_text(value) if _preserve_exact_text else publication_free_text(utf8_safe_value)
+        if utf8_safe_value != value or safe_value != unicodedata.normalize("NFKC", utf8_safe_value):
+            truncated[0] = True
+        elif _preserve_exact_text and unicodedata.normalize("NFC", utf8_safe_value) == utf8_safe_value:
+            # Publication target names are filesystem identities. Preserve
+            # their exact NFC spelling instead of collapsing compatibility-
+            # distinct ASCII and fullwidth spellings.
+            safe_value = utf8_safe_value
+        encoded_size = len(safe_value.encode("utf-8"))
+        if encoded_size > remaining_text_bytes[0]:
+            truncated[0] = True
+            return None
+        remaining_text_bytes[0] -= encoded_size
+        return safe_value
+    if isinstance(value, int):
+        if value.bit_length() <= 256:
+            return value
+        truncated[0] = True
+        return None
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        truncated[0] = True
+        return None
+    if isinstance(value, dict):
+        container_id = id(value)
+        if container_id in active_containers:
+            truncated[0] = True
+            return None
+        active_containers.add(container_id)
+        safe: dict[str, Any] = {}
+        collided_keys: set[str] = set()
+        try:
+            total_keys = len(value)
+            processed_keys = 0
+            if total_keys and remaining_nodes[0] <= 0:
+                truncated[0] = True
+                return safe
+            for key in _json_safe_tier3_mapping_keys(value):
+                processed_keys += 1
+                if isinstance(key, str):
+                    if len(key) > remaining_text_bytes[0]:
+                        truncated[0] = True
+                        remaining_nodes[0] -= 1
+                        if remaining_nodes[0] <= 0 and processed_keys < total_keys:
+                            break
+                        continue
+                    utf8_safe_key = key.encode("utf-8", errors="replace").decode("utf-8")
+                    safe_key = _json_safe_tier3_text(key)
+                    if utf8_safe_key != key or safe_key != unicodedata.normalize("NFKC", utf8_safe_key):
+                        truncated[0] = True
+                elif (
+                    isinstance(key, bool)
+                    or (isinstance(key, int) and key.bit_length() <= 256)
+                    or (isinstance(key, float) and math.isfinite(key))
+                ):
+                    safe_key = str(key)
+                    truncated[0] = True
+                else:
+                    truncated[0] = True
+                    remaining_nodes[0] -= 1
+                    if remaining_nodes[0] <= 0 and processed_keys < total_keys:
+                        break
+                    continue
+                if len(safe_key) > remaining_text_bytes[0]:
+                    truncated[0] = True
+                    remaining_nodes[0] -= 1
+                    if remaining_nodes[0] <= 0 and processed_keys < total_keys:
+                        break
+                    continue
+                encoded_key_size = len(safe_key.encode("utf-8"))
+                if encoded_key_size > remaining_text_bytes[0]:
+                    truncated[0] = True
+                    remaining_nodes[0] -= 1
+                    if remaining_nodes[0] <= 0 and processed_keys < total_keys:
+                        break
+                    continue
+                remaining_text_bytes[0] -= encoded_key_size
+                if not safe_key or safe_key in collided_keys:
+                    truncated[0] = True
+                    remaining_nodes[0] -= 1
+                    if remaining_nodes[0] <= 0 and processed_keys < total_keys:
+                        break
+                    continue
+                if safe_key in safe:
+                    # Drop every alias in a normalized-key collision rather
+                    # than retaining an order-dependent first or last value.
+                    safe.pop(safe_key)
+                    collided_keys.add(safe_key)
+                    truncated[0] = True
+                    remaining_nodes[0] -= 1
+                    if remaining_nodes[0] <= 0 and processed_keys < total_keys:
+                        break
+                    continue
+                item = value[key]
+                if safe_key == "publication_target":
+                    item = publication_target_dict(item)
+                elif safe_key == "publication_target_conflict":
+                    item = publication_target_conflict_marker(item)
+                safe[safe_key] = _json_safe_tier3_value(
+                    item,
+                    _depth=_depth + 1,
+                    _active_containers=active_containers,
+                    _remaining_nodes=remaining_nodes,
+                    _remaining_text_bytes=remaining_text_bytes,
+                    _truncated=truncated,
+                    _max_depth=max_depth,
+                    _preserve_exact_text=_preserve_exact_text or safe_key in AGENT_EVAL_EXACT_TEXT_KEYS,
+                )
+                if remaining_nodes[0] <= 0 and processed_keys < total_keys:
+                    truncated[0] = True
+                    break
+        finally:
+            active_containers.remove(container_id)
+        return safe
+    if isinstance(value, (list, tuple)):
+        if isinstance(value, tuple):
+            truncated[0] = True
+        container_id = id(value)
+        if container_id in active_containers:
+            truncated[0] = True
+            return None
+        active_containers.add(container_id)
+        safe_items: list[Any] = []
+        try:
+            for item in value:
+                if remaining_nodes[0] <= 0:
+                    truncated[0] = True
+                    break
+                safe_items.append(
+                    _json_safe_tier3_value(
+                        item,
+                        _depth=_depth + 1,
+                        _active_containers=active_containers,
+                        _remaining_nodes=remaining_nodes,
+                        _remaining_text_bytes=remaining_text_bytes,
+                        _truncated=truncated,
+                        _max_depth=max_depth,
+                        _preserve_exact_text=_preserve_exact_text,
+                    )
+                )
+        finally:
+            active_containers.remove(container_id)
+        return safe_items
+    truncated[0] = True
+    return None
+
+
+def _json_safe_tier3_payload(value: object) -> dict[str, Any]:
+    """Return a bounded payload while disclosing any serialization truncation."""
+    truncated = [False]
+    normalized = _json_safe_tier3_value(value, _truncated=truncated)
+    payload = normalized if isinstance(normalized, dict) else {}
+    if not isinstance(value, dict):
+        truncated[0] = True
+    if truncated[0]:
+        payload["_serialization_truncated"] = True
+    return payload
+
+
+def _string_list(value: object) -> list[str]:
+    return [item for item in value if isinstance(item, str) and item] if isinstance(value, list) else []
+
+
+def _dict_list(value: object) -> list[dict[str, Any]]:
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _tier3_display_identifier(value: object) -> str:
+    if not publication_identity_present(value):
+        return ""
+    identifier = publication_semantic_text(value).strip()
+    return identifier if publication_identity_present(identifier) else ""
+
+
+def _tier3_identifier_list(value: object) -> list[str]:
+    """Return visible, normalized, collision-free identifiers in source order."""
+    if not isinstance(value, list):
+        return []
+    identifiers: list[str] = []
+    seen: set[str] = set()
+    for raw_identifier in value:
+        identifier = _tier3_display_identifier(raw_identifier)
+        identity_key = identifier.casefold()
+        if not identifier or identity_key in seen:
+            continue
+        seen.add(identity_key)
+        identifiers.append(identifier)
+    return identifiers
+
+
+def _tier3_agent_entries(value: object) -> list[tuple[str, dict[str, Any]]]:
+    """Normalize agent keys and fail closed on malformed or colliding peers."""
+    if not isinstance(value, dict):
+        return []
+    entries: list[tuple[str, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for raw_name, raw_agent in value.items():
+        if not isinstance(raw_name, str):
+            return []
+        name = _tier3_display_identifier(raw_name)
+        identity_key = name.casefold()
+        if not name or not isinstance(raw_agent, dict) or identity_key in seen:
+            return []
+        seen.add(identity_key)
+        entries.append((name, raw_agent))
+    return entries
+
+
+def _score_mapping(
+    value: object,
+    *,
+    minimum: float = 0.0,
+    maximum: float = 1.0,
+) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    scores: dict[str, float] = {}
+    seen: set[str] = set()
+    for key, item in value.items():
+        identifier = _tier3_display_identifier(key)
+        identity_key = identifier.casefold()
+        if not identifier:
+            continue
+        if identity_key in seen:
+            return {}
+        seen.add(identity_key)
+        score = _finite_number(item, minimum=minimum, maximum=maximum)
+        if score is not None:
+            scores[identifier] = score
+    return scores
+
+
+def _tier3_score_reasons(value: object) -> dict[str, str]:
+    """Keep per-metric reasons keyed like ``_score_mapping`` so each matches its score cell."""
+    if not isinstance(value, dict):
+        return {}
+    reasons: dict[str, str] = {}
+    seen: set[str] = set()
+    for key, reason in value.items():
+        identifier = _tier3_display_identifier(key)
+        identity_key = identifier.casefold()
+        if not identifier:
+            continue
+        if identity_key in seen:
+            return {}
+        seen.add(identity_key)
+        if isinstance(reason, str) and reason:
+            reasons[identifier] = reason
+    return reasons
+
+
+@pass_context
+def _tier3_not_applicable_reason(_context: Any, metric: object, with_skill: bool = False) -> str:
+    """Describe N/A metrics at render time, keeping Tier 3 imports out of base template compilation."""
+    from skillevaluator.tier3.harbor.metrics import not_applicable_reason
+
+    return not_applicable_reason(str(metric), with_skill=with_skill is True)
+
+
+_TIER3_BACKEND_LABELS = {"harbor": "Harbor", "nemo-gym": "NeMo Gym"}
+
+
+def _tier3_backend_label(value: object) -> str | None:
+    """Return the display name of a recorded execution backend id, or ``None``.
+
+    The payload is untyped metadata, so a dict, list or other non-string value
+    can sit where the id should be; it counts as no backend rather than being
+    used as a lookup key (an unhashable one would raise inside the template).
+    """
+    return _TIER3_BACKEND_LABELS.get(value) if isinstance(value, str) else None
+
+
+def _tier3_text_mapping(value: object) -> dict[str, str]:
+    """Normalize public label maps without silently overwriting aliases."""
+    if not isinstance(value, dict):
+        return {}
+    labels: dict[str, str] = {}
+    seen: set[str] = set()
+    for raw_name, raw_label in value.items():
+        name = _tier3_display_identifier(raw_name)
+        identity_key = name.casefold()
+        if not publication_identity_present(raw_label):
+            continue
+        label = publication_semantic_text(raw_label).strip()
+        if not name or not publication_identity_present(label):
+            continue
+        if identity_key in seen:
+            return {}
+        seen.add(identity_key)
+        labels[name] = label
+    return labels
+
+
+def _tier3_comparison_block_reason(value: dict[str, Any]) -> str:
+    """Keep cached comparison evidence from restoring an explicitly unavailable skill arm."""
+    summary = value.get("summary") if isinstance(value.get("summary"), dict) else {}
+    if value.get("mode") == "baseline_only" or summary.get("mode") == "baseline_only":
+        return "baseline_only"
+    conditions = value.get("conditions") if isinstance(value.get("conditions"), dict) else {}
+    with_skill = conditions.get("with_skill")
+    if isinstance(with_skill, dict) and any(
+        isinstance(status := with_skill.get(key), str) and status.strip().casefold() == "skipped"
+        for key in ("execution_status", "status")
+    ):
+        return "with_skill_skipped"
+    activation = value.get("skill_activation")
+    if isinstance(activation, dict) and activation.get("status") == "never_activated":
+        return "never_activated"
+    return ""
+
+
+def _sanitize_tier3_dimension_comparison(
+    value: object, *, allow_lift: bool = True, block_reason: str = ""
+) -> dict[str, Any]:
+    """Project recorded native comparisons without recomputing or trusting shaped values."""
+    if not isinstance(value, dict):
+        return {}
+    raw_status = value.get("status")
+    status = raw_status.strip().casefold() if isinstance(raw_status, str) else ""
+    known_status = status in {"comparable", "partial", "not_applicable", "unavailable", "inconclusive"}
+    comparison: dict[str, Any] = {"status": status if known_status else "unavailable"}
+    for key in ("label", "reason", "reason_code"):
+        text = _json_safe_tier3_text(value[key]) if isinstance(value.get(key), str) else ""
+        comparison[key] = (
+            text[:_TIER3_HTML_PREVIEW_STRING_CHARS] + _TIER3_PREVIEW_MARKER
+            if len(text) > _TIER3_HTML_PREVIEW_STRING_CHARS
+            else text
+        )
+    comparison["sources"] = _tier3_identifier_list(value.get("sources"))
+    for key in ("with_skill", "baseline", "lift"):
+        comparison[key] = (
+            _finite_number(value.get(key), minimum=-1.0 if key == "lift" else 0.0, maximum=1.0)
+            if status in {"comparable", "partial"} and allow_lift and not block_reason
+            else None
+        )
+    raw_measured = value.get("measured") if isinstance(value.get("measured"), dict) else {}
+    comparison["measured"] = {}
+    for arm in ("with_skill", "baseline"):
+        measured = raw_measured.get(arm)
+        if isinstance(measured, dict):
+            comparison["measured"][arm] = {
+                "score": _finite_number(measured.get("score"), minimum=0.0, maximum=1.0) if known_status else None,
+                "sources": _tier3_identifier_list(measured.get("sources")),
+            }
+    if block_reason or not allow_lift:
+        reason_code = block_reason or "never_activated"
+        explanations = {
+            "baseline_only": "Baseline-only run; the with-skill arm was not run, so no skill comparison is available.",
+            "with_skill_skipped": "The with-skill arm was explicitly skipped; no skill comparison is available.",
+            "never_activated": "Skill never activated; scores are diagnostic only and no skill comparison is available.",
+        }
+        comparison.update(
+            status="inconclusive" if reason_code == "never_activated" else "unavailable",
+            reason_code=reason_code,
+            reason=explanations[reason_code],
+        )
+    return comparison
+
+
+def _sanitize_tier3_dimension(
+    value: dict[str, Any], *, allow_comparison_lift: bool = True, comparison_block_reason: str = ""
+) -> dict[str, Any]:
+    dimension = dict(value)
+    for key in ("baseline", "with_skill", "score"):
+        dimension[key] = _finite_number(dimension.get(key), minimum=0.0, maximum=1.0)
+    dimension["lift"] = _finite_number(dimension.get("lift"), minimum=-1.0, maximum=1.0)
+    for key in ("id", "dimension", "label"):
+        if key in dimension:
+            dimension[key] = _tier3_display_identifier(dimension[key])
+    if "explanation" in dimension and not isinstance(dimension["explanation"], str):
+        dimension["explanation"] = ""
+    if "verdict" in dimension:
+        raw_verdict = dimension["verdict"]
+        dimension["verdict"] = None if raw_verdict is None else _tier3_display_identifier(raw_verdict)
+    dimension["evaluators"] = _tier3_identifier_list(dimension.get("evaluators"))
+    dimension["reasoning_bullets"] = _string_list(dimension.get("reasoning_bullets"))
+    if "partial" in dimension:
+        dimension["partial"] = dimension["partial"] is True
+    if "comparison" in dimension:
+        comparison = _sanitize_tier3_dimension_comparison(
+            dimension["comparison"], allow_lift=allow_comparison_lift, block_reason=comparison_block_reason
+        )
+        if comparison:
+            dimension["comparison"] = comparison
+        else:
+            dimension.pop("comparison", None)
+    return dimension
+
+
+def _sanitize_tier3_pass_condition(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    condition = dict(value)
+    if "rate" in condition:
+        rate = _finite_number(condition.get("rate"), minimum=0.0, maximum=1.0)
+        if rate is None:
+            condition.pop("rate", None)
+        else:
+            condition["rate"] = rate
+    for key in (
+        "passed_cases",
+        "failed_cases",
+        "total_cases",
+        "attempts_used",
+        "max_attempts_possible",
+    ):
+        if key in condition:
+            condition[key] = _nonnegative_count(condition.get(key))
+
+    cases: dict[str, dict[str, Any]] = {}
+    raw_cases = condition.get("cases")
+    if isinstance(raw_cases, dict):
+        case_ids: set[str] = set()
+        for raw_case_id, raw_case in raw_cases.items():
+            case_id = _tier3_display_identifier(raw_case_id)
+            identity_key = case_id.casefold()
+            if not isinstance(raw_case, dict):
+                continue
+            if not case_id:
+                continue
+            if identity_key in case_ids:
+                cases = {}
+                break
+            case_ids.add(identity_key)
+            case = dict(raw_case)
+            for key in ("attempts_used", "attempts_missing", "attempts_skipped"):
+                case[key] = _nonnegative_count(case.get(key))
+            if "attempts_recovered" in case:
+                case["attempts_recovered"] = _nonnegative_count(case.get("attempts_recovered"))
+            case["best_score"] = _finite_number(case.get("best_score"), minimum=0.0, maximum=1.0)
+            first_pass = case.get("first_pass_attempt")
+            case["first_pass_attempt"] = (
+                _nonnegative_count(first_pass) if isinstance(first_pass, int) and first_pass > 0 else None
+            )
+            case["passed"] = case.get("passed") if isinstance(case.get("passed"), bool) else False
+            attempts: list[dict[str, Any]] = []
+            for raw_attempt in _dict_list(case.get("attempts")):
+                attempt = dict(raw_attempt)
+                attempt["score"] = _finite_number(attempt.get("score"), minimum=0.0, maximum=1.0)
+                attempt_number = attempt.get("attempt")
+                attempt["attempt"] = (
+                    _nonnegative_count(attempt_number)
+                    if isinstance(attempt_number, int) and attempt_number > 0
+                    else None
+                )
+                attempts.append(attempt)
+            case["attempts"] = attempts
+            cases[case_id] = case
+    condition["cases"] = cases
+    return condition
+
+
+def _sanitize_tier3_probability_text(value: object) -> tuple[str, Decimal] | None:
+    if not isinstance(value, str):
+        return None
+    text = publication_semantic_text(value).strip()
+    if not _TIER3_PROBABILITY_TEXT.fullmatch(text):
+        return None
+    try:
+        probability = Decimal(text)
+    except InvalidOperation:
+        return None
+    if not probability.is_finite() or not Decimal(0) <= probability <= Decimal(1):
+        return None
+    return text, probability
+
+
+def _probability_text_matches_number(probability: Decimal, number: float) -> bool:
+    numeric_probability = Decimal(str(number))
+    if numeric_probability == 0:
+        return probability == 0
+    relative_match = abs(probability - numeric_probability) <= abs(numeric_probability) * Decimal("1e-9")
+    if abs(number) < sys.float_info.min:
+        return abs(float(probability) - number) <= math.ulp(number) or relative_match
+    return relative_match
+
+
+def _sanitize_tier3_probability_fields(
+    value: dict[str, Any],
+    *,
+    numeric_key: str,
+    text_key: str,
+    underflow_key: str,
+) -> dict[str, Any] | None:
+    if numeric_key not in value:
+        return None
+    raw_number = value.get(numeric_key)
+    raw_text = value.get(text_key)
+    parsed_text = _sanitize_tier3_probability_text(raw_text)
+    if text_key in value and raw_text is not None and parsed_text is None:
+        return None
+    raw_underflow = value.get(underflow_key)
+    if underflow_key in value and not isinstance(raw_underflow, bool):
+        return None
+
+    if raw_number is None:
+        if not (
+            parsed_text is not None and parsed_text[1] > 0 and float(parsed_text[1]) == 0.0 and raw_underflow is True
+        ):
+            return None
+        return {
+            numeric_key: None,
+            text_key: parsed_text[0],
+            underflow_key: True,
+        }
+
+    number = _finite_number(raw_number, minimum=0.0, maximum=1.0)
+    if number is None or number <= 0.0 or raw_underflow is True:
+        return None
+    if parsed_text is not None and not _probability_text_matches_number(parsed_text[1], number):
+        return None
+    if number < sys.float_info.min and parsed_text is None:
+        return None
+
+    fields: dict[str, Any] = {numeric_key: number}
+    if parsed_text is not None:
+        fields[text_key] = parsed_text[0]
+    if underflow_key in value:
+        fields[underflow_key] = False
+    return fields
+
+
+def _sanitize_tier3_mcnemar_exact(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+
+    p_value_fields = _sanitize_tier3_probability_fields(
+        value,
+        numeric_key="p_value",
+        text_key="p_value_text",
+        underflow_key="p_value_numeric_underflow",
+    )
+    if p_value_fields is None:
+        return {}
+
+    exact = dict(p_value_fields)
+    minimum_keys = {
+        "minimum_attainable_p_value",
+        "minimum_attainable_p_value_text",
+        "minimum_attainable_p_value_numeric_underflow",
+    }
+    if minimum_keys.intersection(value):
+        minimum_fields = _sanitize_tier3_probability_fields(
+            value,
+            numeric_key="minimum_attainable_p_value",
+            text_key="minimum_attainable_p_value_text",
+            underflow_key="minimum_attainable_p_value_numeric_underflow",
+        )
+        if minimum_fields is not None:
+            exact.update(minimum_fields)
+
+    for key in ("method", "null_hypothesis"):
+        text = _tier3_display_identifier(value.get(key))
+        if text:
+            exact[key] = text
+    for key, omitted_key in (
+        ("p_value_exact", "p_value_exact_omitted"),
+        ("minimum_attainable_p_value_exact", "minimum_attainable_p_value_exact_omitted"),
+    ):
+        raw_text = value.get(key)
+        if isinstance(raw_text, str):
+            text = publication_semantic_text(raw_text).strip()
+            if text:
+                exact[key] = text
+        elif key in value and raw_text is None and value.get(omitted_key) is True:
+            exact[key] = None
+    for key in (
+        "p_value_exact_omitted",
+        "p_value_numeric_underflow",
+        "minimum_attainable_p_value_exact_omitted",
+        "minimum_attainable_p_value_numeric_underflow",
+        "resolution_limited_at_alpha_0_05",
+    ):
+        if isinstance(value.get(key), bool):
+            exact[key] = value[key]
+    for key in (
+        "p_value_exact_omitted_reason",
+        "minimum_attainable_p_value_exact_omitted_reason",
+    ):
+        text = _tier3_display_identifier(value.get(key))
+        if text:
+            exact[key] = text
+    return exact
+
+
+def _sanitize_tier3_paired_comparison(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+
+    paired: dict[str, Any] = {}
+    if "pairing_status" in value:
+        status = _tier3_display_identifier(value.get("pairing_status")).casefold()
+        paired["pairing_status"] = status if status in {"complete", "partial", "unavailable"} else "unavailable"
+    count_keys = (
+        "paired_cases",
+        "with_skill_unpaired_case_count",
+        "without_skill_unpaired_case_count",
+        "with_skill_unidentified_cases",
+        "without_skill_unidentified_cases",
+        "both_pass",
+        "with_skill_only_pass",
+        "without_skill_only_pass",
+        "neither_pass",
+        "discordant_cases",
+    )
+    valid_counts: dict[str, int] = {}
+    for key in count_keys:
+        if key in value:
+            count = _strict_nonnegative_count(value.get(key))
+            paired[key] = count if count is not None else 0
+            if count is not None:
+                valid_counts[key] = count
+    for key in ("with_skill_unpaired_case_ids", "without_skill_unpaired_case_ids"):
+        if key in value:
+            paired[key] = _tier3_identifier_list(value.get(key))
+    for key in (
+        "with_skill_unpaired_case_ids_truncated",
+        "without_skill_unpaired_case_ids_truncated",
+    ):
+        if key in value:
+            paired[key] = value.get(key) is True
+    outcome_keys = (
+        "with_skill_only_pass",
+        "without_skill_only_pass",
+        "both_pass",
+        "neither_pass",
+    )
+    counts_are_consistent = (
+        valid_counts.get("paired_cases", 0) > 0
+        and all(key in valid_counts for key in (*outcome_keys, "discordant_cases"))
+        and valid_counts["paired_cases"] == sum(valid_counts[key] for key in outcome_keys)
+        and valid_counts["discordant_cases"]
+        == valid_counts["with_skill_only_pass"] + valid_counts["without_skill_only_pass"]
+    )
+    if counts_are_consistent:
+        paired["paired_rate_delta"] = (
+            valid_counts["with_skill_only_pass"] - valid_counts["without_skill_only_pass"]
+        ) / valid_counts["paired_cases"]
+    if paired.get("pairing_status") == "complete" and counts_are_consistent:
+        mcnemar_exact = _sanitize_tier3_mcnemar_exact(value.get("mcnemar_exact"))
+        if mcnemar_exact:
+            paired["mcnemar_exact"] = mcnemar_exact
+    return paired
+
+
+def _sanitize_tier3_pass_at_k(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    pass_at_k = dict(value)
+    pass_at_k["with_skill"] = _sanitize_tier3_pass_condition(pass_at_k.get("with_skill"))
+    pass_at_k["without_skill"] = _sanitize_tier3_pass_condition(pass_at_k.get("without_skill"))
+    lift = pass_at_k.get("lift") if isinstance(pass_at_k.get("lift"), dict) else {}
+    delta = _finite_number(lift.get("delta"), minimum=-1.0, maximum=1.0)
+    if delta is None:
+        lift.pop("delta", None)
+    else:
+        lift["delta"] = delta
+    paired_comparison = _sanitize_tier3_paired_comparison(lift.get("paired_comparison"))
+    if paired_comparison:
+        lift["paired_comparison"] = paired_comparison
+    else:
+        lift.pop("paired_comparison", None)
+    pass_at_k["lift"] = lift
+    return pass_at_k
+
+
+def _sanitize_tier3_comparison_basis(value: object) -> dict[str, Any] | None:
+    """Keep an evaluator card's judge-model lift exclusions only when they name a case count."""
+    if not isinstance(value, dict) or not (excluded_cases := _nonnegative_count(value.get("excluded_cases"))):
+        return None
+    return {
+        "excluded_cases": excluded_cases,
+        "case_ids": _tier3_identifier_list(value.get("case_ids")),
+        "excluded_attempts": _strict_nonnegative_count(value.get("excluded_attempts")),
+        "contributing_attempts": _strict_nonnegative_count(value.get("contributing_attempts")),
+        "reason": _json_safe_tier3_text(value["reason"]) if isinstance(value.get("reason"), str) else "",
+    }
+
+
+def _sanitize_tier3_evaluator_card(
+    value: dict[str, Any],
+    *,
+    include_evidence_unavailable_default: bool = False,
+) -> dict[str, Any] | None:
+    from skillevaluator.evaluation.tier3_findings import FAILURE_REASON_EVIDENCE_KEYS
+    from skillevaluator.tier3.eval_core.atif_helpers import _METRIC_EVIDENCE_REF_METRICS
+
+    card = dict(value)
+    card["with_skill"] = _finite_number(card.get("with_skill"), minimum=0.0, maximum=1.0)
+    if card["with_skill"] is None:
+        return None
+    card["baseline"] = _finite_number(card.get("baseline"), minimum=0.0, maximum=1.0)
+    card["lift"] = _finite_number(card.get("lift"), minimum=-1.0, maximum=1.0)
+    for key in ("id", "label", "evaluator", "status"):
+        if key in card:
+            card[key] = _tier3_display_identifier(card[key])
+    evidence: list[dict[str, Any]] = []
+    for raw_entry in _dict_list(card.get("evidence")):
+        entry = dict(raw_entry)
+        entry["entry_id"] = _tier3_display_identifier(entry.get("entry_id"))
+        occurrences = _nonnegative_count(entry.get("occurrences"))
+        entry["occurrences"] = occurrences if occurrences > 0 else 1
+        entry["score"] = _finite_number(entry.get("score"), minimum=0.0, maximum=1.0)
+        for key in ("notes", "failures", "checks", "evidence_refs"):
+            entry[key] = _string_list(entry.get(key))
+        for key in FAILURE_REASON_EVIDENCE_KEYS:
+            if not (isinstance(entry.get(key), str) and entry[key]):
+                entry.pop(key, None)
+        if entry.pop("comparison_excluded", None) is True:
+            entry["comparison_excluded"] = True
+        if (
+            include_evidence_unavailable_default
+            and card.get("id") in _METRIC_EVIDENCE_REF_METRICS
+            and entry["score"] is not None
+            and entry["score"] < 0.8
+            and not entry["evidence_refs"]
+        ):
+            unavailable_reason = entry.get("evidence_unavailable_reason")
+            if isinstance(unavailable_reason, str) and unavailable_reason:
+                entry["evidence_unavailable_reason"] = unavailable_reason[:512]
+            else:
+                entry["evidence_unavailable_reason"] = "No trajectory evidence was recorded for this metric"
+        else:
+            entry.pop("evidence_unavailable_reason", None)
+        evidence.append(entry)
+    card["evidence"] = evidence
+    comparison_basis = _sanitize_tier3_comparison_basis(card.pop("comparison_basis", None))
+    if comparison_basis:
+        card["comparison_basis"] = comparison_basis
+    sampling = card.get("evidence_sampling") if isinstance(card.get("evidence_sampling"), dict) else {}
+    for key in ("represented_cases", "represented_trials", "total_trials", "scanned_trials"):
+        if key in sampling:
+            sampling[key] = _nonnegative_count(sampling.get(key))
+    sampling["truncated"] = sampling.get("truncated") is True
+    card["evidence_sampling"] = sampling
+    return card
+
+
+def _sanitize_tier3_agent(value: dict[str, Any], *, comparison_block_reason: str = "") -> dict[str, Any]:
+    agent = dict(value)
+    activation = agent.get("skill_activation")
+    agent["skill_activation"] = dict(activation) if isinstance(activation, dict) else {}
+    for key in ("model", "model_name", "llm_model", "display_name", "label"):
+        if key not in agent:
+            continue
+        if not publication_identity_present(agent[key]):
+            agent.pop(key)
+            continue
+        normalized = publication_semantic_text(agent[key])
+        if publication_identity_present(normalized):
+            agent[key] = normalized
+        else:
+            agent.pop(key)
+    agent["baseline"] = _finite_number(agent.get("baseline"), minimum=0.0, maximum=1.0)
+    agent["with_skill"] = _finite_number(agent.get("with_skill"), minimum=0.0, maximum=1.0)
+    agent["overall_score"] = _finite_number(agent.get("overall_score"), minimum=0.0, maximum=1.0)
+    agent["lift"] = _finite_number(agent.get("lift"), minimum=-1.0, maximum=1.0)
+    agent["num_trials"] = _nonnegative_count(agent.get("num_trials"))
+    agent["num_trials_baseline"] = _nonnegative_count(agent.get("num_trials_baseline"))
+    agent["expected_attempts"] = _nonnegative_count(agent.get("expected_attempts"))
+    agent["scored_attempts"] = _nonnegative_count(agent.get("scored_attempts"))
+    comparison_block_reason = comparison_block_reason or _tier3_comparison_block_reason(agent)
+    agent["dimensions"] = [
+        _sanitize_tier3_dimension(item, comparison_block_reason=comparison_block_reason)
+        for item in _dict_list(agent.get("dimensions"))
+    ]
+    agent["evaluator_cards"] = [
+        card
+        for item in _dict_list(agent.get("evaluator_cards"))
+        if (card := _sanitize_tier3_evaluator_card(item, include_evidence_unavailable_default=True)) is not None
+    ]
+    agent["findings"] = [_sanitize_tier3_dimension(item) for item in _dict_list(agent.get("findings"))]
+    agent["pass_at_k"] = _sanitize_tier3_pass_at_k(agent.get("pass_at_k"))
+    # The drill-down and steps chart render baseline rows from
+    # ``trials_baseline`` (with-skill rows come from the top-level trials), so
+    # those rows get the same render-time bounds as with-skill rows.
+    if "trials_baseline" in agent:
+        agent["trials_baseline"] = [
+            _sanitize_tier3_trial(item, fill_defaults=False) for item in _dict_list(agent.get("trials_baseline"))
+        ]
+    return agent
+
+
+def _tier3_html_dimensions(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Keep recorded dimensions and configured-but-unmeasured public dimensions visible."""
+    if not isinstance(payload, dict):
+        return []
+    dimensions = [dict(item) for item in _dict_list(payload.get("dimensions"))]
+    dimension_ids = {item.get("id") for item in dimensions}
+    dimension_ids.update(item.get("id") for item in _dict_list(payload.get("not_applicable_dimensions")))
+    agents = payload.get("agents")
+    summary = payload.get("summary")
+    summary = summary if isinstance(summary, dict) else {}
+    best_name = payload.get("best_agent") or summary.get("best_agent")
+    best = agents.get(best_name) if isinstance(agents, dict) and isinstance(best_name, str) else None
+    successful_best = isinstance(best, dict) and best.get("execution_status") == "succeeded"
+    active_metrics = (
+        set(_tier3_identifier_list(best.get("metrics_with_skill")))
+        if successful_best
+        else set(_tier3_configured_metrics(payload))
+    )
+    if payload.get("execution_status") == "skipped":
+        return dimensions
+    for dimension_id, config in DIMENSION_MAPPING.items():
+        if dimension_id in dimension_ids:
+            continue
+        signals = list(dict.fromkeys([*config.get("evaluators", []), *config.get("fallback_evaluators", [])]))
+        active_signals = [signal for signal in signals if signal in active_metrics]
+        if not active_signals:
+            continue
+        dimensions.append(
+            {
+                "id": dimension_id,
+                "score": None,
+                "with_skill": None,
+                "baseline": None,
+                "lift": None,
+                "verdict": None,
+                "evaluators": active_signals,
+                "reasoning_bullets": [
+                    "A signal this dimension needs produced no score."
+                    if successful_best
+                    else "The evaluation did not complete; no authoritative dimension measurement is available."
+                    if payload.get("execution_status") in {"failed", "incomplete"}
+                    else "No authoritative dimension measurement was recorded."
+                ],
+                "measurement_unavailable": True,
+            }
+        )
+        dimension_ids.add(dimension_id)
+    return dimensions
+
+
+def _tier3_configured_metrics(payload: dict[str, Any]) -> list[str]:
+    """Read retained metric identities; never substitute the template's default metric set."""
+    metrics = _tier3_identifier_list(payload.get("metric_ids"))
+    for _name, agent in _tier3_agent_entries(payload.get("agents")):
+        for key in ("metrics_with_skill", "metrics_without_skill"):
+            metrics.extend(_tier3_identifier_list(agent.get(key)))
+    if isinstance(payload.get("evaluators"), dict):
+        metrics.extend(_tier3_identifier_list(list(payload["evaluators"])))
+    return list(dict.fromkeys(metrics))
+
+
+def _tier3_metric_comparison_view(payload: object) -> dict[str, Any]:
+    """Bound a custom-only Overview table to already assessed recorded metric values."""
+    empty: dict[str, Any] = {"rows": [], "omitted": 0}
+    if not isinstance(payload, dict) or payload.get("execution_status") == "skipped":
+        return empty
+    standard_metrics = {
+        metric
+        for config in DIMENSION_MAPPING.values()
+        for key in ("evaluators", "fallback_evaluators")
+        for metric in config.get(key, [])
+    }
+    if any(metric in standard_metrics for metric in _tier3_configured_metrics(payload)) or any(
+        item.get("id") in DIMENSION_MAPPING for item in _dict_list(payload.get("dimensions"))
+    ):
+        return empty
+    labels = _tier3_text_mapping(payload.get("metric_labels"))
+    candidates: dict[str, dict[str, Any]] = {}
+    seen: set[str] = set()
+    evaluators = payload.get("evaluators") if isinstance(payload.get("evaluators"), dict) else {}
+    for raw_id, scores in evaluators.items():
+        identifier = _tier3_display_identifier(raw_id)
+        if not identifier or not isinstance(scores, dict) or identifier.casefold() in seen:
+            return empty
+        seen.add(identifier.casefold())
+        candidates[identifier] = {**scores, "label": labels.get(identifier, identifier)}
+    card_ids: set[str] = set()
+    for card in _dict_list(payload.get("evaluator_cards")):
+        identifier = _tier3_display_identifier(card.get("id") or card.get("evaluator"))
+        identity = identifier.casefold()
+        if not identifier or identity in card_ids:
+            return empty
+        card_ids.add(identity)
+        if identifier not in candidates:
+            if identity in seen:
+                return empty
+            seen.add(identity)
+            candidates[identifier] = card
+    for identifier in _tier3_identifier_list(payload.get("metric_ids")):
+        if identifier not in candidates:
+            if identifier.casefold() in seen:
+                return empty
+            seen.add(identifier.casefold())
+            candidates[identifier] = {}
+    agents = dict(_tier3_agent_entries(payload.get("agents")))
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    best_name = _tier3_display_identifier(payload.get("best_agent") or summary.get("best_agent"))
+    best = agents.get(best_name, {})
+    comparison_block_reason = _tier3_comparison_block_reason(payload) or _tier3_comparison_block_reason(best)
+    incomplete = (
+        payload.get("execution_status") in {"failed", "incomplete"} and best.get("execution_status") != "succeeded"
+    )
+    rows = []
+    for identifier, candidate in candidates.items():
+        score = _finite_number(candidate.get("with_skill"), minimum=0.0, maximum=1.0)
+        baseline = _finite_number(candidate.get("baseline"), minimum=0.0, maximum=1.0)
+        lift = _finite_number(candidate.get("lift"), minimum=-1.0, maximum=1.0)
+        reason = ""
+        if incomplete:
+            score = baseline = lift = None
+            reason = "The evaluation did not complete; no authoritative comparison is available."
+        elif comparison_block_reason == "baseline_only":
+            score = lift = None
+            reason = "Baseline-only run; the with-skill arm was not run."
+        elif comparison_block_reason == "with_skill_skipped":
+            score = lift = None
+            reason = "The with-skill arm was explicitly skipped; no skill comparison is available."
+        elif comparison_block_reason == "never_activated":
+            lift = None
+            reason = "Skill never activated; scores are diagnostic only."
+        elif score is None:
+            lift = None
+            reason = "No with-skill measurement was recorded."
+        elif baseline is None:
+            lift = None
+            reason = "No baseline measurement was recorded."
+        elif lift is None:
+            reason = "No comparable lift was recorded."
+        if len(rows) < _TIER3_HTML_PREVIEW_COLLECTION_ITEMS:
+            label = _tier3_display_identifier(candidate.get("label")) or labels.get(identifier) or identifier
+            rows.append(
+                {"id": identifier, "label": label, "score": score, "baseline": baseline, "lift": lift, "reason": reason}
+            )
+    return {"rows": rows, "omitted": max(0, len(candidates) - len(rows))}
+
+
+def _scrub_untrusted_tier3_agents(value: object) -> dict[str, dict[str, Any]]:
+    """Retain agent identity/coverage while removing untrusted score evidence."""
+    agents: dict[str, dict[str, Any]] = {}
+    for name, raw_agent in _tier3_agent_entries(value):
+        agent: dict[str, Any] = {
+            "baseline": None,
+            "with_skill": None,
+            "overall_score": None,
+            "lift": None,
+        }
+        for key in ("model", "model_name", "llm_model", "display_name", "label", "execution_status"):
+            if isinstance(raw_agent.get(key), str):
+                agent[key] = raw_agent[key]
+        for key in (
+            "num_trials",
+            "num_trials_baseline",
+            "expected_attempts",
+            "scored_attempts",
+        ):
+            agent[key] = _nonnegative_count(raw_agent.get(key))
+        for key in ("execution_errors", "warnings"):
+            agent[key] = _string_list(raw_agent.get(key))
+        agent["dimensions"] = [
+            {
+                **{
+                    key: raw_dimension[key]
+                    for key in ("id", "dimension", "label")
+                    if isinstance(raw_dimension.get(key), str)
+                },
+                "baseline": None,
+                "with_skill": None,
+                "score": None,
+                "lift": None,
+                "verdict": None,
+            }
+            for raw_dimension in _dict_list(raw_agent.get("dimensions"))
+        ]
+        agents[name] = _sanitize_tier3_agent(agent)
+    return agents
+
+
+def _sanitize_tier3_trial(value: dict[str, Any], *, fill_defaults: bool = True) -> dict[str, Any]:
+    """Bound the trial fields the template renders.
+
+    With ``fill_defaults=False`` (baseline rows), optional fields are normalized
+    only when present, so the embedded payload does not grow by empty defaults
+    on every row.
+    """
+    trial = dict(value)
+    for key in ("agent", "entry_id", "trial_id"):
+        if fill_defaults or key in trial:
+            trial[key] = _tier3_display_identifier(trial.get(key))
+    trial["overall"] = _finite_number(trial.get("overall"), minimum=0.0, maximum=1.0)
+    trial["scores"] = _score_mapping(trial.get("scores"))
+    for key, minimum in (("baseline_scores", 0.0), ("lift_scores", -1.0)):
+        if fill_defaults or key in trial:
+            trial[key] = _score_mapping(trial.get(key), minimum=minimum, maximum=1.0)
+    score_reasons = _tier3_score_reasons(trial.pop("score_reasons", None))
+    if score_reasons:
+        trial["score_reasons"] = score_reasons
+    if "not_applicable_metrics" in trial:
+        from skillevaluator.tier3.harbor.metrics import not_applicable_list
+
+        # Only metrics that can be N/A count, so a malformed payload cannot mark security N/A.
+        trial["not_applicable_metrics"] = not_applicable_list(trial["not_applicable_metrics"])
+    # Unavailable telemetry stays absent rather than becoming zero, so the
+    # template can omit charts and show "—" instead of reporting no usage.
+    raw_tokens = trial.pop("tokens", None)
+    tokens = raw_tokens if isinstance(raw_tokens, dict) else {}
+    prompt_tokens = _strict_nonnegative_count(tokens.get("prompt"))
+    completion_tokens = _strict_nonnegative_count(tokens.get("completion"))
+    if prompt_tokens is not None and completion_tokens is not None:
+        trial["tokens"] = {"prompt": prompt_tokens, "completion": completion_tokens}
+        cached_tokens = _strict_nonnegative_count(tokens.get("cached"))
+        if cached_tokens is not None:
+            trial["tokens"]["cached"] = cached_tokens
+    steps = _strict_nonnegative_count(trial.pop("steps", None))
+    if steps is not None:
+        trial["steps"] = steps
+    if fill_defaults or "warnings" in trial:
+        trial["warnings"] = _string_list(trial.get("warnings"))
+    if fill_defaults or "error_recovery" in trial:
+        recovery = trial.get("error_recovery") if isinstance(trial.get("error_recovery"), dict) else {}
+        recovery["details"] = _string_list(recovery.get("details"))
+        trial["error_recovery"] = recovery
+    return trial
+
+
+def _sanitize_tier3_harbor_viewer(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    viewer = dict(value)
+    viewer["jobs"] = _dict_list(viewer.get("jobs"))
+    viewer["evidence_links"] = _dict_list(viewer.get("evidence_links"))
+    return viewer
+
+
+def _sanitize_tier3_insight_items(value: object) -> list[dict[str, Any]]:
+    items = _dict_list(value)
+    for item in items:
+        if not isinstance(item.get("evidence"), dict):
+            item.pop("evidence", None)
+        if not isinstance(item.get("harbor_evidence"), dict):
+            item.pop("harbor_evidence", None)
+    return items
+
+
+def _sanitize_tier3_dataset_case(value: dict[str, Any]) -> dict[str, Any]:
+    case = dict(value)
+    case["id"] = _tier3_display_identifier(case.get("id"))
+    case["assertions"] = _string_list(case.get("assertions"))
+    case["expected_behavior"] = _string_list(case.get("expected_behavior"))
+    return case
+
+
+def _sanitize_tier3_case_diagnostics(value: object) -> list[dict[str, Any]]:
+    cases = _dict_list(value)
+    for case in cases:
+        case["entry_id"] = _tier3_display_identifier(case.get("entry_id"))
+        case["requirements"] = _dict_list(case.get("requirements"))
+        case["attempts"] = _dict_list(case.get("attempts"))
+        for attempt in case["attempts"]:
+            attempt["errors"] = _string_list(attempt.get("errors"))
+            attempt["judgments"] = _dict_list(attempt.get("judgments"))
+            for judgment in attempt["judgments"]:
+                judgment["evidence"] = _string_list(judgment.get("evidence"))
+                judgment["unmet_checks"] = _string_list(judgment.get("unmet_checks"))
+                judgment["inapplicable_checks"] = _string_list(judgment.get("inapplicable_checks"))
+    return cases
+
+
+def _sanitize_tier3_display_payload(value: dict[str, Any]) -> dict[str, Any]:
+    """Normalize template-facing types after merging canonical and fallback data."""
+    payload = _json_safe_tier3_payload(value)
+    sufficiency = payload.get("dataset_sufficiency")
+    if isinstance(sufficiency, dict) and sufficiency.get("status") in {"sufficient", "provisional"}:
+        coverage_summary = sufficiency.get("coverage_summary")
+        reason = sufficiency.get("reason")
+        payload["dataset_sufficiency"] = {
+            "status": sufficiency["status"],
+            "coverage_summary": coverage_summary[:512] if isinstance(coverage_summary, str) else "",
+            "reason": reason[:512] if isinstance(reason, str) else "",
+        }
+    else:
+        payload.pop("dataset_sufficiency", None)
+    evidence = payload.get("evidence_volume")
+    if isinstance(evidence, dict):
+
+        def counter(value: object) -> int:
+            return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 2**53 - 1 else 0
+
+        def case_counter(value: object) -> int | None:
+            result = counter(value)
+            return result or None
+
+        safe_evidence: dict[str, Any] = {
+            key: counter(evidence.get(key))
+            for key in (
+                "cases",
+                "attempts_planned",
+                "attempts_scored",
+                "execution_failures",
+                "judge_failures",
+            )
+        }
+        safe_evidence["cases"] = case_counter(evidence.get("cases"))
+        safe_evidence["attempts_per_case"] = case_counter(evidence.get("attempts_per_case"))
+        safe_evidence["uniform_attempts"] = evidence.get("uniform_attempts") is not False
+        safe_evidence["limited"] = evidence.get("limited") is True
+        safe_evidence["by_arm"] = (
+            {
+                arm: {
+                    key: counter(arm_value.get(key))
+                    for key in (
+                        "attempts_planned",
+                        "attempts_scored",
+                        "execution_failures",
+                        "judge_failures",
+                    )
+                }
+                | {"cases": case_counter(arm_value.get("cases"))}
+                for arm, arm_value in evidence.get("by_arm", {}).items()
+                if arm in {"with_skill", "without_skill"} and isinstance(arm_value, dict)
+            }
+            if isinstance(evidence.get("by_arm"), dict)
+            else {}
+        )
+        safe_evidence["display"] = format_evidence_volume(safe_evidence) or ""
+        payload["evidence_volume"] = safe_evidence
+    else:
+        payload.pop("evidence_volume", None)
+    payload["summary"] = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    global_comparison_block = _tier3_comparison_block_reason(payload)
+    payload["agents"] = {
+        identifier: _sanitize_tier3_agent(
+            agent,
+            comparison_block_reason=global_comparison_block
+            if global_comparison_block in {"baseline_only", "with_skill_skipped"}
+            else "",
+        )
+        for identifier, agent in _tier3_agent_entries(payload.get("agents"))
+    }
+    for container in (payload, payload["summary"]):
+        for key in ("skill_name", "evaluator_version", "environment"):
+            if key not in container:
+                continue
+            if key == "skill_name":
+                exact_name = container[key]
+                if (
+                    isinstance(exact_name, str)
+                    and unicodedata.normalize("NFC", exact_name) == exact_name
+                    and publication_identity_present(exact_name)
+                ):
+                    continue
+                container.pop(key)
+                continue
+            normalized = publication_semantic_text(container[key])
+            if publication_identity_present(normalized):
+                container[key] = normalized
+            else:
+                container.pop(key)
+    evaluators: dict[str, dict[str, float | None]] = {}
+    raw_evaluators = payload.get("evaluators")
+    if isinstance(raw_evaluators, dict):
+        evaluator_names: set[str] = set()
+        for raw_name, scores in raw_evaluators.items():
+            name = _tier3_display_identifier(raw_name)
+            identity_key = name.casefold()
+            if not name or not isinstance(scores, dict) or identity_key in evaluator_names:
+                evaluators = {}
+                break
+            evaluator_names.add(identity_key)
+            evaluators[name] = {
+                "with_skill": _finite_number(scores.get("with_skill"), minimum=0.0, maximum=1.0),
+                "baseline": _finite_number(scores.get("baseline"), minimum=0.0, maximum=1.0),
+                "lift": _finite_number(scores.get("lift"), minimum=-1.0, maximum=1.0),
+            }
+            if scores.get("with_skill_status") == "skipped":
+                # A baseline-only run (--skip-with-skill) never ran this arm;
+                # the table says so instead of reporting a missing score.
+                evaluators[name]["with_skill_status"] = "skipped"
+    payload["evaluators"] = evaluators
+    for key in (
+        "insights",
+        "dataset_summary",
+        "verdict_policy",
+        "provenance",
+    ):
+        if not isinstance(payload.get(key), dict):
+            payload[key] = {}
+    payload["metric_labels"] = _tier3_text_mapping(payload.get("metric_labels"))
+    payload["dimension_hints"] = _tier3_text_mapping(payload.get("dimension_hints")) or dict(DIMENSION_HINTS)
+    payload["signal_evidence"] = dict(SIGNAL_EVIDENCE_SOURCES)
+    evaluator_paths = payload["provenance"].get("evaluator_paths")
+    payload["provenance"]["evaluator_paths"] = evaluator_paths if isinstance(evaluator_paths, dict) else {}
+    if "source_validation" in payload["provenance"]:
+        payload["provenance"]["source_validation"] = source_validation_errors(payload["provenance"])
+    harbor_viewer = _sanitize_tier3_harbor_viewer(payload.get("harbor_viewer"))
+    if harbor_viewer:
+        payload["harbor_viewer"] = harbor_viewer
+    else:
+        payload.pop("harbor_viewer", None)
+    summary_harbor_viewer = _sanitize_tier3_harbor_viewer(payload["summary"].get("harbor_viewer"))
+    if summary_harbor_viewer:
+        payload["summary"]["harbor_viewer"] = summary_harbor_viewer
+    else:
+        payload["summary"].pop("harbor_viewer", None)
+    attempt_policy = payload.get("attempt_policy") if isinstance(payload.get("attempt_policy"), dict) else {}
+    if "max_attempts" in attempt_policy:
+        max_attempts = _nonnegative_count(attempt_policy.get("max_attempts"))
+        if max_attempts < 1:
+            attempt_policy.pop("max_attempts", None)
+        else:
+            attempt_policy["max_attempts"] = max_attempts
+    if "pass_threshold" in attempt_policy:
+        threshold = _finite_number(attempt_policy.get("pass_threshold"), minimum=0.0, maximum=1.0)
+        if threshold is None:
+            attempt_policy["pass_threshold"] = None
+        else:
+            attempt_policy["pass_threshold"] = threshold
+    else:
+        attempt_policy["pass_threshold"] = None
+    if "stop_on_pass" in attempt_policy:
+        attempt_policy["stop_on_pass"] = attempt_policy.get("stop_on_pass") is True
+    payload["attempt_policy"] = attempt_policy
+    payload["pass_at_k"] = _sanitize_tier3_pass_at_k(payload.get("pass_at_k"))
+    payload["evaluator_cards"] = [
+        card
+        for item in _dict_list(payload.get("evaluator_cards"))
+        if (card := _sanitize_tier3_evaluator_card(item)) is not None
+    ]
+    payload["cases"] = _dict_list(payload.get("cases"))
+    best_name = _tier3_display_identifier(payload.get("best_agent") or payload["summary"].get("best_agent"))
+    best_agent = payload["agents"].get(best_name, {})
+    comparison_block_reason = global_comparison_block or _tier3_comparison_block_reason(best_agent)
+    # Unscored dimensions stay listed so the report can explain them.
+    payload["dimensions"] = [
+        dimension
+        for item in _dict_list(payload.get("dimensions"))
+        if any(
+            (dimension := _sanitize_tier3_dimension(item, comparison_block_reason=comparison_block_reason)).get(key)
+            is not None
+            for key in ("score", "with_skill", "baseline")
+        )
+    ]
+    scored_dimension_ids = {dimension.get("id") for dimension in payload["dimensions"]}
+    payload["not_applicable_dimensions"] = [
+        {"id": dimension_id, "reason": reason if isinstance(reason := item.get("reason"), str) else ""}
+        for item in _dict_list(payload.get("not_applicable_dimensions"))
+        if (dimension_id := _tier3_display_identifier(item.get("id"))) and dimension_id not in scored_dimension_ids
+    ]
+    for key in ("conclusions", "recommendations", "suggestions_v2"):
+        payload[key] = _sanitize_tier3_insight_items(payload.get(key))
+    payload["next_steps"] = [
+        {
+            key: str(step.get(key) or "")
+            for key in ("kind", "target", "problem", "evidence", "action", "check", "strength")
+        }
+        | {
+            key: _tier3_display_identifier(step[key])
+            for key in ("agent", "case", "case_id", "condition")
+            if isinstance(step.get(key), str)
+        }
+        for step in _dict_list(payload.get("next_steps"))
+    ]
+    payload["dataset"] = [_sanitize_tier3_dataset_case(item) for item in _dict_list(payload.get("dataset"))]
+    payload["case_diagnostics"] = _sanitize_tier3_case_diagnostics(payload.get("case_diagnostics"))
+    payload["trials"] = [_sanitize_tier3_trial(item) for item in _dict_list(payload.get("trials"))]
+    timing: list[dict[str, Any]] = []
+    for item in _dict_list(payload.get("timing")):
+        entry = dict(item)
+        entry["seconds"] = _finite_number(entry.get("seconds"), minimum=0.0)
+        if entry["seconds"] is not None:
+            timing.append(entry)
+    payload["timing"] = timing
+    for key in ("agents_run", "metric_ids"):
+        payload[key] = _tier3_identifier_list(payload.get(key))
+    for key in ("execution_errors", "suggestions"):
+        payload[key] = _string_list(payload.get(key))
+    # The template lists each notice's message; drop entries without one.
+    coverage_notices = [
+        notice
+        for notice in _dict_list(payload.get("coverage_notices"))
+        if isinstance(notice.get("message"), str) and notice["message"]
+    ]
+    if coverage_notices:
+        payload["coverage_notices"] = coverage_notices
+    else:
+        payload.pop("coverage_notices", None)
+    # ``skill_name`` was already validated above as an exact NFC filesystem
+    # identity. Do not pass it through compatibility-normalizing display text.
+    for key in ("best_agent", "verdict", "execution_status"):
+        for container in (payload, payload["summary"]):
+            if key not in container:
+                continue
+            normalized = _tier3_display_identifier(container.get(key))
+            if normalized:
+                container[key] = normalized
+            else:
+                container.pop(key, None)
+    for key in ("overall_score",):
+        payload[key] = _finite_number(payload.get(key), minimum=0.0, maximum=1.0)
+        payload["summary"][key] = _finite_number(payload["summary"].get(key), minimum=0.0, maximum=1.0)
+    for key in ("overall_lift", "composite_lift"):
+        payload[key] = _finite_number(payload.get(key), minimum=-1.0, maximum=1.0)
+        if key in payload["summary"]:
+            payload["summary"][key] = _finite_number(
+                payload["summary"].get(key),
+                minimum=-1.0,
+                maximum=1.0,
+            )
+    payload["runtime_seconds"] = _finite_number(payload.get("runtime_seconds"), minimum=0.0) or 0.0
+    baseline = payload.get("baseline")
+    if isinstance(baseline, dict) and baseline:
+        payload["baseline_description"] = baseline_description(baseline)
+    if comparison := payload.get("prior_version_comparison"):
+        payload["prior_version_lines"] = version_comparison_lines(comparison)
+    payload["summary"]["runtime_seconds"] = (
+        _finite_number(payload["summary"].get("runtime_seconds"), minimum=0.0) or 0.0
+    )
+    for key in ("expected_attempts", "scored_attempts"):
+        for container in (payload, payload["summary"]):
+            if key in container:
+                container[key] = _nonnegative_count(container.get(key))
+    truncation = payload.get("report_truncation") if isinstance(payload.get("report_truncation"), dict) else {}
+    omitted = truncation.get("omitted") if isinstance(truncation.get("omitted"), dict) else {}
+    sanitized_omitted = {
+        str(section): count for section, value in omitted.items() if (count := _nonnegative_count(value)) > 0
+    }
+    if sanitized_omitted:
+        truncation["omitted"] = sanitized_omitted
+    else:
+        truncation.pop("omitted", None)
+    if truncation:
+        payload["report_truncation"] = truncation
+    else:
+        payload.pop("report_truncation", None)
+    return payload
+
+
+@dataclass
+class _Tier3PreviewBudget:
+    chars_remaining: int = _TIER3_HTML_PREVIEW_CHARS
+    omitted_characters: int = 0
+    omitted_items: int = 0
+
+
+def _compact_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+def _script_safe_json(value: object) -> str:
+    """Serialize JSON for an HTML raw-text script element without expansion attacks."""
+    return (
+        _compact_json(value)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def _unrepresented_insight_steps(view: dict[str, Any], *, failed: bool) -> list[dict[str, Any]]:
+    """Keep next steps unless a failed-run card already displays all their evidence."""
+    steps = [step for step in view.get("next_steps", []) if isinstance(step, dict)]
+    if not failed:
+        return steps
+    actions = [
+        item
+        for item in view.get("recommendations", [])
+        if isinstance(item, dict) and item.get("insight_kind") == "execution_action"
+    ]
+
+    def represented(step: dict[str, Any], card: dict[str, Any]) -> bool:
+        if not step.get("action") or step["action"] != card.get("message"):
+            return False
+        target = step.get("target") or "agent_eval"
+        if target != card.get("metric"):
+            return False
+        for field in ("problem", "check", "strength", "agent", "case", "case_id", "condition"):
+            if (step.get(field) or "") != (card.get(field) or ""):
+                return False
+        return (step.get("evidence") or "") == (card.get("evidence_text") or card.get("evidence") or "")
+
+    return [step for step in steps if not any(represented(step, card) for card in actions)]
+
+
+def _canonical_tier3_embed(payload: dict[str, Any] | None) -> tuple[str, str]:
+    """Return one safe canonical Tier 3 copy and its browser decoding mode."""
+    if not payload:
+        return "", "json"
+    raw = _compact_json(payload)
+    safe = _script_safe_json(payload)
+    if len(safe.encode("utf-8")) <= _TIER3_JSON_EMBED_MAX_BYTES:
+        return safe, "json"
+    return base64.b64encode(raw.encode("utf-8")).decode("ascii"), "base64"
+
+
+def _bounded_tier3_preview_value(value: Any, budget: _Tier3PreviewBudget) -> Any:
+    if isinstance(value, str):
+        allowed = min(_TIER3_HTML_PREVIEW_STRING_CHARS, max(0, budget.chars_remaining))
+        if len(value) <= allowed:
+            budget.chars_remaining -= len(value)
+            return value
+        budget.omitted_characters += len(value) - allowed
+        budget.chars_remaining -= allowed
+        if allowed <= len(_TIER3_PREVIEW_MARKER):
+            return _TIER3_PREVIEW_MARKER[:allowed]
+        return value[: allowed - len(_TIER3_PREVIEW_MARKER)] + _TIER3_PREVIEW_MARKER
+
+    if isinstance(value, list):
+        kept = min(len(value), _TIER3_HTML_PREVIEW_COLLECTION_ITEMS)
+        budget.omitted_items += len(value) - kept
+        bounded: list[Any] = []
+        for item in value[:kept]:
+            bounded.append(_bounded_tier3_preview_value(item, budget))
+        return bounded
+
+    if isinstance(value, dict):
+        items = list(value.items())
+        priority_keys = _TIER3_HTML_PREVIEW_PRIORITY_KEYS
+        items.sort(key=lambda item: item[0] not in priority_keys)
+        kept = min(len(items), _TIER3_HTML_PREVIEW_COLLECTION_ITEMS)
+        budget.omitted_items += len(items) - kept
+        bounded_dict: dict[Any, Any] = {}
+        for key, item in items[:kept]:
+            budget.chars_remaining = max(0, budget.chars_remaining - len(str(key)))
+            bounded_dict[key] = _bounded_tier3_preview_value(item, budget)
+        return bounded_dict
+
+    return value
+
+
+def _restore_failure_reason_text(deferred: list[tuple[dict[str, Any], str, Any]], room: int) -> int:
+    """Put deferred failure reasons back while ``room`` bytes remain; return how many stay out."""
+    omitted = 0
+    for container, key, value in deferred:
+        # Key, colon, value and separating comma in compact JSON.
+        cost = len(_compact_json(key).encode("utf-8")) + len(_compact_json(value).encode("utf-8")) + 2
+        if cost <= room:
+            container[key] = value
+            room -= cost
+        else:
+            omitted += 1
+    return omitted
+
+
+def _capped_tier3_trial_rows(payload: dict[str, Any]) -> int:
+    """Count the drill-down rows the bounded preview walk leaves out.
+
+    The walk keeps the first ``_TIER3_HTML_PREVIEW_COLLECTION_ITEMS`` entries of
+    every list and mapping: with-skill rows across all agents in the top-level
+    ``trials``, baseline rows per agent, and the first agents.
+    """
+    limit = _TIER3_HTML_PREVIEW_COLLECTION_ITEMS
+    trials = payload.get("trials")
+    omitted = max(0, len(trials) - limit) if isinstance(trials, list) else 0
+    agents = payload.get("agents")
+    for index, agent in enumerate(agents.values() if isinstance(agents, dict) else []):
+        baseline = agent.get("trials_baseline") if isinstance(agent, dict) else None
+        if isinstance(baseline, list):
+            omitted += len(baseline) if index >= limit else max(0, len(baseline) - limit)
+    return omitted
+
+
+def _tier3_chart_projection(payload: dict[str, Any] | None) -> dict[str, Any]:
+    """Keep only measurements consumed by the native dimension/token charts.
+
+    Derive this from the same bounded display preview as the tables. The full
+    retained evidence is embedded separately for JSON downloads.
+    """
+    data = payload or {}
+    return {
+        "dimensions": [{"id": row.get("id")} for row in (data.get("dimensions") or [])],
+        "agents": {
+            name: {
+                "dimensions": [
+                    {key: row[key] for key in ("id", "score", "with_skill") if key in row}
+                    for row in (agent.get("dimensions") or [])
+                ]
+            }
+            for name, agent in (data.get("agents") or {}).items()
+        },
+        "trials": [
+            {
+                "agent": trial.get("agent"),
+                "tokens": {
+                    key: value
+                    for key, value in (trial.get("tokens") or {}).items()
+                    if key in ("prompt", "completion", "cached")
+                },
+            }
+            for trial in (data.get("trials") or [])
+        ],
+    }
+
+
+def _bounded_tier3_preview(payload: dict[str, Any] | None) -> tuple[dict[str, Any] | None, dict[str, int]]:
+    """Return a presentation-only projection plus visible omission counts.
+
+    Built failure reasons and excerpts are optional for the overview, so they
+    are taken out first and put back only into room left under the preview
+    trigger. They can never spend the bounded preview budget ahead of the
+    overview keys. ``trial_rows`` counts only drill-down rows the walk capped,
+    so the drill-down note does not fire when only another list was trimmed.
+    """
+    if not payload:
+        return payload, {}
+    # A private copy: the caller embeds ``payload`` itself as the canonical data.
+    # The token usage table reads the full payload, so ``token_usage`` neither
+    # triggers the preview nor spends its budget.
+    slim = json.loads(_compact_json({key: value for key, value in payload.items() if key != "token_usage"}))
+    # Activation diagnostics belong to the canonical export. The template does
+    # not render them, so duplicate per-trial copies must not spend overview or
+    # failure-reason space before the preview budget is applied.
+    agents = slim.get("agents")
+    containers = [slim, *(agents.values() if isinstance(agents, dict) else [])]
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for arm in ("trials", "trials_baseline"):
+            trials = container.get(arm)
+            for trial in trials if isinstance(trials, list) else []:
+                if isinstance(trial, dict):
+                    trial.pop("activation_validation", None)
+    serialized = _compact_json(slim)
+    if len(serialized.encode("utf-8")) <= _TIER3_HTML_PREVIEW_TRIGGER_BYTES:
+        return slim, {}
+
+    from skillevaluator.evaluation.tier3_findings import failure_reason_text_slots, strip_failure_reason_text
+
+    rendered_slots = list(failure_reason_text_slots(slim, include_top_level_cards=False))
+    deferred = [(container, key, container.pop(key)) for container, key in rendered_slots]
+    # The page renders each agent's cards, never the top-level card copy, so its
+    # reasons are dropped without being restored or counted as left out.
+    strip_failure_reason_text(slim)
+    slim_size = len(_compact_json(slim).encode("utf-8"))
+    omitted_diagnostics = 0
+    if slim_size > _TIER3_HTML_PREVIEW_TRIGGER_BYTES:
+        omitted_diagnostics = len(slim.pop("case_diagnostics", []))
+        slim_size = len(_compact_json(slim).encode("utf-8"))
+    if slim_size <= _TIER3_HTML_PREVIEW_TRIGGER_BYTES:
+        omitted_reasons = _restore_failure_reason_text(deferred, _TIER3_HTML_PREVIEW_TRIGGER_BYTES - slim_size)
+        return slim, {
+            key: count
+            for key, count in {
+                "failure_reasons": omitted_reasons,
+                "case_diagnostics": omitted_diagnostics,
+            }.items()
+            if count
+        }
+
+    budget = _Tier3PreviewBudget()
+    preview = _bounded_tier3_preview_value(slim, budget)
+    notice = {
+        key: value
+        for key, value in {
+            "characters": budget.omitted_characters,
+            "items": budget.omitted_items,
+            "trial_rows": _capped_tier3_trial_rows(slim),
+            "failure_reasons": len(deferred),
+            "case_diagnostics": omitted_diagnostics,
+        }.items()
+        if value > 0
+    }
+    return preview, notice
+
+
+def _skillspector_versions(results: list[ValidationResult]) -> list[str]:
+    """Return the distinct SkillSpector versions recorded on ``results``, in first-seen order."""
+    versions: dict[str, None] = {}
+    for result in results:
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        raw_version = metadata.get("skillspector_version")
+        if isinstance(raw_version, str) and _SKILLSPECTOR_VERSION_RE.fullmatch(raw_version.strip()):
+            versions.setdefault(raw_version.strip(), None)
+    return list(versions)
+
+
+def _skillspector_provenance(results: list[ValidationResult]) -> list[dict[str, object]]:
+    """Return the validated SkillSpector LLM provenance records on ``results``."""
+    return [record for result in results for record in skillspector_provenance_records(result.metadata)]
+
+
+def _related_paths(finding: object) -> list[str]:
+    """Return distinct path-like string values carried in finding metadata."""
+    metadata = finding.get("metadata", {}) if isinstance(finding, dict) else getattr(finding, "metadata", {})
+    if not isinstance(metadata, dict):
+        return []
+
+    paths: list[str] = []
+    for key, value in metadata.items():
+        normalized_key = str(key).casefold()
+        if not (normalized_key == "path" or normalized_key.startswith("path_") or normalized_key.endswith("_path")):
+            continue
+        if isinstance(value, str) and value and value not in paths:
+            paths.append(value)
+    return paths
+
+
+def _adaptive_unsigned_percent_decimals(percentage: float) -> int:
+    """Return the existing bounded precision policy for one unsigned percentage."""
+    if percentage in {0.0, 100.0}:
+        return 0
+    if 0 < percentage < 1 or 99 < percentage < 100:
+        distance_from_endpoint = min(percentage, 100 - percentage)
+        return max(2, min(6, math.ceil(-math.log10(distance_from_endpoint))))
+    return 0
+
+
+def _adaptive_percent(value: object, signed: bool = False) -> str:
+    """Format percentages without rounding narrow nonzero effects to zero or endpoints."""
+    try:
+        percentage = float(value) * 100
+    except (TypeError, ValueError, OverflowError):
+        return "—"
+    if not math.isfinite(percentage):
+        return "—"
+
+    if signed:
+        magnitude = abs(percentage)
+        if magnitude == 0 or magnitude >= 0.1:
+            decimals = 1
+        else:
+            decimals = max(2, min(6, math.ceil(-math.log10(magnitude))))
+        return f"{percentage:+.{decimals}f}%"
+
+    decimals = _adaptive_unsigned_percent_decimals(percentage)
+    return f"{percentage:.{decimals}f}%"
+
+
+def _adaptive_interval_percent(interval: object) -> str:
+    """Format a percentage interval with shared precision and visible bounds."""
+    if not isinstance(interval, dict):
+        return "—"
+    try:
+        lower = float(interval["lower"]) * 100
+        upper = float(interval["upper"]) * 100
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return "—"
+    if not math.isfinite(lower) or not math.isfinite(upper) or lower > upper:
+        return "—"
+
+    decimals = max(
+        _adaptive_unsigned_percent_decimals(lower),
+        _adaptive_unsigned_percent_decimals(upper),
+    )
+    if lower != upper:
+        for candidate in range(decimals, 7):
+            if f"{lower:.{candidate}f}" != f"{upper:.{candidate}f}":
+                decimals = candidate
+                break
+        else:
+            # Preserve a distinct interval narrower than the six-decimal
+            # display budget by rounding its bounds outward at that budget.
+            decimals = 6
+            scale = 10**decimals
+            lower = math.floor(lower * scale) / scale
+            upper = math.ceil(upper * scale) / scale
+
+    def _bound(value: float) -> str:
+        # Exact mathematical endpoints remain compact even when the other
+        # bound needs additional precision.
+        if value in {0.0, 100.0}:
+            return f"{value:.0f}%"
+        return f"{value:.{decimals}f}%"
+
+    return f"{_bound(lower)}\N{EN DASH}{_bound(upper)}"
+
+
+# Plain-language names for checks that report a raw upper-case ID. The report
+# shows the plain name with the raw ID beside it.
+_PLAIN_CHECK_NAMES = {
+    "QUALITY": "Quality score",
+    "SCRIPT_LINT": "Script lint",
+    "SCHEMA": "Schema",
+    "RUBRIC_EVAL": "Rubric evaluation",
+    "AGENT_EVAL": "Live agent evaluation",
+    "DEDUPLICATION": "Duplicate detection",
+}
+_RAW_CHECK_ID = re.compile(r"[A-Z][A-Z0-9_]*")
+# One verdict vocabulary for every surface: the HTML report, the CI index and
+# the Pages history. Keys are the report's verdict keys.
+VERDICT_WORDS = {
+    "pass": "Passed",
+    "fail": "Changes required",
+    "incomplete": "Incomplete",
+    "skipped": "Skipped",
+    "neutral": "Neutral",
+}
+PUBLICATION_WORDS = {"pass": "Eligible", "fail": "Not eligible", "incomplete": "Incomplete", "neutral": "Neutral"}
+# A tier whose gate does not block can fail without requiring changes.
+ADVISORY_FAIL_WORD = "Failed (advisory)"
+# "A 90+, B 80+, C 70+, D 60+, F below 60", from the thresholds the grades use.
+QUALITY_GRADE_LEGEND = ", ".join(
+    f"{grade} {threshold}+" if threshold else f"{grade} below {QUALITY_GRADE_THRESHOLDS[index - 1][0]}"
+    for index, (threshold, grade) in enumerate(QUALITY_GRADE_THRESHOLDS)
+)
+_SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+FIX_FIRST_LIMIT = 5
+# How the tool runner and the scanners say that a scanner itself is missing.
+_MISSING_SCANNER = re.compile(r"\bnot installed\b|\bnot found in PATH\b", re.IGNORECASE)
+
+
+def _scan_stop_reason(errors: list[str], warnings: list[str]) -> str:
+    """Return the diagnostic that says why a scan did not finish, or "".
+
+    *errors* and *warnings* are the lines that do not repeat a finding.
+    Errors come first. A line saying a scanner is missing is used only when
+    nothing else explains the gap, because a scanner that ran and failed
+    needs a different fix.
+    """
+    lines = [" ".join(str(line).split()) for line in [*errors, *warnings]]
+    lines = [line for line in lines if line]
+    return next((line for line in lines if not _MISSING_SCANNER.search(line)), lines[0] if lines else "")
+
+
+def _sentence(text: str, limit: int = 200) -> str:
+    """Bound *text* to *limit* characters and end it as a sentence."""
+    if len(text) > limit:
+        text = text[: limit - 1].rstrip() + "\N{HORIZONTAL ELLIPSIS}"
+    return text if text.endswith((".", "!", "?", "\N{HORIZONTAL ELLIPSIS}")) else f"{text}."
+
+
+def plain_check_name(name: object) -> str:
+    """Return a readable name for a check that reports a raw ID such as ``SCRIPT_LINT``."""
+    text = str(name or "")
+    if text in _PLAIN_CHECK_NAMES:
+        return _PLAIN_CHECK_NAMES[text]
+    if _RAW_CHECK_ID.fullmatch(text):
+        return text.replace("_", " ").capitalize()
+    return text
+
+
+def _skill_relative_path(path: object, skill_name: object, scan_root: str | None = None) -> str:
+    """Show a location relative to the skill folder instead of the machine path.
+
+    *scan_root* is the folder the scanners ran on, when it is known. Without
+    it, the last part of the skill name marks the skill folder, which cannot
+    work for a skill at the repository root.
+    """
+    text = str(path or "")
+    root = (scan_root or "").rstrip("/")
+    if root and text.startswith(f"{root}/"):
+        return text[len(root) + 1 :]
+    base = str(skill_name or "").rstrip("/").rsplit("/", 1)[-1]
+    marker = f"/{base}/" if base else ""
+    if marker and marker in text:
+        return text.split(marker, 1)[1]
+    return text
+
+
+def _anchor_slug(*parts: object) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", " ".join(str(part) for part in parts).lower()).strip("-")
+    return slug or "item"
+
+
+def _evidence_anchors(
+    skills: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, list[str]]], dict[str, dict[str, str]]]:
+    """Give every check and finding card in the skill view a stable, unique id.
+
+    Returns ``(findings, checks)``: ``findings[skill][check]`` lists one id per
+    finding card in template order, and ``checks[skill][check]`` is the id of
+    the check itself. Ids are readable slugs, so a link to a finding survives
+    a re-render of the same evidence.
+    """
+    used: set[str] = set()
+
+    def unique(base: str) -> str:
+        candidate, suffix = base, 2
+        while candidate in used:
+            candidate, suffix = f"{base}-{suffix}", suffix + 1
+        used.add(candidate)
+        return candidate
+
+    findings: dict[str, dict[str, list[str]]] = {}
+    checks: dict[str, dict[str, str]] = {}
+    for skill_name in sorted(skills):
+        for check_name in sorted(skills[skill_name].get("validators", {})):
+            check = skills[skill_name]["validators"][check_name]
+            base = _anchor_slug(skill_name, check_name)
+            checks.setdefault(skill_name, {})[check_name] = unique(f"c-{base}")
+            findings.setdefault(skill_name, {})[check_name] = [
+                unique(f"f-{base}-{index}") for index in range(1, len(check.get("findings") or []) + 1)
+            ]
+    return findings, checks
+
+
+def _fix_first(
+    skills: dict[str, dict[str, Any]],
+    finding_anchors: dict[str, dict[str, list[str]]],
+    check_anchors: dict[str, dict[str, str]],
+    *,
+    limit: int = FIX_FIRST_LIMIT,
+    scan_root: str | None = None,
+) -> list[dict[str, Any]]:
+    """Pick the few places to fix first, most severe first, one entry per location.
+
+    A check that could not finish comes first, with the scanner's own reason,
+    because no pass can be claimed until it runs. Findings then rank by severity, then blocking before
+    advisory, then occurrences. A failed check's independent error, or its
+    failure without a located finding, is listed as a high, blocking item so
+    its reason is not lost. Two findings at
+    the same file and line (for example one secret reported by two scanners)
+    take one slot.
+    """
+    candidates: list[tuple[tuple[int, ...], tuple, dict[str, Any]]] = []
+    for skill_name in sorted(skills):
+        for check_name in sorted(skills[skill_name].get("validators", {})):
+            check = skills[skill_name]["validators"][check_name]
+            label = plain_check_name(check_name)
+            status = check.get("status") or ("pass" if check.get("passed") else "fail")
+            findings = check.get("findings") or []
+            independent_errors = [str(error) for error in check.get("additional_errors") or [] if str(error).strip()]
+            blocking = not check.get("passed", True)
+            item = {"check": label, "skill": skill_name, "location": "", "blocking": True}
+            check_key = (skill_name, "check", check_name)
+            if status == "incomplete" or check.get("incomplete_scans"):
+                scans = ", ".join(str(scan) for scan in check.get("incomplete_scans") or [])
+                reason = _scan_stop_reason(check.get("additional_errors") or [], check.get("additional_warnings") or [])
+                message = f"{label} did not finish" + (f": {reason}" if reason else f" ({scans})" if scans else "")
+                item |= {"kind": "incomplete", "severity": "incomplete", "message": message}
+                candidates.append(((2, 0, 1, 0), check_key, item | {"anchor": check_anchors[skill_name][check_name]}))
+            elif status == "fail" and (independent_errors or not findings):
+                errors = independent_errors or [str(error) for error in check.get("errors") or [] if str(error).strip()]
+                message = errors[0] if errors else f"{label} failed without a located finding"
+                item |= {"kind": "check", "severity": "high", "message": message}
+                rank = (1, _SEVERITY_RANK["high"], 1, 1)
+                candidates.append((rank, check_key, item | {"anchor": check_anchors[skill_name][check_name]}))
+            for index, finding in enumerate(findings):
+                severity = str(finding.get("severity") or "medium").lower()
+                location = _skill_relative_path(finding.get("file_path"), skill_name, scan_root)
+                if location and finding.get("line_number"):
+                    location = f"{location}:{finding['line_number']}"
+                occurrences = finding.get("occurrences", 1)
+                occurrences = min(occurrences, 9999) if isinstance(occurrences, int) else 1
+                rank = (1, _SEVERITY_RANK.get(severity, _SEVERITY_RANK["medium"]), int(blocking), occurrences)
+                key = (skill_name, "file", location) if location else (skill_name, check_name, finding.get("message"))
+                entry = {
+                    "kind": "finding",
+                    "severity": severity,
+                    "message": str(finding.get("message") or ""),
+                    "check": label,
+                    "skill": skill_name,
+                    "location": location,
+                    "blocking": blocking,
+                    "anchor": finding_anchors[skill_name][check_name][index],
+                }
+                candidates.append((rank, key, entry))
+    items: list[dict[str, Any]] = []
+    seen: set[tuple] = set()
+    # sorted() is stable, so ties keep skill, check and evidence order.
+    for _rank, key, entry in sorted(candidates, key=lambda candidate: candidate[0], reverse=True):
+        if key not in seen:
+            seen.add(key)
+            items.append(entry)
+    return items[:limit]
+
+
+@cache
+def _load_chart_assets() -> tuple[str, str]:
+    """Read fixed, trusted chart resources once, only for reports containing charts."""
+    assets = resources.files("skillevaluator.reporting").joinpath("assets")
+    try:
+        runtime = assets.joinpath("chart.umd.min.js").read_text(encoding="utf-8")
+        notices = "\n\n".join(
+            assets.joinpath(name).read_text(encoding="utf-8")
+            for name in ("Chart.js-LICENSE.md", "kurkle-color-LICENSE.md")
+        )
+    except OSError:
+        # A broken install keeps the report; each chart shows its data-link fallback.
+        return "", ""
+    return runtime, notices
+
+
+class PackageLoader(BaseLoader):
+    """Custom Jinja2 loader that loads templates from package resources."""
+
+    def __init__(self, package: str, path: str) -> None:
+        self.package = package
+        self.path = path
+
+    def get_source(self, _environment: Environment, template: str) -> tuple[str, str, callable]:
+        """Load template source from package resources."""
+        template_path = f"{self.path}/{template}"
+        try:
+            source = resources.files(self.package).joinpath(template_path).read_text(encoding="utf-8")
+        except AttributeError as exc:
+            encoded = pkgutil.get_data(self.package, template_path)
+            if encoded is None:
+                raise FileNotFoundError(template_path) from exc
+            source = encoded.decode("utf-8")
+        return source, template, lambda: True
+
+
+def _detail_display_status(detail: Any) -> str:
+    """Recognize explicit producer evidence that a check was inapplicable."""
+    return "not_applicable" if success_is_not_applicable(detail.check_name, detail.message, detail.metadata) else "pass"
+
+
+def _result_display_status(result: ValidationResult) -> str:
+    """Describe execution separately from the preserved gate boolean."""
+    return result_execution_status(result)
+
+
+def _validated_ci_context(context: dict[str, str] | None) -> dict[str, str]:
+    """Allow only bounded display text and HTTPS links in trusted CI chrome."""
+    if context is None:
+        return {}
+    if not isinstance(context, dict):
+        raise ValueError("ci_context must be a dictionary")
+    result = {}
+    for key in ("run_url", "report_index_url", "report_url", "canonical_json_url", "commit", "image", "ci_conclusion"):
+        value = context.get(key)
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str) or len(value) > 4096 or any(ord(c) < 32 for c in value):
+            raise ValueError(f"Invalid CI context {key}")
+        if key.endswith("url"):
+            if (key, value) in {
+                ("report_index_url", "../index.html"),
+                ("canonical_json_url", "skillevaluator-tier1.json"),
+            }:
+                result[key] = value
+                continue
+            parsed = urlparse(value)
+            if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or "\\" in value:
+                raise ValueError(f"CI context {key} must be an HTTPS URL")
+        result[key] = value
+    return result
+
+
+class HTMLReporter(ReporterBase):
+    """HTML report generator using Jinja2 templates."""
+
+    ICONS: ClassVar[dict[str, str]] = {
+        "checkmark": '<svg class="success-icon" viewBox="0 0 16 16" fill="currentColor"><path d="M13.78 4.22a.75.75 0 010 1.06l-7.25 7.25a.75.75 0 01-1.06 0L2.22 9.28a.75.75 0 011.06-1.06L6 10.94l6.72-6.72a.75.75 0 011.06 0z"/></svg>',
+        "file": '<svg class="meta-icon" viewBox="0 0 16 16" fill="currentColor"><path d="M3.75 1.5a.25.25 0 00-.25.25v11.5c0 .138.112.25.25.25h8.5a.25.25 0 00.25-.25V4.664a.25.25 0 00-.073-.177l-2.914-2.914a.25.25 0 00-.177-.073H3.75z"/><path fill-rule="evenodd" d="M2 1.75C2 .784 2.784 0 3.75 0h5.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237v8.586A1.75 1.75 0 0112.25 15h-8.5A1.75 1.75 0 012 13.25V1.75z"/></svg>',
+        "search": '<svg class="meta-icon" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" d="M11.5 7a4.499 4.499 0 11-8.998 0A4.499 4.499 0 0111.5 7zm-.82 4.74a6 6 0 111.06-1.06l3.04 3.04a.75.75 0 11-1.06 1.06l-3.04-3.04z"/></svg>',
+        "arrow_up": '<svg viewBox="0 0 16 16" fill="currentColor" width="20" height="20"><path fill-rule="evenodd" d="M8 12a.75.75 0 01-.75-.75V5.56L5.03 7.78a.75.75 0 01-1.06-1.06l3.5-3.5a.75.75 0 011.06 0l3.5 3.5a.75.75 0 01-1.06 1.06L8.75 5.56v5.69A.75.75 0 018 12z"/></svg>',
+    }
+
+    DEFAULT_TABS: ClassVar[list[dict[str, str]]] = [
+        {"id": "tier1", "label": "Tier 1: Security and Static Validation"},
+    ]
+
+    def __init__(
+        self,
+        *,
+        include_timestamp: bool = True,
+        title: str | None = None,
+        tabs: list[dict[str, str]] | None = None,
+        target_path: str | None = None,
+        content_label: str = "Skill",
+        profile: str | None = None,
+        expected_skill_name: str | None = None,
+        explicit_skill_name: str | None = None,
+        ci_context: dict[str, str] | None = None,
+        report_scope: str = "publication",
+        scan_root: str | None = None,
+        requested_tiers: tuple[int, ...] | None = None,
+        displayed_tiers: tuple[int, ...] | None = None,
+        presentation_context: FinalRenderContext | None = None,
+    ) -> None:
+        self.include_timestamp = include_timestamp
+        self.title = title or "SkillEvaluator Validation Report"
+        self.tabs = list(tabs) if tabs is not None else list(self.DEFAULT_TABS)
+        self._tabs_explicit = tabs is not None
+        self.target_path = target_path
+        self.content_label = content_label
+        # Active validation policy (e.g. "default" or a custom policy name). Surfaced
+        # in the report header so reviewers can tell which audience the
+        # validation gate was applied for.
+        self.profile = profile
+        validate_report_scope(report_scope, [])
+        self.report_scope = report_scope
+        self.expected_skill_name = expected_skill_name
+        self.explicit_skill_name = explicit_skill_name
+        self.ci_context = _validated_ci_context(ci_context)
+        # The folder the scanners ran on, used to show finding locations
+        # relative to the skill in "Fix first".
+        self.scan_root = scan_root
+        self.requested_tiers = requested_tiers
+        self.displayed_tiers = displayed_tiers
+        self.presentation_context = presentation_context
+        self._env = self._create_environment()
+
+    @staticmethod
+    @cache
+    def _create_environment() -> Environment:
+        """Return one shared environment, so each template compiles once per process.
+
+        Compiling report.html.j2 costs far more than rendering it. The loader
+        serves fixed package templates and the filters are pure functions, so
+        reporters with different options can share it. Jinja environments are
+        safe to share between threads once they are configured.
+        """
+        from skillevaluator.skillspector_references import reference_summary_message
+
+        loader = PackageLoader("skillevaluator.reporting", "templates")
+        environment = Environment(loader=loader, autoescape=True)
+        environment.filters["skillspector_reference_summary"] = reference_summary_message
+        environment.filters["cleanly_skipped"] = is_cleanly_skipped
+        environment.filters["execution_status"] = _result_display_status
+        environment.filters["related_paths"] = _related_paths
+        environment.filters["finding_verification"] = finding_verification
+        environment.filters["additional_errors"] = additional_errors
+        environment.filters["adaptive_percent"] = _adaptive_percent
+        environment.filters["adaptive_interval_percent"] = _adaptive_interval_percent
+        environment.filters["skip_reason"] = get_skip_reason
+        environment.filters["not_applicable_reason"] = _tier3_not_applicable_reason
+        environment.filters["tier3_backend_label"] = _tier3_backend_label
+        return environment
+
+    @staticmethod
+    def _infer_profile_from_results(results: list[ValidationResult]) -> str | None:
+        """Read the active profile name out of result metadata.
+
+        ``commands.validate._stamp_policy`` writes ``result.metadata['policy']``
+        for every result; we read it back here so reporters constructed
+        without an explicit ``profile=`` argument still surface the profile.
+        Returns ``None`` if no result carries policy metadata.
+        """
+        for r in results:
+            policy_meta = (r.metadata or {}).get("policy") if isinstance(r.metadata, dict) else None
+            if isinstance(policy_meta, dict) and policy_meta.get("profile"):
+                return str(policy_meta["profile"])
+        return None
+
+    @property
+    def name(self) -> str:
+        return "html"
+
+    @property
+    def description(self) -> str:
+        return "Standalone HTML reports for archiving/sharing"
+
+    def _is_single_skill_mode(self, results: list[ValidationResult]) -> str | None:
+        """Detect if results are from a single-skill run (not folder-of-skills).
+
+        In folder mode, findings have ``[skill-name] path`` prefixes from
+        ``merge_with_prefix`` and success_details use the skill name as
+        ``check_name``.  In single-skill mode neither of these holds; instead
+        success_detail check_names are validator-internal IDs like
+        ``manifest_exists``.
+
+        Returns the inferred skill name if single-skill mode, else None.
+        """
+        if self.explicit_skill_name is not None:
+            return self.explicit_skill_name
+
+        # Check for [prefix] pattern in any finding — indicates folder mode
+        for r in results:
+            for f in r.findings:
+                if f.file_path.startswith("[") and "]" in f.file_path:
+                    return None
+
+        # Try to infer skill name from the first absolute file_path
+        for r in results:
+            for f in r.findings:
+                fp = f.file_path
+                if "/" in fp:
+                    p = Path(fp)
+                    while p.parent != p:
+                        if (p / "SKILL.md").exists() or (p / "skill.md").exists():
+                            return p.name
+                        p = p.parent
+
+        # Fall back: look for quality_scores metadata which always has skill_name
+        for r in results:
+            qs = r.metadata.get("quality_scores") if r.metadata else None
+            if qs and qs.get("skill_name"):
+                return qs["skill_name"]
+
+        # Fall back: target_path
+        if self.target_path:
+            tp = Path(self.target_path)
+            if (tp / "SKILL.md").exists() or (tp / "skill.md").exists():
+                # ``.`` and ``..`` (``tier1 .`` from inside the skill folder) have
+                # no folder name of their own; the folder they open does.
+                return (tp.resolve().name if tp.name in {"", ".", ".."} else tp.name) or None
+
+        return None
+
+    def _reorganize_single_skill(
+        self,
+        results: list[ValidationResult],
+        skill_name: str,
+    ) -> dict[str, dict[str, Any]]:
+        """Reorganize results for a single-skill run into one entry."""
+        skill_data: dict[str, Any] = {"passed": True, "validators": {}, "issue_count": 0, "status": "pass"}
+
+        for result in results:
+            vn = result.validator_name
+            display_status = _result_display_status(result)
+            vdata: dict[str, Any] = {
+                "passed": result.passed,
+                "status": display_status,
+                "errors": list(result.errors),
+                "warnings": list(result.warnings),
+                # The lines that do not repeat a finding: scanner diagnostics and gate failures.
+                "additional_errors": additional_errors(result),
+                "additional_warnings": additional_warnings(result),
+                "incomplete_scans": list(result.incomplete_scans),
+                "description": result.validator_description,
+                "details": [],
+                "findings": [],
+            }
+
+            for detail in result.success_details:
+                vdata["details"].append(
+                    {
+                        "check_name": detail.check_name,
+                        "status": _detail_display_status(detail),
+                        "message": detail.message,
+                        "metadata": detail.metadata,
+                    }
+                )
+
+            for finding in result.findings:
+                clean_path = finding.file_path
+                if self.explicit_skill_name is None and "/" + skill_name + "/" in clean_path:
+                    clean_path = clean_path[clean_path.index("/" + skill_name + "/") + len(skill_name) + 2 :]
+
+                confidence = "high"
+                if hasattr(finding, "metadata") and isinstance(finding.metadata, dict):
+                    confidence = finding.metadata.get("confidence", "high")
+
+                vdata["findings"].append(
+                    {
+                        "finding_id": finding.finding_id,
+                        "occurrence_id": finding.occurrence_id,
+                        "category": finding.category,
+                        "severity": finding.severity.value
+                        if hasattr(finding.severity, "value")
+                        else str(finding.severity),
+                        "check_name": finding.check_name,
+                        "message": self._normalize_message(finding.message),
+                        "file_path": clean_path,
+                        "line_number": finding.line_number,
+                        "line_content": finding.line_content,
+                        "suggestion": finding.suggestion,
+                        "location": finding.location,
+                        "confidence": confidence,
+                        "metadata": finding.metadata if hasattr(finding, "metadata") else {},
+                    }
+                )
+
+            if not result.passed:
+                skill_data["passed"] = False
+                vdata["passed"] = False
+
+            if result_status(result) == Status.FAILED:
+                skill_data["status"] = "fail"
+            elif result_status(result) == Status.INCOMPLETE and skill_data["status"] != "fail":
+                skill_data["status"] = "incomplete"
+            skill_data["validators"][vn] = vdata
+
+        skill_data["finding_count"] = self._unique_finding_count(skill_data)
+        # Deduplicate findings per validator
+        for vdata in skill_data["validators"].values():
+            if vdata["findings"]:
+                vdata["findings"] = self._deduplicate_findings(vdata["findings"])
+
+        skill_data["issue_count"] = sum(
+            sum(f.get("occurrences", 1) for f in vd["findings"]) for vd in skill_data["validators"].values()
+        )
+
+        return {skill_name: skill_data}
+
+    def _reorganize_by_skill(self, results: list[ValidationResult]) -> dict[str, dict[str, Any]]:
+        """Reorganize validation results by skill instead of by validator.
+
+        Returns a dict like:
+        {
+            "skill-name": {
+                "passed": True/False,
+                "validators": {
+                    "SCHEMA": {"passed": True, "details": [...], "findings": [...]},
+                    "SECURITY": {"passed": True, "details": [...], "findings": [...]},
+                }
+            }
+        }
+        """
+        # Detect single-skill mode and use the dedicated path
+        single_skill = self._is_single_skill_mode(results)
+        if single_skill:
+            return self._reorganize_single_skill(results, single_skill)
+
+        skills: dict[str, dict[str, Any]] = {}
+
+        for result in results:
+            validator_name = result.validator_name
+
+            # Extract skill names from success_details
+            for detail in result.success_details:
+                skill_name = detail.check_name
+                # Skip discovery/folder-level checks
+                if skill_name in (
+                    "skill_discovery",
+                    "folder_structure",
+                    "skills_directory",
+                    "team_skills_directory",
+                    "pii_scan_start",
+                    "pii_detection",
+                ):
+                    continue
+
+                if skill_name not in skills:
+                    skills[skill_name] = {"passed": True, "validators": {}}
+
+                if validator_name not in skills[skill_name]["validators"]:
+                    skills[skill_name]["validators"][validator_name] = {
+                        "passed": True,
+                        "description": result.validator_description,
+                        "details": [],
+                        "findings": [],
+                    }
+
+                skills[skill_name]["validators"][validator_name]["details"].append(
+                    {
+                        "check_name": detail.check_name,
+                        "message": detail.message,
+                        "metadata": detail.metadata,
+                    }
+                )
+
+            # Extract skill names from findings (failures)
+            for finding in result.findings:
+                # Extract skill name from file_path (e.g., "[skill-name] file.md")
+                file_path = finding.file_path
+                skill_name = None
+                if file_path.startswith("[") and "]" in file_path:
+                    skill_name = file_path[1 : file_path.index("]")]
+                else:
+                    # Try to extract from path
+                    parts = file_path.split("/")
+                    if len(parts) > 0:
+                        skill_name = parts[0]
+
+                if skill_name:
+                    if skill_name not in skills:
+                        skills[skill_name] = {"passed": False, "validators": {}, "issue_count": 0}
+
+                    if validator_name not in skills[skill_name]["validators"]:
+                        skills[skill_name]["validators"][validator_name] = {
+                            "passed": False,
+                            "description": result.validator_description,
+                            "details": [],
+                            "findings": [],
+                        }
+
+                    skills[skill_name]["validators"][validator_name]["passed"] = False
+                    skills[skill_name]["passed"] = False
+
+                    # Clean file_path: strip redundant [skill-name] prefix
+                    clean_path = file_path
+                    if file_path.startswith("[") and "] " in file_path:
+                        clean_path = file_path[file_path.index("] ") + 2 :]
+
+                    # Strip absolute paths -- keep only path relative to skill dir
+                    if "/" + skill_name + "/" in clean_path:
+                        clean_path = clean_path[clean_path.index("/" + skill_name + "/") + len(skill_name) + 2 :]
+
+                    confidence = "high"
+                    if hasattr(finding, "metadata") and isinstance(finding.metadata, dict):
+                        confidence = finding.metadata.get("confidence", "high")
+                    skills[skill_name]["validators"][validator_name]["findings"].append(
+                        {
+                            "finding_id": finding.finding_id,
+                            "occurrence_id": finding.occurrence_id,
+                            "category": finding.category,
+                            "severity": finding.severity.value
+                            if hasattr(finding.severity, "value")
+                            else str(finding.severity),
+                            "check_name": finding.check_name,
+                            "message": finding.message,
+                            "file_path": clean_path,
+                            "line_number": finding.line_number,
+                            "line_content": finding.line_content,
+                            "suggestion": finding.suggestion,
+                            "location": finding.location,
+                            "confidence": confidence,
+                            "metadata": finding.metadata if hasattr(finding, "metadata") else {},
+                        }
+                    )
+                    skills[skill_name]["issue_count"] = skills[skill_name].get("issue_count", 0) + 1
+
+        # Deduplicate findings within each skill/validator
+        for skill_data in skills.values():
+            skill_data["finding_count"] = self._unique_finding_count(skill_data)
+            # Recompute issue_count after deduplication (use occurrences)
+            deduped_count = 0
+            for validator_data in skill_data["validators"].values():
+                if validator_data["findings"]:
+                    validator_data["findings"] = self._deduplicate_findings(validator_data["findings"])
+                    deduped_count += sum(f.get("occurrences", 1) for f in validator_data["findings"])
+            if deduped_count > 0:
+                skill_data["issue_count"] = deduped_count
+
+        # Ensure all skills have issue_count (including passing ones)
+        for skill_data in skills.values():
+            if "issue_count" not in skill_data:
+                skill_data["issue_count"] = 0
+
+        return skills
+
+    @staticmethod
+    def _normalize_message(msg: str) -> str:
+        """Normalize a finding message for deduplication.
+
+        Strips trailing whitespace/newlines and collapses internal whitespace
+        so that near-identical messages (e.g., "Privilege Escalation: .env\\n"
+        vs "Privilege Escalation: .env ") are grouped together.
+        """
+        # Strip and collapse whitespace
+        return " ".join((msg or "").split())
+
+    @staticmethod
+    def _unique_finding_count(skill_data: dict[str, Any]) -> int:
+        """Count a skill's findings once per ``finding_id``, before display merging.
+
+        ``issue_count`` keeps counting raw records for the JSON ``skills``
+        list and contributor totals; the skill badge shows this count so it
+        agrees with the summary's Findings number.
+        """
+        return len(
+            {
+                finding["finding_id"]
+                for validator in skill_data["validators"].values()
+                for finding in validator["findings"]
+                if finding.get("finding_id")
+            }
+        )
+
+    @staticmethod
+    def _deduplicate_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Aggregate duplicate findings that share the same message, file, and suggestion.
+
+        Groups findings by (message, file_path, suggestion) and merges duplicates
+        into a single entry with an 'occurrences' count and a 'lines' list.
+        This dramatically reduces visual noise when the same PII pattern
+        (e.g., "Personal macOS user path") fires on many lines in the same file.
+        A finding's ``occurrence_id`` becomes an ``occurrence_ids`` list on the
+        merged entry, so every merged location keeps its identity. The key
+        also holds ``finding_id`` and the verification decision when present,
+        so different checks or decisions never merge. The first occurrence's
+        rationale represents the group; individual rationales remain in the
+        validator view and JSON export.
+        """
+        groups: dict[tuple, dict[str, Any]] = {}
+        seen_occurrences: dict[tuple, set[str]] = {}
+
+        for finding in findings:
+            # Normalize message for deduplication (strip trailing whitespace/newlines)
+            norm_msg = HTMLReporter._normalize_message(finding.get("message", ""))
+            verification = finding_verification(finding)
+            decision = (
+                (verification.verdict, verification.confidence, verification.severity_effect) if verification else None
+            )
+            key = (
+                norm_msg,
+                finding.get("file_path", ""),
+                finding.get("suggestion", ""),
+                finding.get("finding_id"),
+                decision,
+            )
+
+            if key in groups:
+                groups[key]["occurrences"] += 1
+                line_num = finding.get("line_number")
+                if line_num and line_num not in groups[key]["lines"]:
+                    groups[key]["lines"].append(line_num)
+                # Keep highest severity
+                sev_order = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+                existing_sev = sev_order.get(groups[key]["severity"], 0)
+                new_sev = sev_order.get(finding.get("severity", "medium"), 0)
+                if new_sev > existing_sev:
+                    groups[key]["severity"] = finding["severity"]
+                # Preserve the first line_content as representative
+                if not groups[key].get("line_content") and finding.get("line_content"):
+                    groups[key]["line_content"] = finding["line_content"]
+                # Track confidence (keep lowest = most suspicious)
+                conf_order = {"low": 0, "medium": 1, "high": 2}
+                existing_conf = groups[key].get("confidence", "high")
+                new_conf = finding.get("confidence", "high")
+                if conf_order.get(new_conf, 2) < conf_order.get(existing_conf, 2):
+                    groups[key]["confidence"] = new_conf
+                occurrence_id = finding.get("occurrence_id")
+                if occurrence_id and "occurrence_ids" in groups[key] and occurrence_id not in seen_occurrences[key]:
+                    seen_occurrences[key].add(occurrence_id)
+                    groups[key]["occurrence_ids"].append(occurrence_id)
+            else:
+                entry = dict(finding)
+                entry["message"] = norm_msg  # Store normalized message
+                entry["occurrences"] = 1
+                if "occurrence_id" in entry:
+                    occurrence_id = entry.pop("occurrence_id")
+                    entry["occurrence_ids"] = [occurrence_id] if occurrence_id else []
+                    seen_occurrences[key] = set(entry["occurrence_ids"])
+                line_num = finding.get("line_number")
+                entry["lines"] = [line_num] if line_num else []
+                # Extract confidence from metadata if present
+                metadata = finding.get("metadata", {})
+                if isinstance(metadata, dict) and "confidence" in metadata:
+                    entry["confidence"] = metadata["confidence"]
+                elif "confidence" not in entry:
+                    entry["confidence"] = "high"
+                groups[key] = entry
+
+        # Sort lines for display
+        for group in groups.values():
+            group["lines"].sort()
+
+        return list(groups.values())
+
+    @staticmethod
+    def _extract_issue_group_key(message: str, category: str) -> str:
+        """Extract a grouping key from a finding message.
+
+        For SECURITY findings from skillspector, messages often include the matched
+        code snippet after a colon (e.g., "Privilege Escalation: ~/.ssh/id_ed25519").
+        We group these by the prefix so all "Privilege Escalation" variants are
+        aggregated into one top-issue row in the executive summary.
+
+        For PII and SCHEMA findings, the full normalized message is used as-is.
+        """
+        norm = HTMLReporter._normalize_message(message)
+        if category == "SECURITY" and ": " in norm:
+            # Use the category prefix (e.g., "Privilege Escalation", "Data Exfiltration")
+            return norm.split(": ", 1)[0]
+        return norm
+
+    @staticmethod
+    def _compute_issue_key(category: str, group_key: str) -> str:
+        """Stable, JS/CSS-safe identifier shared between top-issue rows and findings.
+
+        The HTML report cross-links the executive-summary row, the per-skill
+        affected pill, and the finding card itself. We need an identifier we
+        can safely embed in ``data-issue-key`` attributes and inline ``onclick``
+        JS strings without escaping concerns. Truncated SHA-1 hex meets that
+        bar: hex-only, deterministic, and short enough to read in DevTools.
+        16 hex chars (~64 bits) is well below collision risk for the few
+        dozen unique issue groups a single report ever shows.
+        """
+        payload = f"{category}::{group_key}".encode("utf-8", "surrogatepass")
+        return hashlib.sha1(payload, usedforsecurity=False).hexdigest()[:16]
+
+    @staticmethod
+    def _compute_top_issues(
+        skills: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Compute cross-skill aggregation of top issues for the executive summary.
+
+        For SECURITY findings, groups by category prefix (e.g., all
+        "Privilege Escalation: ..." variants are merged into one row).
+        For PII/SCHEMA findings, groups by exact (normalized) message.
+
+        As a side effect, each underlying finding is tagged with
+        ``issue_key`` (matching the row it rolls up to) so the template can
+        deep-link from the executive summary directly to the finding card.
+
+        Returns a list of dicts, most severe first; the occurrence count only
+        breaks ties within a severity.
+        """
+        sev_order = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+        issue_map: dict[tuple, dict[str, Any]] = {}
+
+        for skill_name, skill_data in skills.items():
+            for validator_data in skill_data["validators"].values():
+                for finding in validator_data.get("findings", []):
+                    msg = finding.get("message", "")
+                    category = finding.get("category", "")
+                    group_key = HTMLReporter._extract_issue_group_key(msg, category)
+                    issue_key = HTMLReporter._compute_issue_key(category, group_key)
+                    # Tag the finding so the template can attach a matching
+                    # ``data-issue-key`` to its card and JS can locate it.
+                    finding["issue_key"] = issue_key
+                    key = (group_key, category)
+
+                    occurrences = finding.get("occurrences", 1)
+
+                    if key in issue_map:
+                        issue_map[key]["total_count"] += occurrences
+                        if skill_name not in issue_map[key]["skills_affected"]:
+                            issue_map[key]["skills_affected"].append(skill_name)
+                        # Keep highest severity
+                        existing = sev_order.get(issue_map[key]["severity"], 0)
+                        new = sev_order.get(finding.get("severity", "medium"), 0)
+                        if new > existing:
+                            issue_map[key]["severity"] = finding["severity"]
+                    else:
+                        issue_map[key] = {
+                            "message": group_key,
+                            "severity": finding.get("severity", "medium"),
+                            "total_count": occurrences,
+                            "skills_affected": [skill_name],
+                            "category": category,
+                            "suggestion": finding.get("suggestion", ""),
+                            "issue_key": issue_key,
+                        }
+
+        return sorted(
+            issue_map.values(),
+            key=lambda issue: (sev_order.get(issue["severity"], 0), issue["total_count"]),
+            reverse=True,
+        )
+
+    @staticmethod
+    def _extract_contributors(
+        skills: dict[str, dict[str, Any]],
+        results: list[ValidationResult],
+    ) -> list[dict[str, Any]]:
+        """Extract contributor summary by mapping authors to their content items.
+
+        Searches for author information in:
+        1. Success details metadata (for passed skills — author_format check)
+        2. Finding metadata (for failed skills — current_author key)
+
+        Returns a list of contributor dicts sorted by issue count descending:
+        [
+            {
+                "author": "John Doe <john@example.com>",
+                "items": [{"name": "skill-x", "passed": True, "issue_count": 0}, ...],
+                "total_items": 3,
+                "passed_count": 2,
+                "failed_count": 1,
+                "total_issues": 5,
+            },
+        ]
+        """
+        # Build skill_name -> author mapping from validation results
+        skill_authors: dict[str, str] = {}
+
+        # Track author from unprefixed author_format (single-skill runs)
+        single_skill_author: str | None = None
+
+        for result in results:
+            # Check success_details for author info (passed skills)
+            for detail in result.success_details:
+                skill_name = detail.check_name
+                if skill_name in skills and skill_name not in skill_authors:
+                    # Look in nested checks metadata for author_format
+                    checks = detail.metadata.get("checks", [])
+                    for check in checks:
+                        if check.get("name") == "author_format":
+                            msg = check.get("description", "")
+                            # Message format: "Valid author format: Name <email>"
+                            if ": " in msg:
+                                author = msg.split(": ", 1)[1]
+                                skill_authors[skill_name] = author
+
+                # Handle prefixed success details from failed skills:
+                # check_name format: "[skill-name] author_format"
+                if detail.check_name.startswith("[") and "] author_format" in detail.check_name:
+                    sname = detail.check_name[1 : detail.check_name.index("]")]
+                    if sname in skills and sname not in skill_authors:
+                        msg = detail.message
+                        if ": " in msg:
+                            author = msg.split(": ", 1)[1]
+                            skill_authors[sname] = author
+
+                # Handle unprefixed author_format (single-skill runs):
+                # check_name is just "author_format" with author in message
+                if (
+                    detail.check_name == "author_format"
+                    and not detail.check_name.startswith("[")
+                    and single_skill_author is None
+                ):
+                    msg = detail.message
+                    if ": " in msg:
+                        single_skill_author = msg.split(": ", 1)[1]
+
+            # Check findings for author info (failed skills with author metadata)
+            for finding in result.findings:
+                if finding.check_name == "author_format" and finding.metadata:
+                    current_author = finding.metadata.get("current_author")
+                    if current_author:
+                        # Extract skill name from prefixed file_path "[skill-name] path"
+                        fp = finding.file_path
+                        if fp.startswith("[") and "]" in fp:
+                            sname = fp[1 : fp.index("]")]
+                            if sname in skills:
+                                skill_authors[sname] = current_author
+
+        # For single-skill runs, apply the unprefixed author to all skills
+        # that don't already have an author assigned
+        if single_skill_author:
+            for skill_name in skills:
+                if skill_name not in skill_authors:
+                    skill_authors[skill_name] = single_skill_author
+
+        # Group skills by author
+        author_map: dict[str, list[dict[str, Any]]] = {}
+        for skill_name, skill_data in skills.items():
+            author = skill_authors.get(skill_name, "Unknown")
+            if author not in author_map:
+                author_map[author] = []
+            author_map[author].append(
+                {
+                    "name": skill_name,
+                    "passed": skill_data["passed"],
+                    "issue_count": skill_data.get("issue_count", 0),
+                }
+            )
+
+        # Build contributor list
+        contributors = []
+        for author, items in author_map.items():
+            passed_count = sum(1 for i in items if i["passed"])
+            total_issues = sum(i["issue_count"] for i in items)
+            contributors.append(
+                {
+                    "author": author,
+                    "items": sorted(items, key=lambda x: (x["passed"], x["name"])),
+                    "total_items": len(items),
+                    "passed_count": passed_count,
+                    "failed_count": len(items) - passed_count,
+                    "total_issues": total_issues,
+                }
+            )
+
+        # Sort: most issues first, then by name
+        contributors.sort(key=lambda c: (-c["total_issues"], c["author"]))
+        return contributors
+
+    @staticmethod
+    def _compute_target_display(url: str) -> str:
+        """Compute a short display label for a target URL.
+
+        For repository URLs like
+        ``https://github.com/example/project/tree/HEAD/skills/my-skill``
+        returns ``ai_tools/ai_rules / skills/my-skill``.
+
+        Falls back to the path portion of the URL, or the raw string for
+        non-URL values.
+        """
+        if not url or not url.startswith("https://"):
+            return url or ""
+        parsed = urlparse(url)
+        path = parsed.path.lstrip("/")
+        if "/-/tree/" in path:
+            repo_part, _, rest = path.partition("/-/tree/")
+            branch_and_path = rest.split("/", 1)
+            if len(branch_and_path) == 2:
+                return f"{repo_part} / {branch_and_path[1]}"
+            return repo_part
+        return path or url
+
+    @staticmethod
+    def _compute_friendly_skill_label(target: str | None) -> str:
+        """Strip repo / filesystem prefixes so the hero card shows ``skills/<name>``.
+
+        The header keeps the full clickable path/URL for traceability; the hero
+        card only gets a short, audience-friendly label so reviewers don't have
+        to skim ``/workspaces/example-project/.../skills/log-analyzer`` to find
+        the skill they care about.
+
+        Resolution order — first match wins:
+
+        1. ``team-skills/<team>/<name>`` is preserved verbatim. The team prefix
+           carries useful provenance ("which team owns this skill") so we keep
+           it instead of collapsing to the bare name.
+        2. ``skills/<name>`` is preserved verbatim. The single ``skills/``
+           segment makes it obvious the artifact is a skill (not a rule or
+           workflow) without leaking the surrounding repo / worktree path.
+        3. Falls back to the basename — best effort when no canonical
+           ``skills/`` or ``team-skills/`` segment is present (e.g. validating
+           an ad-hoc directory outside the standard SkillEvaluator layout).
+        4. Empty string when ``target`` is ``None`` / empty so callers can
+           defensibly chain ``label or fallback``.
+        """
+        if not target:
+            return ""
+        path = target
+        if path.startswith("https://"):
+            parsed = urlparse(path)
+            path = parsed.path.lstrip("/")
+            if "/-/tree/" in path:
+                _repo, _, rest = path.partition("/-/tree/")
+                branch_and_path = rest.split("/", 1)
+                if len(branch_and_path) == 2:
+                    path = branch_and_path[1]
+        for marker in ("team-skills/", "skills/"):
+            idx = path.rfind(marker)
+            if idx >= 0:
+                return path[idx:]
+        try:
+            return Path(path).name or path
+        except (ValueError, OSError):
+            return path
+
+    # Validator names produced by ``commands.validate`` for each tier.  Used
+    # to bucket combined run results back into per-tier summaries for the
+    # hero card so the chip for "Tier 1" reflects only Tier 1 validators
+    # instead of leaking Tier 2 / Tier 3 stats from the global totals.
+    @classmethod
+    def _split_results_by_tier(
+        cls, results: list[ValidationResult]
+    ) -> tuple[list[ValidationResult], list[ValidationResult], list[ValidationResult]]:
+        """Bucket a flat results list into ``(tier1, tier2, tier3)`` slices.
+
+        ``commands.validate`` concatenates results in tier order before handing
+        them to the reporter, so we restore tier identity here by validator
+        name rather than relying on list slicing (which would silently break
+        if a tier ever produced zero results).
+        """
+        buckets: dict[int, list[ValidationResult]] = {1: [], 2: [], 3: []}
+        for result in results:
+            buckets[result_tier(result)].append(result)
+        return buckets[1], buckets[2], buckets[3]
+
+    @staticmethod
+    def _compute_tier_summary(
+        results: list[ValidationResult], *, presentation: TierPresentation | None = None
+    ) -> dict[str, Any]:
+        """Compact stats for a single tier — what the hero chip displays.
+
+        Returns ``passed`` (boolean), executed/pass/skip counts,
+        ``issue_count`` (unique findings, as the Markdown summary counts
+        them), and per-severity totals of those unique findings at their
+        highest severity. ``occurrence_count``, ``raw_finding_count`` and
+        ``duplicates_removed`` sit beside them, and ``issue_detail`` describes
+        them in the shared report wording when they differ from the unique
+        count or when errors or warnings have no finding behind them.
+        ``total == 0`` lets the template hide the chip entirely without an
+        extra "did this tier run?" predicate.
+        """
+        total = len(results)
+        statuses = [result_execution_status(r) for r in results] if presentation is None else []
+        skipped_count = presentation.skipped if presentation else statuses.count("skipped")
+        not_applicable_count = presentation.not_applicable if presentation else statuses.count("not_applicable")
+        passed_count = presentation.passed if presentation else statuses.count("pass")
+        failed_count = presentation.failed if presentation else statuses.count("fail")
+        incomplete_count = presentation.incomplete if presentation else statuses.count("incomplete")
+        executed_count = passed_count + failed_count + incomplete_count
+        advisory_skipped_count = sum(1 for r in results if is_advisory_agent_eval_skip(r))
+        findings = summarize_findings(results)
+        messages = summarize_messages(results)
+        unique_by_severity = findings["unique_by_severity"]
+        has_detail = (
+            findings["raw_occurrences"] != findings["unique_findings"]
+            or findings["distinct_occurrences"] != findings["unique_findings"]
+            or messages["independent_errors"]
+            or messages["independent_warnings"]
+        )
+        return {
+            "total": total,
+            "executed_count": executed_count,
+            "passed_count": passed_count,
+            "skipped_count": skipped_count,
+            "not_applicable_count": not_applicable_count,
+            "advisory_skipped_count": advisory_skipped_count,
+            "failed_count": failed_count,
+            "issue_count": findings["unique_findings"],
+            "occurrence_count": findings["distinct_occurrences"],
+            "raw_finding_count": findings["raw_occurrences"],
+            "duplicates_removed": findings["duplicates_removed"],
+            "total_issues": total_issue_count(findings, messages),
+            "issue_detail": (
+                describe_issue_counts(findings, messages, raw_records=True, duplicates=True) if has_detail else ""
+            ),
+            "all_passed": executed_count > 0 and failed_count == 0 and incomplete_count == 0,
+            "incomplete_count": incomplete_count,
+            "critical": unique_by_severity["critical"],
+            "high": unique_by_severity["high"],
+            "medium": unique_by_severity["medium"],
+            "low": unique_by_severity["low"],
+        }
+
+    def _results_to_dict(self, results: list[ValidationResult]) -> list[dict[str, Any]]:
+        output = []
+        for result in results:
+            skipped = is_cleanly_skipped(result)
+            result_dict = {
+                "validator_name": result.validator_name,
+                "validator_description": result.validator_description,
+                "passed": result.passed,
+                "status": result_status(result).value,
+                "skipped": skipped,
+                "skip_reason": get_skip_reason(result) if skipped else None,
+                "incomplete_scans": result.incomplete_scans,
+                "summary": {
+                    "files_scanned": result.summary.files_scanned,
+                    "checks_performed": result.summary.checks_performed,
+                    "errors": result.summary.errors,
+                    "warnings": result.summary.warnings,
+                    "critical_count": result.summary.critical_count,
+                    "high_count": result.summary.high_count,
+                    "medium_count": result.summary.medium_count,
+                    "low_count": result.summary.low_count,
+                },
+                "findings": [],
+                "success_details": [],
+                "messages": result.messages,
+                "errors": result.errors,
+                "warnings": result.warnings,
+            }
+            publication_target = result_publication_target_dict(result)
+            if publication_target is not None:
+                result_dict["publication_target"] = publication_target
+            publication_target_conflict = result_publication_target_conflict_marker(result)
+            if publication_target_conflict is not None:
+                result_dict["publication_target_conflict"] = publication_target_conflict
+            publication_evidence = result_publication_evidence_dict(result)
+            if publication_evidence is not None:
+                result_dict["publication_evidence"] = publication_evidence
+            for finding in result.findings:
+                result_dict["findings"].append(
+                    {
+                        "finding_id": finding.finding_id,
+                        "occurrence_id": finding.occurrence_id,
+                        "category": finding.category,
+                        "severity": finding.severity.value,
+                        "check_name": finding.check_name,
+                        "message": finding.message,
+                        "file_path": finding.file_path,
+                        "line_number": finding.line_number,
+                        "line_content": finding.line_content,
+                        "suggestion": finding.suggestion,
+                        "location": finding.location,
+                        "metadata": finding.metadata,
+                    }
+                )
+            for detail in result.success_details:
+                result_dict["success_details"].append(
+                    {
+                        "check_name": detail.check_name,
+                        "message": detail.message,
+                        "metadata": detail.metadata,
+                    }
+                )
+            coverage = result.metadata.get("dependency_coverage")
+            if isinstance(coverage, list):
+                result_dict["dependency_coverage"] = coverage
+            output.append(result_dict)
+        return output
+
+    @staticmethod
+    def _tier3_report_data(
+        results: list[ValidationResult], *, selected: tuple[ValidationResult, dict] | None = None
+    ) -> dict[str, Any] | None:
+        """Return safe Tier 3 display data without certifying partial evidence."""
+        if not results:
+            return None
+
+        def fallback(verdict: str, execution_status: str) -> dict[str, Any]:
+            messages = [
+                message for result in results for message in (*result.errors, *result.warnings, *result.messages)
+            ]
+            if execution_status == "skipped":
+                skipped_result = next(result for result in results if is_cleanly_skipped(result))
+                message = get_skip_reason(skipped_result)
+            else:
+                incomplete_scans = list(dict.fromkeys(tool for result in results for tool in result.incomplete_scans))
+                if incomplete_scans:
+                    message = f"Missing trustworthy evidence from {', '.join(incomplete_scans)}."
+                else:
+                    message = messages[0] if messages else "Tier 3 did not provide canonical evaluation details."
+            provenance = {"source": "validation_result", "message": message}
+            if execution_status == "skipped":
+                provenance.update({"reason": "skipped", "advisory": True})
+            execution_errors = [error for result in results for error in result.errors]
+            return {
+                "schema_version": "2.0",
+                "summary": {
+                    "schema_version": "2.0",
+                    "verdict": verdict,
+                    "skill_name": "",
+                    "best_agent": "",
+                    "agents_run": [],
+                    "overall_score": None,
+                    "overall_lift": None,
+                    "environment": None,
+                    "runtime_seconds": 0.0,
+                    "execution_status": execution_status,
+                    "execution_errors": execution_errors,
+                    "expected_attempts": 0,
+                    "scored_attempts": 0,
+                },
+                "skill_name": "",
+                "verdict": verdict,
+                "best_agent": "",
+                "agents_run": [],
+                "environment": None,
+                "overall_score": None,
+                "overall_lift": None,
+                "composite_lift": None,
+                "execution_status": execution_status,
+                "execution_errors": execution_errors,
+                "expected_attempts": 0,
+                "scored_attempts": 0,
+                "runtime_seconds": 0.0,
+                "agents": {},
+                "dimensions": [],
+                "evaluators": {},
+                "evaluator_cards": [],
+                "cases": [],
+                "trials": [],
+                "insights": {},
+                "conclusions": [],
+                "recommendations": [],
+                "suggestions": messages,
+                "suggestions_v2": [],
+                "metric_ids": [],
+                "metric_labels": {},
+                "attempt_policy": {},
+                "dataset": [],
+                "dataset_summary": {
+                    "total_tasks": 0,
+                    "positive_tasks": 0,
+                    "negative_tasks": 0,
+                    "unclassified_tasks": 0,
+                    "source": "unavailable",
+                },
+                "verdict_policy": {},
+                "provenance": provenance,
+            }
+
+        def payload_summary(candidate: dict[str, Any]) -> dict[str, Any]:
+            summary = candidate.get("summary")
+            return summary if isinstance(summary, dict) else {}
+
+        def payload_verdict(candidate: dict[str, Any]) -> str:
+            summary = payload_summary(candidate)
+            value = candidate.get("verdict") or summary.get("verdict") or ""
+            return value.lower() if isinstance(value, str) else ""
+
+        def payload_execution_status(candidate: dict[str, Any]) -> str:
+            summary = payload_summary(candidate)
+            value = candidate.get("execution_status") or summary.get("execution_status") or ""
+            return value.lower() if isinstance(value, str) else ""
+
+        def result_has_execution_evidence(result: ValidationResult) -> bool:
+            return bool(result.success_details or result.findings or result.summary.checks_performed > 0)
+
+        def payload_has_agent_evidence(candidate: dict[str, Any]) -> bool:
+            """Require a succeeded, scored agent with a positive attempt count."""
+            summary = payload_summary(candidate)
+            agents = candidate.get("agents")
+            if not isinstance(agents, dict):
+                return False
+            payload_attempts = max(
+                _nonnegative_count(candidate.get("scored_attempts")),
+                _nonnegative_count(summary.get("scored_attempts")),
+            )
+            for agent in agents.values():
+                if not isinstance(agent, dict):
+                    continue
+                status = agent.get("execution_status")
+                if not isinstance(status, str) or status.lower() != "succeeded":
+                    continue
+                score = _finite_number(agent.get("with_skill"), minimum=0.0, maximum=1.0)
+                if score is None:
+                    score = _finite_number(agent.get("overall_score"), minimum=0.0, maximum=1.0)
+                if score is None and candidate.get("mode") == "baseline_only":
+                    # A baseline-only run (--skip-with-skill) is scored by its baseline arm.
+                    score = _finite_number(agent.get("baseline"), minimum=0.0, maximum=1.0)
+                attempts = max(payload_attempts, _nonnegative_count(agent.get("scored_attempts")))
+                if score is not None and attempts > 0:
+                    return True
+            return False
+
+        def payload_has_execution_evidence(
+            result: ValidationResult,
+            candidate: dict[str, Any],
+        ) -> bool:
+            if agent_eval_publication_evidence_complete(candidate):
+                return True
+            if payload_verdict(candidate) not in {"pass", "neutral", "fail", "inconclusive", "incomplete"}:
+                return False
+            execution_status = payload_execution_status(candidate)
+            if execution_status == "succeeded":
+                return payload_has_agent_evidence(candidate)
+            return not execution_status and result_has_execution_evidence(result)
+
+        selected = selected if selected is not None else select_agent_eval_candidate(results)
+        payload_result, payload = selected if selected is not None else (None, None)
+        serialization_issue = agent_eval_report_serialization_issue(payload) if payload is not None else None
+        rejected_assessment = (
+            assess_tier3_evidence(results, payload) if payload is not None and serialization_issue is not None else None
+        )
+        bounded_rejected_has_execution_evidence = False
+        if payload is not None and serialization_issue is not None:
+            bounded_rejected_payload = _json_safe_tier3_payload(payload)
+            bounded_evidence_candidate = dict(bounded_rejected_payload)
+            bounded_evidence_candidate.pop("_serialization_truncated", None)
+            bounded_rejected_has_execution_evidence = payload_has_execution_evidence(
+                payload_result,
+                bounded_evidence_candidate,
+            )
+        selected_verdict = (
+            rejected_assessment.verdict
+            if rejected_assessment is not None
+            else payload_verdict(payload)
+            if payload is not None
+            else ""
+        )
+        selected_execution_status = (
+            rejected_assessment.execution_status
+            if rejected_assessment is not None
+            else payload_execution_status(payload)
+            if payload is not None
+            else ""
+        )
+        has_trustworthy_payload = bool(
+            payload_result is not None
+            and payload is not None
+            and serialization_issue is None
+            and payload_has_execution_evidence(payload_result, payload)
+        )
+        has_explicit_failure_payload = bool(
+            payload_result is not None
+            and payload is not None
+            and (
+                rejected_assessment.status == "fail"
+                if rejected_assessment is not None
+                else selected_execution_status in {"failed", "incomplete"}
+            )
+        )
+
+        def normalized_payload(
+            *,
+            forced_verdict: str | None = None,
+            forced_execution_status: str | None = None,
+            scrub_untrusted_evidence: bool = False,
+        ) -> dict[str, Any]:
+            assert payload is not None
+            verdict = selected_verdict or "incomplete"
+            execution_status = selected_execution_status or "incomplete"
+            display = fallback(forced_verdict or verdict, forced_execution_status or execution_status)
+            normalized = normalize_agent_eval_harbor_links(_sanitize_tier3_display_payload(payload))
+            normalized_summary = normalized.get("summary") if isinstance(normalized.get("summary"), dict) else {}
+            display.update(normalized)
+            display["summary"] = {**display["summary"], **normalized_summary}
+
+            def merge_strings(value: object, additions: list[str]) -> list[str]:
+                existing = value if isinstance(value, list) else []
+                return list(dict.fromkeys(item for item in (*existing, *additions) if isinstance(item, str) and item))
+
+            if forced_verdict is not None:
+                display["verdict"] = forced_verdict
+                display["summary"]["verdict"] = forced_verdict
+            if forced_execution_status is not None:
+                display["execution_status"] = forced_execution_status
+                display["summary"]["execution_status"] = forced_execution_status
+            display = _sanitize_tier3_display_payload(display)
+            if scrub_untrusted_evidence:
+                preserved = display
+                display = fallback(
+                    forced_verdict or verdict,
+                    forced_execution_status or execution_status,
+                )
+                display["agents"] = _scrub_untrusted_tier3_agents(preserved.get("agents"))
+                display["agents_run"] = list(display["agents"])
+                for key in (
+                    "schema_version",
+                    "skill_name",
+                    "publication_target",
+                    "publication_target_conflict",
+                    "run_id",
+                    "environment",
+                    "execution_backend",
+                    "evaluated_at",
+                    "evaluator_version",
+                    "benchmark_policy",
+                    "attempt_policy",
+                    "provenance",
+                    "harbor_viewer",
+                ):
+                    if key in preserved:
+                        display[key] = preserved[key]
+                for key in (
+                    "schema_version",
+                    "skill_name",
+                    "publication_target",
+                    "publication_target_conflict",
+                    "run_id",
+                    "environment",
+                    "execution_backend",
+                    "evaluated_at",
+                    "evaluator_version",
+                    "benchmark_policy",
+                ):
+                    if key in preserved["summary"]:
+                        display["summary"][key] = preserved["summary"][key]
+                if "harbor_viewer" in preserved["summary"]:
+                    display["summary"]["harbor_viewer"] = preserved["summary"]["harbor_viewer"]
+                if preserved.get("_serialization_truncated") is True:
+                    display["_serialization_truncated"] = True
+                from skillevaluator.tier3.harbor.run_budget import budget_fully_denied
+
+                if (
+                    selected_execution_status == "skipped"
+                    and not preserved.get("execution_errors")
+                    and budget_fully_denied(preserved.get("budget"))
+                ):
+                    display["budget"] = preserved["budget"]
+                    display["budget_summary"] = preserved.get("budget_summary")
+
+            result_errors = [error for result in results for error in result.errors]
+            result_diagnostics = [
+                message for result in results for message in (*result.errors, *result.warnings, *result.messages)
+            ]
+            display["execution_errors"] = merge_strings(display.get("execution_errors"), result_errors)
+            display["summary"]["execution_errors"] = merge_strings(
+                display["summary"].get("execution_errors"),
+                result_errors,
+            )
+            display["suggestions"] = merge_strings(display.get("suggestions"), result_diagnostics)
+            return _sanitize_tier3_display_payload(display)
+
+        # Incomplete scanner evidence takes precedence over failures, matching
+        # ValidationResult.status and the publication benchmark.
+        if any(result.is_incomplete for result in results):
+            if payload is not None:
+                return normalized_payload(
+                    forced_verdict="incomplete",
+                    forced_execution_status="incomplete",
+                    scrub_untrusted_evidence=not has_trustworthy_payload,
+                )
+            return fallback("incomplete", "incomplete")
+
+        # Aggregate all Tier 3 results before falling back so the display does
+        # not depend on result ordering.
+        if any(not result.passed and not is_cleanly_skipped(result) for result in results):
+            if payload is not None:
+                return normalized_payload(
+                    forced_verdict="fail",
+                    forced_execution_status="failed",
+                    scrub_untrusted_evidence=not (has_trustworthy_payload or has_explicit_failure_payload),
+                )
+            return fallback("fail", "failed")
+
+        if all(is_cleanly_skipped(result) for result in results):
+            if payload is not None:
+                return normalized_payload(
+                    forced_verdict="skipped",
+                    forced_execution_status="skipped",
+                    scrub_untrusted_evidence=True,
+                )
+            return fallback("skipped", "skipped")
+
+        if payload is not None:
+            verdict = selected_verdict
+            execution_status = selected_execution_status
+            if serialization_issue is not None:
+                if rejected_assessment is not None and rejected_assessment.status == "fail":
+                    return normalized_payload(
+                        forced_verdict="fail",
+                        forced_execution_status="failed",
+                        scrub_untrusted_evidence=True,
+                    )
+                return normalized_payload(
+                    forced_verdict=None if bounded_rejected_has_execution_evidence else "incomplete",
+                    forced_execution_status=None if bounded_rejected_has_execution_evidence else "incomplete",
+                    scrub_untrusted_evidence=True,
+                )
+            if verdict == "fail" or execution_status == "failed":
+                return normalized_payload(
+                    forced_verdict="fail",
+                    forced_execution_status=execution_status or "failed",
+                    scrub_untrusted_evidence=not (has_trustworthy_payload or has_explicit_failure_payload),
+                )
+            if execution_status == "incomplete":
+                return normalized_payload(
+                    forced_verdict="incomplete",
+                    forced_execution_status="incomplete",
+                    scrub_untrusted_evidence=not has_trustworthy_payload,
+                )
+            if has_trustworthy_payload:
+                return normalized_payload(
+                    forced_execution_status="incomplete" if not execution_status else None,
+                )
+            return normalized_payload(
+                forced_verdict="incomplete",
+                forced_execution_status="incomplete",
+                scrub_untrusted_evidence=True,
+            )
+
+        # A default-passed bare result or partial payload is not proof that
+        # Tier 3 completed.
+        return fallback("incomplete", "incomplete")
+
+    def render(self, result: ValidationResult) -> str:
+        return self.render_all([result])
+
+    def render_all(
+        self,
+        results: list[ValidationResult],
+        *,
+        plugin_static: object = None,
+        plugin_runtime: object = None,
+    ) -> str:
+        plugin_evidence = build_plugin_evidence(static=plugin_static, runtime=plugin_runtime)
+        validate_report_scope(self.report_scope, results)
+        tier1_results, tier2_results, tier3_results = self._split_results_by_tier(results)
+        selected = select_agent_eval_candidate(tier3_results)
+        raw_payload = selected[1] if selected is not None else None
+        tier3_data = self._tier3_report_data(tier3_results, selected=selected)
+        # Export valid retained evidence exactly; display shaping below is deliberately
+        # conservative and must never rewrite the downloadable object.
+        canonical_tier3 = (
+            raw_payload
+            if raw_payload is not None and agent_eval_report_serialization_issue(raw_payload) is None
+            else tier3_data
+        )
+        completed_agent = completed_agent_result(tier3_data)
+        # Preserve the raw policy/provenance assessment, then let the emitted
+        # payload make the decision only more conservative. Display shaping
+        # must never invent a successful run or erase a persisted waiver.
+        raw_publication = assess_publication(results, raw_payload, expected_skill_name=self.expected_skill_name)
+        # Without a persisted payload, tier3_data is a synthesized display
+        # fallback rather than evidence, so only the raw assessment applies.
+        emitted_publication = (
+            assess_publication(
+                results,
+                tier3_data,
+                expected_skill_name=self.expected_skill_name,
+            )
+            if selected is not None
+            else raw_publication
+        )
+        publication = max(
+            (raw_publication, emitted_publication),
+            key=lambda assessment: {"pass": 0, "neutral": 1, "incomplete": 2, "fail": 3}.get(
+                assessment.status,
+                3,
+            ),
+        )
+
+        context = self.presentation_context or build_final_render_context(
+            results,
+            requested_tiers=self.requested_tiers,
+            displayed_tiers=self.displayed_tiers,
+            report_scope=self.report_scope,
+            expected_skill_name=self.expected_skill_name,
+            agent_eval=raw_payload,
+            publication_assessment=publication,
+        )
+        all_passed = context.command_status == Status.PASSED
+        has_incomplete = context.command_status == Status.INCOMPLETE
+        overall_status = context.command_status.value
+        finding_summary = summarize_findings(results)
+        message_summary = summarize_messages(results)
+        skipped_count = sum(1 for r in results if is_cleanly_skipped(r))
+        passed_count = sum(tier.passed for tier in context.tiers.values())
+        advisory_skipped_count = sum(1 for r in results if is_advisory_agent_eval_skip(r))
+        failed_count = sum(1 for r in results if not passes_required_gate(r))
+        # Count unique findings rather than raw validator records that repeat
+        # one finding, plus errors and warnings with no finding behind them
+        # (failed gates, scanner and execution errors), as Markdown does.
+        total_issues = total_issue_count(finding_summary, message_summary)
+        total_validators = len(results)
+        executed_count = sum(tier.executed for tier in context.tiers.values())
+        pass_percentage = round((passed_count / executed_count * 100) if executed_count > 0 else 0, 1)
+
+        timestamp = ""
+        if self.include_timestamp:
+            timestamp = datetime.now(tz=UTC).strftime("%B %d, %Y at %I:%M %p UTC")
+
+        # Reorganize results by skill for the new view
+        skills_by_name = self._reorganize_by_skill(results)
+
+        # Count total skills
+        total_skills = len(skills_by_name)
+        passed_skills = sum(1 for s in skills_by_name.values() if s["passed"])
+        failed_skills = total_skills - passed_skills
+
+        # Compute cross-skill top issues for executive summary
+        top_issues = self._compute_top_issues(skills_by_name)
+
+        # Extract contributor summary (author -> skills mapping)
+        contributors = self._extract_contributors(skills_by_name, results)
+
+        # Compute severity breakdown from actual findings (summary counts may be
+        # incomplete when merge_with_prefix is used, so count from findings directly)
+        total_critical = 0
+        total_high = 0
+        total_medium = 0
+        total_low = 0
+        for r in results:
+            for f in r.findings:
+                sev = f.severity.value if hasattr(f.severity, "value") else str(f.severity).lower()
+                if sev == "critical":
+                    total_critical += 1
+                elif sev == "high":
+                    total_high += 1
+                elif sev == "medium":
+                    total_medium += 1
+                elif sev == "low":
+                    total_low += 1
+
+        target_display = self._compute_target_display(self.target_path or "")
+        # Friendly hero label (``skills/<name>`` or ``team-skills/<team>/<name>``)
+        # — strips repo / filesystem prefixes so the hero stays readable when
+        # ``target_path`` is something like
+        # ``/workspaces/example-project/skills/log-analyzer``. The full path
+        # remains in the top-right header (``Target: ...``) for traceability.
+        friendly_label = self._compute_friendly_skill_label(self.target_path or "")
+        # Per-tier summaries so the hero card chips can show "Tier 1: 6/7
+        # passed (0 critical)" etc. without leaking Tier 2 / Tier 3 stats
+        # from the global aggregate counters.
+        tier1_summary = self._compute_tier_summary(tier1_results, presentation=context.tiers[1])
+        tier1_skillspector_versions = _skillspector_versions(tier1_results)
+        tier1_skillspector_provenance = _skillspector_provenance(tier1_results)
+        tier2_summary = self._compute_tier_summary(tier2_results, presentation=context.tiers[2])
+        tier3_summary = self._compute_tier_summary(tier3_results, presentation=context.tiers[3])
+        tier3_dataset_sufficiency = tier3_data.get("dataset_sufficiency") if isinstance(tier3_data, dict) else None
+        dataset_summary = tier3_data.get("dataset_summary") if isinstance(tier3_data, dict) else None
+        task_count = dataset_summary.get("total_tasks") if isinstance(dataset_summary, dict) else None
+        dataset_source = dataset_summary.get("source") if isinstance(dataset_summary, dict) else None
+        if (
+            not isinstance(task_count, int)
+            or isinstance(task_count, bool)
+            or task_count <= 0
+            or dataset_source == "unavailable"
+        ):
+            tier3_dataset_sufficiency = None
+        # Runtime-only plugin projections expose passive evidence in the native
+        # tabs without inventing an AGENT_EVAL result or canonical Tier 3 payload.
+        if tier3_data is None and any(plugin_evidence[slot] for slot in ("overview", "agents", "trials", "provenance")):
+            tier3_data = {
+                "skill_name": (plugin_evidence["runtime"] or plugin_evidence["static"] or {}).get(
+                    "name", "Plugin evidence"
+                ),
+                "overall_score": None,
+                "overall_lift": None,
+                "best_agent": None,
+                "verdict": "incomplete",
+                "execution_status": "incomplete",
+                "agents": {},
+                "summary": {},
+            }
+        tier3_telemetry = build_telemetry_view(tier3_data)
+        # Failed-arm trials remain diagnostic evidence, including scored rewards.
+        # Determine comparison eligibility before preview bounds can omit those rows.
+        tier3_diagnostic_comparison_agents = {
+            trial.get("agent") or "(default)"
+            for trial in _dict_list((tier3_data or {}).get("trials"))
+            if trial.get("diagnostic_only") is True
+        }
+        tier3_diagnostic_comparison_agents.update(
+            name
+            for name, agent in ((tier3_data or {}).get("agents") or {}).items()
+            if isinstance(agent, dict)
+            if any(
+                trial.get("diagnostic_only") is True
+                for key in ("trials", "trials_baseline")
+                for trial in _dict_list(agent.get(key))
+            )
+        )
+        tier3_preview, tier3_preview_notice = _bounded_tier3_preview(tier3_data)
+        tier3_metric_comparison = _tier3_metric_comparison_view(tier3_preview)
+        insights_view = build_insights_view(tier3_preview or {})
+        insights_case_fix_count = len(insights_view.get("recommendations") or [])
+        # Older retained source checks and healthy runs may only have suggestions.
+        # Give those the same native cards in Overview and Insights.
+        if not insights_view.get("recommendations"):
+            insights_view = {
+                **insights_view,
+                "recommendations": [
+                    {"message": suggestion, "title": "", "category": "Action", "source": "deterministic"}
+                    for suggestion in (tier3_preview or {}).get("suggestions", [])
+                    if isinstance(suggestion, str) and suggestion
+                ],
+            }
+        remaining_insight_steps = _unrepresented_insight_steps(
+            insights_view, failed=(tier3_preview or {}).get("execution_status") == "failed"
+        )
+        if isinstance(tier3_preview, dict) and isinstance(tier3_preview.get("evidence_volume"), dict):
+            tier3_preview["evidence_volume"]["display"] = format_evidence_volume(tier3_preview["evidence_volume"]) or ""
+        tier3_dataset_provenance_line, tier3_dataset_provenance_warning = dataset_provenance_display(
+            tier3_data.get("dataset_provenance") if isinstance(tier3_data, dict) else None
+        )
+        tier3_canonical_data, tier3_canonical_encoding = _canonical_tier3_embed(canonical_tier3)
+        tier3_truncation = tier3_data.get("report_truncation", {}) if isinstance(tier3_data, dict) else {}
+
+        # Keep the Tier 1 dashboard scoped to Tier 1. Tier 2 and Tier 3 have
+        # dedicated tabs; including an advisory Tier 3 skip here would make
+        # the dashboard report a failure even though it does not gate Tier 1.
+        tier1_display_results = tier1_results
+        tier1_skills = self._reorganize_by_skill(tier1_display_results)
+        tier1_top_issues = self._compute_top_issues(tier1_skills)
+        tier1_contributors = self._extract_contributors(tier1_skills, tier1_display_results)
+        tier1_display_skipped = sum(1 for result in tier1_display_results if is_cleanly_skipped(result))
+        tier1_display_total = context.tiers[1].executed
+        tier1_display_passed = context.tiers[1].passed
+        tier1_display_failed = context.tiers[1].failed
+        tier1_display_total_skills = len(tier1_skills)
+        tier1_display_passed_skills = sum(1 for skill in tier1_skills.values() if skill["passed"])
+        tier1_display_summary = {
+            "total_validators": tier1_display_total,
+            "passed_count": tier1_display_passed,
+            "skipped_count": tier1_display_skipped,
+            "failed_count": tier1_display_failed,
+            # Unique Tier 1 findings plus errors and warnings with no finding
+            # behind them, counted as the Markdown summary counts them.
+            "total_issues": tier1_summary["total_issues"],
+            "pass_percentage": round(
+                (tier1_display_passed / tier1_display_total * 100) if tier1_display_total else 0,
+                1,
+            ),
+            "total_skills": tier1_display_total_skills,
+            "passed_skills": tier1_display_passed_skills,
+            "failed_skills": tier1_display_total_skills - tier1_display_passed_skills,
+        }
+
+        # Keep report gating aligned with the exact policy used for the CLI
+        # exit code. Results produced outside ``validate`` retain the public
+        # defaults: Tier 1/Tier 2 block and Tier 3 is advisory.
+        blocking_results: list[ValidationResult] = []
+        # Per tier, so the gate policy counts findings the way each tier card does.
+        blocking_by_tier: dict[str, list[ValidationResult]] = {}
+        advisory_by_tier: dict[str, list[ValidationResult]] = {}
+        blocking_tiers: list[str] = []
+        advisory_tiers: list[str] = []
+        for tier_name, tier_results, default_blocking in (
+            ("tier1", tier1_results, True),
+            ("tier2", tier2_results, True),
+            ("tier3", tier3_results, False),
+        ):
+            if not tier_results:
+                (blocking_tiers if default_blocking else advisory_tiers).append(tier_name)
+                continue
+            tier_blocks = False
+            tier_advises = False
+            for result in tier_results:
+                result_gating = result.metadata.get("gating") if isinstance(result.metadata, dict) else None
+                is_blocking = (
+                    bool(result_gating.get("blocking", default_blocking))
+                    if isinstance(result_gating, dict)
+                    else default_blocking
+                )
+                if is_blocking:
+                    blocking_results.append(result)
+                    blocking_by_tier.setdefault(tier_name, []).append(result)
+                    tier_blocks = True
+                else:
+                    advisory_by_tier.setdefault(tier_name, []).append(result)
+                    tier_advises = True
+            if tier_blocks:
+                blocking_tiers.append(tier_name)
+            if tier_advises:
+                advisory_tiers.append(tier_name)
+
+        def _severity_totals(results_by_tier: dict[str, list[ValidationResult]]) -> dict[str, int]:
+            # Each tier's unique findings at their highest severity, as its tier
+            # card counts them; the same finding in two tiers counts in both.
+            totals = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+            for tier_results in results_by_tier.values():
+                unique_by_severity = summarize_findings(tier_results)["unique_by_severity"]
+                for severity in totals:
+                    totals[severity] += unique_by_severity[severity]
+            return totals
+
+        blocking_totals = _severity_totals(blocking_by_tier)
+        advisory_totals = _severity_totals(advisory_by_tier)
+        blocking_critical = blocking_totals["critical"]
+        blocking_high = blocking_totals["high"]
+        blocking_medium = blocking_totals["medium"]
+        blocking_low = blocking_totals["low"]
+        advisory_critical = advisory_totals["critical"]
+        advisory_high = advisory_totals["high"]
+        advisory_medium = advisory_totals["medium"]
+        advisory_low = advisory_totals["low"]
+        # A tier whose every result is explicitly non-blocking is advisory: its
+        # failure does not require changes, so the report labels it "Failed (advisory)".
+        nonblocking_tiers = [
+            tier_name
+            for tier_name, tier_results in (("tier2", tier2_results), ("tier3", tier3_results))
+            if tier_results
+            and all(
+                isinstance(result.metadata.get("gating"), dict) and result.metadata["gating"].get("blocking") is False
+                for result in tier_results
+            )
+        ]
+        gating = {
+            "blocking_tiers": blocking_tiers,
+            "advisory_tiers": advisory_tiers,
+            "blocking": blocking_totals,
+            "advisory": advisory_totals,
+            "blocking_findings": blocking_totals["critical"] + blocking_totals["high"],
+            "would_block": any(not passes_required_gate(result) for result in blocking_results),
+        }
+
+        # Extract quality scores from results for per-skill quality display
+        quality_scores_by_skill: dict[str, dict] = {}
+        for r in results:
+            qs = r.metadata.get("quality_scores") if r.metadata else None
+            if qs and qs.get("dimensions"):
+                sname = qs.get("skill_name", "")
+                if sname:
+                    quality_scores_by_skill[sname] = qs
+            # Also check folder-level aggregation
+            qs_all = r.metadata.get("quality_scores_all") if r.metadata else None
+            if qs_all:
+                for q in qs_all:
+                    sname = q.get("skill_name", "")
+                    if sname and sname not in quality_scores_by_skill:
+                        quality_scores_by_skill[sname] = q
+
+        def _attach_quality_scores(skills: dict[str, dict[str, Any]]) -> None:
+            # Attach quality scores to per-skill data for the template.
+            # Two strategies: (1) exact name match for folder-of-skills mode,
+            # (2) attach to the FIRST entry only for single-skill mode (where
+            # _reorganize_by_skill keys are check names, not skill names).
+            matched = set()
+            for sname, sdata in skills.items():
+                if sname in quality_scores_by_skill:
+                    sdata["quality"] = quality_scores_by_skill[sname]
+                    matched.add(sname)
+
+            # If no exact matches found, the report is for a single skill whose
+            # name doesn't appear as a key. Attach to the first entry only to
+            # avoid duplicating the quality panel across every check entry.
+            if not matched and quality_scores_by_skill and skills:
+                single_qs = next(iter(quality_scores_by_skill.values()))
+                first_key = next(iter(skills))
+                skills[first_key]["quality"] = single_qs
+
+        _attach_quality_scores(skills_by_name)
+        _attach_quality_scores(tier1_skills)
+
+        # The quality gate's minimum, shown next to every score it applies to.
+        quality_min_score = next(
+            (
+                r.metadata["quality_config"]["min_score"]
+                for r in results
+                if isinstance(r.metadata, dict)
+                and isinstance(r.metadata.get("quality_config"), dict)
+                and isinstance(r.metadata["quality_config"].get("min_score"), int | float)
+            ),
+            None,
+        )
+        check_names = {
+            r.validator_name: plain_check_name(r.validator_name)
+            for r in results
+            if plain_check_name(r.validator_name) != r.validator_name
+        }
+        tier1_finding_anchors, tier1_check_anchors = _evidence_anchors(tier1_skills)
+        tier1_fix_first = _fix_first(tier1_skills, tier1_finding_anchors, tier1_check_anchors, scan_root=self.scan_root)
+        tier1_failed_checks = [
+            plain_check_name(r.validator_name) for r in tier1_results if _result_display_status(r) == "fail"
+        ]
+        # Unique critical and high findings in failed checks, counted like the Findings number.
+        tier1_blocking_by_severity = summarize_findings([r for r in tier1_results if not passes_required_gate(r)])[
+            "unique_by_severity"
+        ]
+        tier1_blocking_findings = tier1_blocking_by_severity["critical"] + tier1_blocking_by_severity["high"]
+        # Why each incomplete Tier 1 check stopped, in the scanner's words. The
+        # summary asks for an install only when every scanner is just missing.
+        tier1_stop_reasons = [
+            (plain_check_name(r.validator_name), _scan_stop_reason(additional_errors(r), additional_warnings(r)))
+            for r in tier1_results
+            if r.is_incomplete
+        ]
+        tier1_scanners_missing = bool(tier1_stop_reasons) and all(
+            _MISSING_SCANNER.search(reason) for _check, reason in tier1_stop_reasons
+        )
+        tier1_scan_stop = next(
+            (
+                f"{check}: {_sentence(reason)}"
+                for check, reason in tier1_stop_reasons
+                if reason and not _MISSING_SCANNER.search(reason)
+            ),
+            "",
+        )
+
+        report_data = {
+            "title": self.title,
+            "timestamp": timestamp,
+            "version": __version__,
+            "target_path": self.target_path,
+            "target_display": target_display,
+            "summary": {
+                "all_passed": all_passed,
+                "status": overall_status,
+                "incomplete_scans": list(dict.fromkeys(tool for result in results for tool in result.incomplete_scans)),
+                "total_validators": total_validators,
+                "executed_count": executed_count,
+                "passed_count": passed_count,
+                "skipped_count": skipped_count,
+                "advisory_skipped_count": advisory_skipped_count,
+                "failed_count": failed_count,
+                "total_issues": total_issues,
+                "raw_finding_occurrences": finding_summary["raw_occurrences"],
+                "distinct_finding_occurrences": finding_summary["distinct_occurrences"],
+                "duplicates_removed": finding_summary["duplicates_removed"],
+                "pass_percentage": pass_percentage,
+                "total_skills": total_skills,
+                "passed_skills": passed_skills,
+                "failed_skills": failed_skills,
+                "publication_status": publication.status,
+            },
+            "results": self._results_to_dict(results),
+            "finding_counts": finding_counts(finding_summary),
+            "finding_groups": finding_summary["groups"],
+            "message_counts": message_summary,
+            "skills": skills_by_name,
+            "top_issues": top_issues,
+            "contributors": contributors,
+            "quality_scores": quality_scores_by_skill,
+            # Tier 3 is embedded once in ``#tier3-full``. The export helper
+            # resolves this reference at download time, avoiding a second full
+            # copy inside ``#report-data``.
+            "tier3": {"$ref": "#tier3-full"} if canonical_tier3 else None,
+            "gating": gating,
+            "publication": {
+                "status": publication.status,
+                "eligible": publication.status == "pass",
+                "reasons": list(publication.reasons),
+                "tier3": {
+                    "status": publication.tier3.status,
+                    "evidence_complete": publication.tier3.evidence_complete,
+                    "reason": publication.tier3.reason,
+                },
+            },
+            "skillspector_versions": tier1_skillspector_versions,
+            "skillspector_provenance": tier1_skillspector_provenance,
+        }
+        if plugin_evidence["static"] is not None:
+            report_data["plugin_static"] = plugin_evidence["static"]
+        if plugin_evidence["runtime"] is not None:
+            report_data["plugin_runtime"] = plugin_evidence["runtime"]
+        # CI-native pages link Download JSON to the retained canonical file, so
+        # nothing on them reads an embedded copy. Only standalone reports embed it.
+        report_json = None
+        if not self.ci_context.get("canonical_json_url"):
+            report_json = (
+                json.dumps(report_data, separators=(",", ":"), allow_nan=False)
+                .replace("<", "\\u003c")
+                .replace(">", "\\u003e")
+                .replace("&", "\\u0026")
+            )
+
+        # Dynamically add Tier 3 tab when agent eval data is present
+        active_tabs = list(self.tabs)
+        if not self._tabs_explicit and tier2_results and not any(tab["id"] == "tier2" for tab in active_tabs):
+            active_tabs.append({"id": "tier2", "label": "Tier 2: Deduplication"})
+        if not self._tabs_explicit and tier2_results and not tier1_display_results:
+            active_tabs = [tab for tab in active_tabs if tab["id"] != "tier1"]
+        if tier3_data and not any(t["id"] == "tier3" for t in active_tabs):
+            active_tabs.append({"id": "tier3", "label": "Tier 3: Live Agent Evaluation"})
+
+        # When the run only produced agent-eval results (no real Tier 1 validators
+        # ran), drop the Tier 1 tab entirely so the report opens on the tier
+        # that actually has data. This mirrors the user experience for
+        # ``skill-evaluator agent-eval`` and ``skill-evaluator agent-eval-report``: there is
+        # no "Tier 1: Security and Static Validation" content to show.
+        agent_eval_only = bool(results) and all(getattr(r, "validator_name", None) == "AGENT_EVAL" for r in results)
+        if agent_eval_only and tier3_data:
+            active_tabs = [t for t in active_tabs if t["id"] != "tier1"]
+
+        for tier_number in (1, 2):
+            tier_id = f"tier{tier_number}"
+            if plugin_evidence[tier_id] and not any(tab["id"] == tier_id for tab in active_tabs):
+                active_tabs.append(
+                    {"id": tier_id, "label": f"Tier {tier_number}", "empty": True, "number": tier_number}
+                )
+        active_tabs.sort(key=lambda tab: tab["id"])
+        template = self._env.get_template("report.html.j2")
+        cl = self.content_label
+        return template.render(
+            report_scope=self.report_scope,
+            presentation=context,
+            completed_agent=completed_agent,
+            tolerated_baselines=tolerated_baseline_agents(tier3_data),
+            title=self.title,
+            ci_context=self.ci_context,
+            explicit_skill_name=self.explicit_skill_name,
+            tier1_execution_summary={
+                status: sum(context.result_statuses[id(r)] == status for r in tier1_results)
+                for status in ("pass", "fail", "incomplete", "skipped", "not_applicable")
+            },
+            timestamp=timestamp,
+            version=__version__,
+            target_path=self.target_path,
+            target_display=target_display,
+            friendly_label=friendly_label,
+            profile=self.profile or self._infer_profile_from_results(results),
+            all_passed=all_passed,
+            has_incomplete=has_incomplete,
+            overall_status=overall_status,
+            publication_status=publication.status,
+            publication_reasons=publication.reasons,
+            tier3_effective_status=(
+                tier3_data.get("verdict")
+                if self.report_scope == "tier3" and isinstance(tier3_data, dict) and tier3_data.get("verdict")
+                else publication.tier3.status
+            ),
+            total_validators=total_validators,
+            executed_count=executed_count,
+            passed_count=passed_count,
+            skipped_count=skipped_count,
+            advisory_skipped_count=advisory_skipped_count,
+            failed_count=failed_count,
+            total_issues=total_issues,
+            pass_percentage=pass_percentage,
+            total_skills=total_skills,
+            passed_skills=passed_skills,
+            failed_skills=failed_skills,
+            results=results,
+            skills=skills_by_name,
+            top_issues=top_issues,
+            total_critical=total_critical,
+            total_high=total_high,
+            total_medium=total_medium,
+            total_low=total_low,
+            blocking_critical=blocking_critical,
+            blocking_high=blocking_high,
+            blocking_medium=blocking_medium,
+            blocking_low=blocking_low,
+            advisory_critical=advisory_critical,
+            advisory_high=advisory_high,
+            advisory_medium=advisory_medium,
+            advisory_low=advisory_low,
+            gating=gating,
+            icons=self.ICONS,
+            tabs=active_tabs,
+            contributors=contributors,
+            report_json=report_json,
+            content_label=cl,
+            content_label_plural=cl + "s",
+            quality_scores=quality_scores_by_skill,
+            tier3=tier3_preview,
+            tier3_diagnostic_comparison_agents=tier3_diagnostic_comparison_agents,
+            tier3_chart_data=_tier3_chart_projection(tier3_preview),
+            insights_view=insights_view,
+            dataset_diagnostics_view=build_dataset_diagnostics_view((tier3_preview or {}).get("case_diagnostics")),
+            native_evidence=build_native_evidence(tier3_data),
+            remaining_insight_steps=remaining_insight_steps,
+            insights_case_fix_count=insights_case_fix_count,
+            plugin_evidence=plugin_evidence,
+            tier3_display_dimensions=_tier3_html_dimensions(tier3_data),
+            tier3_metric_comparison_rows=tier3_metric_comparison["rows"],
+            tier3_metric_comparison_omitted=tier3_metric_comparison["omitted"],
+            tier3_dataset_provenance_line=tier3_dataset_provenance_line,
+            tier3_dataset_provenance_warning=tier3_dataset_provenance_warning,
+            chart_assets=_load_chart_assets,
+            tier3_canonical_data=tier3_canonical_data,
+            tier3_canonical_encoding=tier3_canonical_encoding,
+            tier3_truncation=tier3_truncation,
+            tier3_dataset_sufficiency=tier3_dataset_sufficiency,
+            tier3_preview_notice=tier3_preview_notice,
+            tier3_telemetry=tier3_telemetry,
+            declarative_coverage_groups=declarative_coverage_groups(
+                tier3_data.get("agents") if isinstance(tier3_data, dict) else {}
+            ),
+            declarative_coverage_summary=coverage_summary,
+            declarative_check_status=check_status,
+            declarative_attempt_denominators=attempt_denominators,
+            declarative_denominator_note=DENOMINATOR_NOTE,
+            # Measured, not scored. From the full display payload, with its own
+            # per-agent cap: the preview walk can blank strings of late keys.
+            tier3_token_usage=token_usage_table(
+                tier3_data.get("token_usage") if isinstance(tier3_data, dict) else None
+            ),
+            # From the full display payload: the bounded preview can cap rows
+            # unevenly per condition and blank identity fields of late rows.
+            steps_by_case_chart=steps_by_case_chart(
+                tier3_data.get("agents") if isinstance(tier3_data, dict) else {},
+                tier3_data.get("trials") if isinstance(tier3_data, dict) else [],
+            ),
+            tier1_summary=tier1_summary,
+            skillspector_versions=tier1_skillspector_versions,
+            skillspector_provenance=tier1_skillspector_provenance,
+            tier2_summary=tier2_summary,
+            tier3_summary=tier3_summary,
+            tier1_display_results=tier1_display_results,
+            tier1_skills=tier1_skills,
+            tier1_top_issues=tier1_top_issues,
+            tier1_contributors=tier1_contributors,
+            tier1_display_summary=tier1_display_summary,
+            tier2_results=tier2_results,
+            tier2_scopes=tier2_scope_views(tier2_results),
+            harbor_jobs=harbor_job_display_links(tier3_data or {}),
+            dataset_provenance=agent_eval_publication_dataset_provenance(tier3_data),
+            evaluated_source=recorded_evaluated_source(result.metadata for result in results),
+            tier3_lift_pass_threshold=TIER3_LIFT_PASS_THRESHOLD,
+            tier3_lift_fail_threshold=TIER3_LIFT_FAIL_THRESHOLD,
+            tier3_dimension_pass_threshold=DIMENSION_VERDICT_PASS_THRESHOLD,
+            tier3_dimension_neutral_threshold=DIMENSION_VERDICT_NEUTRAL_THRESHOLD,
+            quality_min_score=quality_min_score,
+            quality_grade_legend=QUALITY_GRADE_LEGEND,
+            verdict_words=VERDICT_WORDS,
+            advisory_fail_word=ADVISORY_FAIL_WORD,
+            nonblocking_tiers=nonblocking_tiers,
+            publication_words=PUBLICATION_WORDS,
+            tier3_status_reason=publication.tier3.reason,
+            tier1_failed_checks=tier1_failed_checks,
+            tier1_incomplete_scans=list(dict.fromkeys(tool for r in tier1_results for tool in r.incomplete_scans)),
+            tier1_scanners_missing=tier1_scanners_missing,
+            tier1_scan_stop=tier1_scan_stop,
+            tier1_blocking_findings=tier1_blocking_findings,
+            check_names=check_names,
+            finding_anchors=tier1_finding_anchors,
+            check_anchors=tier1_check_anchors,
+            fix_first=tier1_fix_first,
+        )
+
+    def get_file_extension(self) -> str:
+        return ".html"
+
+
+def fix_first_for_results(
+    results: list[ValidationResult],
+    *,
+    skill_name: str | None = None,
+    expected_skill_name: str | None = None,
+    scan_root: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return the Tier 1 "Fix first" entries exactly as the report for *results* lists them.
+
+    The CI index uses this so its "Needs attention" line names the same first
+    fix as the skill's own report, with the same anchor. Pass the same
+    *scan_root* as the report.
+    """
+    reporter = HTMLReporter(
+        include_timestamp=False, explicit_skill_name=skill_name, expected_skill_name=expected_skill_name
+    )
+    tier1_results, _tier2, _tier3 = reporter._split_results_by_tier(results)
+    skills = reporter._reorganize_by_skill(tier1_results)
+    return _fix_first(skills, *_evidence_anchors(skills), scan_root=scan_root)
+
+
+def render_logo(uid: str, size: int = 28, label: str = "SkillEvaluator logo") -> str:
+    """Return the inline SkillEvaluator logo for pages built outside report.html.j2.
+
+    ``uid`` keeps the logo's ids unique on the page. An empty ``label`` marks
+    the logo as decorative, for use next to visible "SkillEvaluator" text.
+    """
+    # The shared reporter environment compiles the partial once per process.
+    environment = HTMLReporter._create_environment()
+    return str(environment.get_template("logo.svg.j2").module.se_logo(uid, size, label))

@@ -1,0 +1,1353 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Load Harbor artifacts for canonical Tier 3 reporting.
+
+This module intentionally contains no HTML generation. It translates the
+on-disk Harbor result layout into data consumed by the shared report adapters.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import heapq
+import json
+import logging
+import math
+import os
+import stat
+from collections.abc import Callable, Iterable
+from itertools import islice
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+from skillevaluator.tier3.declarative_coverage import agent_declarative_checks
+from skillevaluator.tier3.eval_core.checks import resolve_should_trigger
+from skillevaluator.tier3.harbor import baseline_timeouts
+from skillevaluator.tier3.harbor.metrics import (
+    CUSTOM_ONLY_METRIC_SET,
+    DEFAULT_METRIC_SET,
+    DEFAULT_METRICS,
+    LEGACY_METRIC_SET,
+    LEGACY_METRICS,
+    PARTIAL_SCORE_POLICY,
+    metric_set_for_reward,
+    not_applicable_list,
+    not_applicable_metrics,
+    score_value,
+)
+from skillevaluator.tier3.harbor.resource_usage import agent_execution_seconds
+from skillevaluator.tier3.harbor.trajectory_timing import trajectory_timing
+
+logger = logging.getLogger(__name__)
+
+_MAX_JSON_BYTES = 2 * 1024 * 1024
+_MAX_JSON_DEPTH = 64
+_MAX_JSON_NODES = 50_000
+_MAX_JSON_NUMBER_CHARS = 4_300
+_MAX_JSON_SAFE_INTEGER = (1 << 53) - 1
+_MAX_AGENTS = 64
+_MAX_AGENT_PATHS_SCANNED = 512
+_MAX_TRIALS_PER_CONDITION = 512
+_MAX_TRIAL_PATHS_SCANNED = 4096
+_MAX_STAGED_TASKS = 4096
+_MAX_STAGED_PATHS_SCANNED = 32_768
+_MAX_DATASET_RECORDS = 4096
+_MAX_DIAGNOSTIC_REASONS = 8
+_INVALID_JSON = object()
+
+DATASET_SNAPSHOT_MAX_BYTES = _MAX_JSON_BYTES
+DATASET_SNAPSHOT_MAX_DEPTH = _MAX_JSON_DEPTH
+DATASET_SNAPSHOT_MAX_NODES = _MAX_JSON_NODES
+DATASET_SNAPSHOT_LIMIT_ERROR = (
+    "Dataset snapshot exceeds the 2 MiB, depth-64, or 50,000-node publication limit; "
+    "reduce dataset size or structural complexity."
+)
+
+__all__ = (
+    "DATASET_SNAPSHOT_DIGEST_ALGORITHM",
+    "DATASET_SNAPSHOT_LIMIT_ERROR",
+    "DATASET_SNAPSHOT_MAX_BYTES",
+    "DATASET_SNAPSHOT_MAX_DEPTH",
+    "DATASET_SNAPSHOT_MAX_NODES",
+    "DatasetSnapshotContractError",
+    "aggregate_execution_error_details",
+    "build_dataset_snapshot",
+    "dataset_snapshot_manifest",
+    "deduplicate_dataset_entries",
+    "encode_dataset_snapshot",
+    "load_agent_data",
+    "load_dataset",
+    "load_dataset_snapshot",
+    "load_staged_harbor_dataset",
+    "logical_trial_reward_groups",
+    "metrics_for_agents",
+    "metrics_for_condition",
+    "summarize_dataset_entries",
+)
+
+DATASET_SNAPSHOT_DIGEST_ALGORITHM = "skill-evaluator-dataset-snapshot/1"
+DATASET_SNAPSHOT_SCHEMA_VERSION = "1.1"
+
+
+class DatasetSnapshotContractError(ValueError):
+    """Raised when exact dataset truth cannot fit the public artifact contract."""
+
+    def __init__(self) -> None:
+        super().__init__(DATASET_SNAPSHOT_LIMIT_ERROR)
+
+
+def _canonical_dataset_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _dataset_entry_identity(entry: dict[str, Any]) -> str:
+    for key in ("id", "entry_id", "case_id", "task_id"):
+        value = entry.get(key)
+        if value is not None and str(value).strip():
+            return f"{key}:{str(value).strip()}"
+    return f"payload:{_canonical_dataset_json(entry)}"
+
+
+def deduplicate_dataset_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the first entry for each stable task identity, preserving order."""
+    deduplicated: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        identity = _dataset_entry_identity(entry)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduplicated.append(dict(entry))
+    return deduplicated
+
+
+def summarize_dataset_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize unique task identities and their activation intent."""
+    unique = deduplicate_dataset_entries(entries)
+    routing_intents = [resolve_should_trigger(case) for case in unique]
+    positive = routing_intents.count(True)
+    negative = routing_intents.count(False)
+    return {
+        "total_tasks": len(unique),
+        "positive_tasks": positive,
+        "negative_tasks": negative,
+        "unclassified_tasks": len(unique) - positive - negative,
+        "source": "dataset" if unique else "unavailable",
+    }
+
+
+def build_dataset_snapshot(entries: list[dict[str, Any]], *, evaluator_version: str) -> dict[str, Any]:
+    """Build immutable, digest-backed dataset truth owned by one evaluation run."""
+    unique = deduplicate_dataset_entries(entries)
+    canonical = _canonical_dataset_json(unique).encode("utf-8")
+    return {
+        "schema_version": DATASET_SNAPSHOT_SCHEMA_VERSION,
+        "evaluator_version": evaluator_version,
+        "dataset": unique,
+        "dataset_summary": summarize_dataset_entries(unique),
+        "dataset_digest": f"sha256:{hashlib.sha256(canonical).hexdigest()}",
+        "dataset_digest_algorithm": DATASET_SNAPSHOT_DIGEST_ALGORITHM,
+    }
+
+
+def encode_dataset_snapshot(snapshot: object) -> bytes:
+    """Encode one snapshot within the same bounds enforced by the report loader."""
+    try:
+        _validate_json_tree(snapshot)
+        stack = [snapshot]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, dict):
+                stack.extend(current.values())
+            elif isinstance(current, list):
+                stack.extend(current)
+            elif isinstance(current, bool) or current is None or isinstance(current, str):
+                continue
+            elif isinstance(current, int):
+                if abs(current) > _MAX_JSON_SAFE_INTEGER:
+                    raise ValueError("browser-unsafe JSON integer")
+            elif isinstance(current, float):
+                if not math.isfinite(current):
+                    raise ValueError("non-finite JSON number")
+            else:
+                raise TypeError("value is not JSON serializable")
+        encoded = json.dumps(
+            snapshot,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    except (MemoryError, RecursionError, TypeError, UnicodeError, ValueError):
+        raise DatasetSnapshotContractError from None
+    if len(encoded) > DATASET_SNAPSHOT_MAX_BYTES:
+        raise DatasetSnapshotContractError
+    return encoded
+
+
+def dataset_snapshot_manifest(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Return validated dataset metadata suitable for embedding in ``result.json``."""
+    encode_dataset_snapshot(snapshot)
+    return {
+        "schema_version": snapshot.get("schema_version"),
+        "evaluator_version": snapshot.get("evaluator_version"),
+        "dataset_summary": dict(snapshot.get("dataset_summary", {})),
+        "dataset_digest": snapshot.get("dataset_digest"),
+        "dataset_digest_algorithm": snapshot.get("dataset_digest_algorithm"),
+    }
+
+
+def load_dataset_snapshot(run_dir: Path) -> dict[str, Any] | None:
+    """Validate the recorded schema, then normalize in memory without rewriting it."""
+    path = run_dir / "dataset_snapshot.json"
+    diagnostics: list[dict[str, Any]] = []
+    snapshot = _load_bounded_json(path, diagnostics, artifact="dataset_snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    schema_version = snapshot.get("schema_version")
+    if not isinstance(schema_version, str) or schema_version not in {"1.0", DATASET_SNAPSHOT_SCHEMA_VERSION}:
+        return None
+    try:
+        encode_dataset_snapshot(snapshot)
+    except DatasetSnapshotContractError:
+        return None
+    dataset = snapshot.get("dataset")
+    summary = snapshot.get("dataset_summary")
+    version = snapshot.get("evaluator_version")
+    if not isinstance(dataset, list) or not isinstance(summary, dict):
+        return None
+    if not isinstance(version, str) or not version.strip():
+        return None
+    expected = build_dataset_snapshot(
+        [entry for entry in dataset if isinstance(entry, dict)],
+        evaluator_version=version,
+    )
+    expected_summary = expected["dataset_summary"]
+    if snapshot["schema_version"] == "1.0":
+        # Schema 1.0 counted only legacy expected_skill labels. Validate that
+        # exact historical rule before projecting the corrected 1.1 summary.
+        positive = sum(1 for case in expected["dataset"] if case.get("expected_skill") is not None)
+        negative = sum(
+            1 for case in expected["dataset"] if "expected_skill" in case and case.get("expected_skill") is None
+        )
+        expected_summary = {
+            **expected_summary,
+            "positive_tasks": positive,
+            "negative_tasks": negative,
+            "unclassified_tasks": len(expected["dataset"]) - positive - negative,
+        }
+    if dataset != expected["dataset"] or summary != expected_summary:
+        return None
+    if snapshot.get("dataset_digest_algorithm") != DATASET_SNAPSHOT_DIGEST_ALGORITHM:
+        return None
+    if snapshot.get("dataset_digest") != expected["dataset_digest"]:
+        return None
+    return {**snapshot, **expected}
+
+
+class _JSONLimitError(ValueError):
+    def __init__(self, code: str, limit: int) -> None:
+        super().__init__(code)
+        self.code = code
+        self.limit = limit
+
+
+class _BoundedDataset(list[dict[str, Any]]):
+    """List-compatible dataset carrying bounded loader diagnostics."""
+
+    def __init__(self, entries: list[dict[str, Any]], diagnostics: list[dict[str, Any]]) -> None:
+        super().__init__(entries)
+        self._report_truncation = {"truncated": True, "reasons": [dict(reason) for reason in diagnostics]}
+
+
+def _record_truncation(
+    diagnostics: list[dict[str, Any]],
+    *,
+    code: str,
+    artifact: str,
+    limit: int,
+) -> None:
+    """Record one bounded, content-free diagnostic and emit it once per scope."""
+    reason = {"code": code, "artifact": artifact, "limit": limit}
+    if reason in diagnostics or len(diagnostics) >= _MAX_DIAGNOSTIC_REASONS:
+        return
+    diagnostics.append(reason)
+    logger.warning("Tier 3 report loader bounded %s: %s (limit=%d)", artifact, code, limit)
+
+
+def _attach_truncation(target: dict[str, Any], diagnostics: list[dict[str, Any]]) -> None:
+    if not diagnostics:
+        return
+    existing = target.get("_report_truncation")
+    reasons = existing.get("reasons", []) if isinstance(existing, dict) else []
+    merged = [*reasons]
+    for reason in diagnostics:
+        if reason not in merged and len(merged) < _MAX_DIAGNOSTIC_REASONS:
+            merged.append(reason)
+    target["_report_truncation"] = {"truncated": True, "reasons": merged}
+
+
+def _dataset_result(entries: list[dict[str, Any]], diagnostics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return _BoundedDataset(entries, diagnostics) if diagnostics else entries
+
+
+def _bounded_smallest(
+    paths: Iterable[Path],
+    limit: int,
+    *,
+    scan_limit: int,
+    predicate: Callable[[Path], bool] | None = None,
+) -> tuple[list[Path], bool, bool]:
+    """Select deterministic paths while bounding both visits and retained paths."""
+    scanned = 0
+
+    def candidates() -> Iterable[Path]:
+        nonlocal scanned
+        for path in islice(paths, scan_limit + 1):
+            scanned += 1
+            if scanned > scan_limit:
+                break
+            if predicate is None or predicate(path):
+                yield path
+
+    selected = heapq.nsmallest(limit + 1, candidates(), key=lambda path: path.as_posix())
+    return selected[:limit], len(selected) > limit, scanned > scan_limit
+
+
+def _is_safe_directory(path: Path, root: Path) -> bool:
+    """Return whether path is a real directory contained by the report root."""
+    try:
+        if not stat.S_ISDIR(path.lstat().st_mode):
+            return False
+        path.resolve().relative_to(root.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
+
+
+def _bounded_staged_entry_files(tasks_dir: Path) -> tuple[list[Path], bool, bool]:
+    """Find staged entry files without allowing ``rglob`` to hide unbounded visits."""
+    pending = [tasks_dir]
+    matches: list[Path] = []
+    visited = 0
+    scan_truncated = False
+    while pending and not scan_truncated:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as scanner:
+                children = []
+                for child in scanner:
+                    visited += 1
+                    if visited > _MAX_STAGED_PATHS_SCANNED:
+                        scan_truncated = True
+                        break
+                    children.append(child)
+        except OSError:
+            continue
+        for child in sorted(children, key=lambda entry: entry.name, reverse=True):
+            try:
+                if child.is_dir(follow_symlinks=False):
+                    pending.append(Path(child.path))
+                elif child.name == "entry.json" and directory.name == "tests" and child.is_file(follow_symlinks=False):
+                    matches.append(Path(child.path))
+            except OSError:
+                continue
+    selected = heapq.nsmallest(_MAX_STAGED_TASKS + 1, matches, key=lambda path: path.as_posix())
+    return selected[:_MAX_STAGED_TASKS], len(selected) > _MAX_STAGED_TASKS, scan_truncated
+
+
+def _validate_json_tree(value: Any) -> None:
+    """Validate decoded JSON iteratively so validation itself cannot recurse."""
+    nodes = 0
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > _MAX_JSON_NODES:
+            raise _JSONLimitError("json_nodes", _MAX_JSON_NODES)
+        if not isinstance(current, dict | list):
+            continue
+        if depth > _MAX_JSON_DEPTH:
+            raise _JSONLimitError("json_depth", _MAX_JSON_DEPTH)
+        if nodes + len(current) > _MAX_JSON_NODES:
+            raise _JSONLimitError("json_nodes", _MAX_JSON_NODES)
+        children = current.values() if isinstance(current, dict) else current
+        stack.extend((child, depth + 1) for child in children)
+
+
+def _read_bounded_bytes(
+    path: Path,
+    diagnostics: list[dict[str, Any]],
+    *,
+    artifact: str,
+) -> bytes | None:
+    if path.is_symlink():
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                _record_truncation(diagnostics, code="json_file_type", artifact=artifact, limit=0)
+                return None
+            if metadata.st_size > _MAX_JSON_BYTES:
+                _record_truncation(
+                    diagnostics,
+                    code="json_bytes",
+                    artifact=artifact,
+                    limit=_MAX_JSON_BYTES,
+                )
+                return None
+            raw = stream.read(_MAX_JSON_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > _MAX_JSON_BYTES:
+        _record_truncation(
+            diagnostics,
+            code="json_bytes",
+            artifact=artifact,
+            limit=_MAX_JSON_BYTES,
+        )
+        return None
+    return raw
+
+
+def _load_bounded_json(
+    path: Path,
+    diagnostics: list[dict[str, Any]],
+    *,
+    artifact: str,
+) -> Any:
+    raw = _read_bounded_bytes(path, diagnostics, artifact=artifact)
+    if raw is None:
+        return _INVALID_JSON
+    return _decode_bounded_json(raw, diagnostics, artifact=artifact)
+
+
+def _decode_bounded_json(
+    raw: bytes,
+    diagnostics: list[dict[str, Any]],
+    *,
+    artifact: str,
+    strict_syntax: bool = False,
+) -> Any:
+    try:
+        value = json.loads(raw)
+        _validate_json_tree(value)
+    except RecursionError:
+        _record_truncation(
+            diagnostics,
+            code="json_depth",
+            artifact=artifact,
+            limit=_MAX_JSON_DEPTH,
+        )
+        return _INVALID_JSON
+    except _JSONLimitError as exc:
+        _record_truncation(diagnostics, code=exc.code, artifact=artifact, limit=exc.limit)
+        return _INVALID_JSON
+    except json.JSONDecodeError:
+        if strict_syntax:
+            raise
+        return _INVALID_JSON
+    except ValueError:
+        if strict_syntax:
+            raise
+        _record_truncation(
+            diagnostics,
+            code="json_number",
+            artifact=artifact,
+            limit=_MAX_JSON_NUMBER_CHARS,
+        )
+        return _INVALID_JSON
+    except UnicodeDecodeError:
+        if strict_syntax:
+            raise
+        return _INVALID_JSON
+    return value
+
+
+def _bounded_dataset_payload(payload: Any, diagnostics: list[dict[str, Any]]) -> Any:
+    """Slice list-like dataset shapes before normalization copies their records."""
+    if isinstance(payload, list):
+        if len(payload) > _MAX_DATASET_RECORDS:
+            _record_truncation(
+                diagnostics,
+                code="dataset_record_limit",
+                artifact="dataset",
+                limit=_MAX_DATASET_RECORDS,
+            )
+            return payload[:_MAX_DATASET_RECORDS]
+        return payload
+    if not isinstance(payload, dict):
+        return payload
+    for key in ("evals", "cases"):
+        records = payload.get(key)
+        if not isinstance(records, list) or len(records) <= _MAX_DATASET_RECORDS:
+            continue
+        _record_truncation(
+            diagnostics,
+            code="dataset_record_limit",
+            artifact="dataset",
+            limit=_MAX_DATASET_RECORDS,
+        )
+        return {**payload, key: records[:_MAX_DATASET_RECORDS]}
+    return payload
+
+
+def _load_bounded_jsonl(raw: bytes, diagnostics: list[dict[str, Any]]) -> list[Any]:
+    records: list[Any] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        value = _decode_bounded_json(
+            line,
+            diagnostics,
+            artifact="dataset_record",
+            strict_syntax=True,
+        )
+        if value is _INVALID_JSON:
+            continue
+        records.append(value)
+        if len(records) > _MAX_DATASET_RECORDS:
+            _record_truncation(
+                diagnostics,
+                code="dataset_record_limit",
+                artifact="dataset",
+                limit=_MAX_DATASET_RECORDS,
+            )
+            return records[:_MAX_DATASET_RECORDS]
+    return records
+
+
+def _metrics_for_rewards(rewards: list[dict[str, Any]]) -> list[str]:
+    inferred = [metric_set_for_reward(reward)[1] for reward in rewards]
+    if any(metrics == DEFAULT_METRICS for metrics in inferred):
+        return list(DEFAULT_METRICS)
+    if any(metrics == LEGACY_METRICS for metrics in inferred):
+        return list(LEGACY_METRICS)
+    return []
+
+
+def metrics_for_condition(agent_info: dict[str, Any], condition: str) -> list[str]:
+    """Return the standard metric contract declared by one agent condition.
+
+    Recorded metrics win. Older artifacts fall back to the recorded metric set,
+    then to the standard metrics present in the condition scores, then rewards.
+    """
+    if condition == "with_skill":
+        metrics_key, scores_key, rewards_key = "metrics_with_skill", "with_skill", "rewards"
+    elif condition == "without_skill":
+        metrics_key, scores_key, rewards_key = "metrics_without_skill", "without_skill", "rewards_baseline"
+    else:
+        return []
+
+    configured = agent_info.get(metrics_key)
+    if isinstance(configured, list):
+        return list(dict.fromkeys(str(metric) for metric in configured))
+    recorded_set = agent_info.get(f"metric_set_{condition}")
+    if recorded_set == DEFAULT_METRIC_SET:
+        return list(DEFAULT_METRICS)
+    if recorded_set == LEGACY_METRIC_SET:
+        return list(LEGACY_METRICS)
+    if recorded_set == CUSTOM_ONLY_METRIC_SET:
+        return []
+    scores = agent_info.get(scores_key, {})
+    if isinstance(scores, dict) and scores:
+        if "security" in scores and agent_info.get(f"score_policy_{condition}") != PARTIAL_SCORE_POLICY:
+            # Unversioned Security scores claim the default v2 contract, so a
+            # missing evaluator leaves the condition incomplete, not partial.
+            return list(DEFAULT_METRICS)
+        return [metric for metric in DEFAULT_METRICS if metric in scores]
+    rewards = agent_info.get(rewards_key, [])
+    return _metrics_for_rewards(rewards) if isinstance(rewards, list) else []
+
+
+def metrics_for_agents(agents: dict[str, dict[str, Any]], *, condition: str = "with_skill") -> list[str]:
+    """Return the canonical default or legacy metric set represented by agents."""
+    saw_metrics = False
+    for info in agents.values():
+        metrics = metrics_for_condition(info, condition)
+        if metrics:
+            saw_metrics = True
+        if "security" in metrics:
+            return list(DEFAULT_METRICS)
+    return list(LEGACY_METRICS) if saw_metrics else []
+
+
+def logical_trial_reward_groups(rewards: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Group persisted reward rows by collector-issued logical trial identity.
+
+    Older or independently produced artifacts do not carry the opaque identity;
+    those rows remain singletons so report loading never guesses trial structure
+    from case IDs or ambiguous output-directory names.
+    """
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for index, reward in enumerate(rewards):
+        identity = reward.get("trial_id")
+        key = f"trial:{identity}" if _is_trial_identity(identity) else f"row:{index}"
+        groups.setdefault(key, []).append(reward)
+    return list(groups.values())
+
+
+def _is_trial_identity(value: object) -> bool:
+    """Whether ``value`` is a usable trial identity: a non-empty string of at most 512 characters."""
+    return isinstance(value, str) and 0 < len(value) <= 512
+
+
+def _nonnegative_counter(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _execution_error_details(data: dict[str, Any], displayed_count: int) -> dict[str, Any]:
+    """Normalize bounded execution-error detail metadata around visible errors."""
+    raw_total = data.get("execution_error_details_total")
+    declared_total = (
+        raw_total
+        if isinstance(raw_total, int) and not isinstance(raw_total, bool) and 0 <= raw_total <= _MAX_JSON_SAFE_INTEGER
+        else displayed_count
+    )
+    raw_shown = data.get("execution_error_details_shown")
+    declared_shown = (
+        raw_shown
+        if isinstance(raw_shown, int) and not isinstance(raw_shown, bool) and 0 <= raw_shown <= _MAX_JSON_SAFE_INTEGER
+        else displayed_count
+    )
+    declared_total = max(declared_total, declared_shown, displayed_count)
+    truncated = data.get("execution_error_details_truncated") is True
+    if truncated and declared_total <= displayed_count:
+        declared_total = min(_MAX_JSON_SAFE_INTEGER, displayed_count + 1)
+    return {
+        "execution_error_details_total": declared_total,
+        "execution_error_details_shown": displayed_count,
+        "execution_error_details_truncated": truncated or displayed_count < declared_total,
+    }
+
+
+def aggregate_execution_error_details(
+    summaries: Iterable[dict[str, Any]],
+    displayed_count: int,
+) -> dict[str, Any]:
+    """Sum condition occurrence counts while deduplicating only displayed text."""
+    total = 0
+    child_truncated = False
+    for summary in summaries:
+        raw_errors = summary.get("execution_errors")
+        visible_count = len([error for error in raw_errors if error]) if isinstance(raw_errors, list) else 0
+        details = _execution_error_details(summary, visible_count)
+        total = min(_MAX_JSON_SAFE_INTEGER, total + details["execution_error_details_total"])
+        child_truncated = child_truncated or details["execution_error_details_truncated"]
+    total = max(total, displayed_count)
+    if child_truncated and total <= displayed_count:
+        total = min(_MAX_JSON_SAFE_INTEGER, displayed_count + 1)
+    return {
+        "execution_error_details_total": total,
+        "execution_error_details_shown": displayed_count,
+        "execution_error_details_truncated": child_truncated or displayed_count < total,
+    }
+
+
+_USAGE_COUNTERS = ("prompt_tokens", "completion_tokens", "cached_tokens")
+# Attempts that count for token usage only, per arm: they never reach scores,
+# pass@k or resource totals. See ``skillevaluator.tier3.token_usage``.
+_USAGE_ONLY_KEYS = {"with_skill": "usage_only_attempts", "without_skill": "usage_only_attempts_baseline"}
+
+
+def _trajectory_token_counter(value: Any) -> int | None:
+    """Return a browser-safe token counter without inventing zero usage."""
+    return (
+        value
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _MAX_JSON_SAFE_INTEGER
+        else None
+    )
+
+
+def _matching_baseline_tolerance(record: Any, conditions: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    """Return an agent's baseline-timeout record when it still matches the on-disk arms.
+
+    The collector writes the record only for an agent it kept scored on its
+    with-skill arm under ``--tolerate-baseline-timeouts``. It is honored only
+    while the with-skill arm succeeded with every attempt scored and no errors,
+    and the baseline failed with exactly the recorded attempt counts; anything
+    else keeps the agent failed.
+    """
+    if not isinstance(record, dict):
+        return None
+    with_skill = conditions.get("with_skill") or {}
+    baseline = conditions.get("without_skill") or {}
+    expected, scored = record.get("expected_attempts"), record.get("scored_attempts")
+    matches = (
+        with_skill.get("execution_status") == "succeeded"
+        and not with_skill.get("execution_errors")
+        and 0 < with_skill.get("expected_attempts", 0) == with_skill.get("scored_attempts")
+        and baseline.get("execution_status") == "failed"
+        and type(expected) is int
+        and type(scored) is int
+        and 0 <= scored < expected
+        and (baseline.get("expected_attempts"), baseline.get("scored_attempts")) == (expected, scored)
+    )
+    return dict(record) if matches else None
+
+
+def _condition_status(agent_info: dict[str, Any], condition: str) -> str:
+    conditions = agent_info.get("conditions")
+    data = conditions.get(condition) if isinstance(conditions, dict) else None
+    return str(data.get("execution_status") or "unknown") if isinstance(data, dict) else "unknown"
+
+
+def _invalid_token_counters(final_metrics: dict[str, Any]) -> list[str]:
+    """Name the token counters a trajectory recorded with a value that is not a count.
+
+    ``_trajectory_token_counter`` reads such a value as ``None``, as it reads a
+    counter Harbor left out. Harbor leaves out only a zero cache counter, so
+    token usage needs these names to keep an invalid cache counter from
+    counting as 0. Only names are kept, never values.
+    """
+    return [
+        name
+        for name in _USAGE_COUNTERS
+        if (value := final_metrics.get(f"total_{name}")) is not None and _trajectory_token_counter(value) is None
+    ]
+
+
+def _token_counter_names(value: object) -> list[str]:
+    """Return the token counter names that ``value`` lists, in ``_USAGE_COUNTERS`` order.
+
+    Anything that is not such a name is dropped, so a report trial and a
+    usage-only attempt name the same counters in the same order.
+    """
+    return [name for name in _USAGE_COUNTERS if isinstance(value, list) and name in value]
+
+
+def _usage_tokens(counters: dict[str, Any]) -> dict[str, int] | None:
+    """Return a report trial's ``tokens`` object, or ``None`` without prompt and completion counts."""
+    prompt = _trajectory_token_counter(counters.get("prompt_tokens"))
+    completion = _trajectory_token_counter(counters.get("completion_tokens"))
+    if prompt is None or completion is None:
+        return None
+    tokens = {"prompt": prompt, "completion": completion}
+    cached = _trajectory_token_counter(counters.get("cached_tokens"))
+    if cached is not None:
+        tokens["cached"] = cached
+    return tokens
+
+
+def _attempt_usage(counters: dict[str, Any], invalid_counters: object) -> dict[str, Any]:
+    """Return an attempt's token fields as a report trial carries them.
+
+    ``tokens`` holds the valid counters, and ``invalid_token_counters`` names
+    the counters the trajectory recorded with an invalid value. Token usage
+    leaves such an attempt unmeasured.
+    """
+    usage: dict[str, Any] = {}
+    tokens = _usage_tokens(counters)
+    if tokens is not None:
+        usage["tokens"] = tokens
+    if names := _token_counter_names(invalid_counters):
+        usage["invalid_token_counters"] = names
+    return usage
+
+
+def _harbor_task_directory(trial_dir: Path) -> str | None:
+    """Return the task directory a Harbor trial ran, from its copied ``result.json`` or ``config.json``.
+
+    A generated task's directory is named after its case. The files are
+    optional, so an unreadable or oversized one only gives ``None``.
+    """
+    for artifact, keys in (("result", (("task_id",), ("config", "task"))), ("config", (("task",),))):
+        path = trial_dir / f"{artifact}.json"
+        data = _load_bounded_json(path, [], artifact=artifact) if path.is_file() else None
+        for key_path in keys if isinstance(data, dict) else ():
+            task: Any = data
+            for key in key_path:
+                task = task.get(key) if isinstance(task, dict) else None
+            task_path = task.get("path") if isinstance(task, dict) else None
+            if not isinstance(task_path, str):
+                continue
+            # The run may have used either path separator.
+            directory = task_path.replace("\\", "/").strip().rstrip("/").rsplit("/", 1)[-1]
+            if directory:
+                return directory
+    return None
+
+
+def _recorded_case_id(trial_dir: Path) -> str | None:
+    """Return the case ID the collector recorded in an unscored attempt's ``failure.json``.
+
+    Older runs have no such record. The file is optional, so an unreadable or
+    oversized one only gives ``None``.
+    """
+    path = trial_dir / "failure.json"
+    failure = _load_bounded_json(path, [], artifact="failure") if path.is_file() else None
+    entry_id = failure.get("entry_id") if isinstance(failure, dict) else None
+    return entry_id if isinstance(entry_id, str) and entry_id.strip() else None
+
+
+def _unscored_attempt_usage(trial_dir: Path) -> dict[str, Any]:
+    """Read the token counters of an attempt that has no usable reward.
+
+    The attempt is not scored, but it ran and used tokens. Its case is the one
+    the collector recorded in its ``failure.json``, which also holds for a
+    native task whose ``entry_id`` differs from its directory. A run without
+    that record gives the task directory its Harbor result or config names, or
+    else the trial name before Harbor's ``__<id>`` suffix, which never contains
+    ``__`` while a case ID may. Its trajectory is optional telemetry, so an
+    unreadable or oversized file only leaves the counters out and does not
+    mark score evidence truncated.
+    """
+    attempt: dict[str, Any] = {
+        "entry_id": _recorded_case_id(trial_dir)
+        or _harbor_task_directory(trial_dir)
+        or trial_dir.name.rsplit("__", 1)[0]
+        or "unknown",
+        "trial_id": trial_dir.name,
+        "scored": False,
+    }
+    trajectory_file = trial_dir / "trajectory.json"
+    trajectory = _load_bounded_json(trajectory_file, [], artifact="trajectory") if trajectory_file.exists() else None
+    final_metrics = trajectory.get("final_metrics") if isinstance(trajectory, dict) else None
+    if isinstance(final_metrics, dict):
+        counters = {name: final_metrics.get(f"total_{name}") for name in _USAGE_COUNTERS}
+        attempt.update(_attempt_usage(counters, _invalid_token_counters(final_metrics)))
+    return attempt
+
+
+def _with_trial_identity(rewards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return ``rewards`` with the trial directory as the identity of every row that has no usable one.
+
+    A failed arm keeps each scored reward twice: as a diagnostic report trial
+    and as a usage-only attempt. Token usage counts the attempt once by finding
+    both copies under the same ``trial_id``, but older artifacts carry none.
+    Nothing else tells the copies apart from two attempts: retries share a case
+    ID, and two attempts can use the same tokens. A trial directory holds one
+    attempt, so both copies name it and no two attempts share it. A reward with
+    a usable ``trial_id`` keeps it, so ``logical_trial_reward_groups`` groups it
+    as before. Only withheld arms need this, so the rewards of an arm that
+    succeeded are loaded exactly as they were read.
+    """
+    identified = []
+    for reward in rewards:
+        artifacts = reward.get("_activation_artifacts")
+        reward_path = artifacts.get("reward") if isinstance(artifacts, dict) else None
+        trial_dir = PurePosixPath(reward_path).parent.name if isinstance(reward_path, str) else ""
+        if _is_trial_identity(reward.get("trial_id")) or not _is_trial_identity(trial_dir):
+            identified.append(reward)
+        else:
+            identified.append({**reward, "trial_id": trial_dir})
+    return identified
+
+
+def _withheld_attempt_usage(rewards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the token usage of scored attempts whose arm's scores are not reported.
+
+    One row per logical attempt. As in report trials, an attempt scored over
+    several reward rows has no token counts.
+    """
+    rows = []
+    for group in logical_trial_reward_groups(rewards):
+        reward = group[0]
+        row: dict[str, Any] = {"entry_id": reward.get("entry_id"), "trial_id": reward.get("trial_id"), "scored": True}
+        counters = reward.get("_traj")
+        if len(group) == 1 and isinstance(counters, dict):
+            row.update(_attempt_usage(counters, reward.get("_invalid_token_counters")))
+        rows.append(row)
+    return rows
+
+
+def load_agent_data(
+    results_dir: Path,
+    *,
+    allow_legacy_missing_status: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Load per-agent summaries, rewards, lift, and execution coverage."""
+    agents: dict[str, dict[str, Any]] = {}
+    selection_diagnostics: list[dict[str, Any]] = []
+    try:
+        agent_dirs, agents_truncated, agent_scan_truncated = _bounded_smallest(
+            results_dir.iterdir(),
+            _MAX_AGENTS,
+            scan_limit=_MAX_AGENT_PATHS_SCANNED,
+            predicate=lambda path: _is_safe_directory(path, results_dir) and not path.name.startswith("_"),
+        )
+    except OSError:
+        return agents
+    if agents_truncated:
+        _record_truncation(
+            selection_diagnostics,
+            code="agent_limit",
+            artifact="agents",
+            limit=_MAX_AGENTS,
+        )
+    if agent_scan_truncated:
+        _record_truncation(
+            selection_diagnostics,
+            code="agent_scan_limit",
+            artifact="agents",
+            limit=_MAX_AGENT_PATHS_SCANNED,
+        )
+
+    for agent_dir in agent_dirs:
+        agent_name = agent_dir.name
+        agent_info: dict[str, Any] = {"name": agent_name}
+        agent_diagnostics: list[dict[str, Any]] = []
+        condition_execution: dict[str, dict[str, Any]] = {}
+
+        for variant in ("with-skill", "without-skill"):
+            condition_dir = agent_dir / variant
+            if not _is_safe_directory(condition_dir, results_dir):
+                continue
+            summary = condition_dir / "summary.json"
+            if summary.exists():
+                data = _load_bounded_json(summary, agent_diagnostics, artifact="summary")
+                if isinstance(data, dict):
+                    scores = data.get("scores")
+                    if not isinstance(scores, dict):
+                        continue
+                    key = "with_skill" if variant == "with-skill" else "without_skill"
+                    agent_info[key] = scores
+                    agent_info[f"_not_applicable_hint_{key}"] = not_applicable_list(data.get("not_applicable_metrics"))
+                    if variant == "with-skill" and isinstance(data.get("skill_activation"), dict):
+                        agent_info["skill_activation"] = data["skill_activation"]
+                    metric_key = "metrics_with_skill" if variant == "with-skill" else "metrics_without_skill"
+                    if isinstance(data.get("metrics"), list):
+                        agent_info[metric_key] = data["metrics"]
+                    if isinstance(data.get("metric_set"), str):
+                        agent_info[f"metric_set_{key}"] = data["metric_set"]
+                    custom_key = "custom_with_skill" if variant == "with-skill" else "custom_without_skill"
+                    if "custom_scores" in data:
+                        custom_scores = data.get("custom_scores")
+                        agent_info[custom_key] = custom_scores if isinstance(custom_scores, dict) else {}
+                    overall_key = "overall_with_skill" if variant == "with-skill" else "overall_without_skill"
+                    if "overall_score" in data:
+                        agent_info[overall_key] = data.get("overall_score")
+                    score_policy_key = (
+                        "score_policy_with_skill" if variant == "with-skill" else "score_policy_without_skill"
+                    )
+                    if isinstance(data.get("score_policy"), str) and data["score_policy"].strip():
+                        agent_info[score_policy_key] = data["score_policy"].strip()
+                    mixed_contract_key = (
+                        "mixed_metric_contracts_with_skill"
+                        if variant == "with-skill"
+                        else "mixed_metric_contracts_without_skill"
+                    )
+                    if isinstance(data.get("mixed_metric_contracts"), bool):
+                        agent_info[mixed_contract_key] = data["mixed_metric_contracts"]
+                    dimension_key = "dimensions_with_skill" if variant == "with-skill" else "dimensions_without_skill"
+                    if "dimensions" in data:
+                        agent_info[dimension_key] = data.get("dimensions", {})
+                    pass_key = "pass_with_skill" if variant == "with-skill" else "pass_without_skill"
+                    if "pass_at_k" in data:
+                        agent_info[pass_key] = data["pass_at_k"]
+                    status = data.get("execution_status")
+                    if status is None and allow_legacy_missing_status:
+                        status = "succeeded"
+                    if status not in {"succeeded", "failed", "skipped"}:
+                        status = "unknown"
+                    errors = data.get("execution_errors")
+                    condition_errors = [str(error) for error in errors] if isinstance(errors, list) else []
+                    label = "With skill" if variant == "with-skill" else "Without skill"
+                    job_failure = data.get("job_failure")
+                    if job_failure:
+                        condition_errors.append(f"{label} aggregate job: {job_failure}")
+                    trial_failures = data.get("trial_failures")
+                    judge_failure_trials: set[str] = set()
+                    if isinstance(trial_failures, list):
+                        for failure in trial_failures:
+                            if not isinstance(failure, dict):
+                                continue
+                            trial = failure.get("trial") or "unknown"
+                            reason = failure.get("reason") or "Unknown Harbor trial failure"
+                            condition_errors.append(f"{label} trial {trial}: {reason}")
+                            trial_id = str(trial)
+                            if str(reason).startswith("Required judge evaluation failed:"):
+                                judge_failure_trials.add(
+                                    str(
+                                        failure.get("_trial_root_name") or failure.get("trial_root_name") or trial_id
+                                    ).split("__step", 1)[0]
+                                )
+                    raw_judge_failures = data.get("judge_failures")
+                    planned_attempts = _nonnegative_counter(data.get("expected_attempts"))
+                    scored_attempts = _nonnegative_counter(data.get("scored_attempts"))
+                    judge_failures = min(
+                        (
+                            _nonnegative_counter(raw_judge_failures)
+                            if isinstance(raw_judge_failures, int) and not isinstance(raw_judge_failures, bool)
+                            else len(judge_failure_trials)
+                        ),
+                        max(0, planned_attempts - scored_attempts),
+                    )
+                    condition_execution[key] = {
+                        "execution_status": status,
+                        **(
+                            {"skip_reason": "budget_exhausted"} if data.get("skip_reason") == "budget_exhausted" else {}
+                        ),
+                        "execution_errors": condition_errors,
+                        **_execution_error_details(data, len(condition_errors)),
+                        "expected_cases": _nonnegative_counter(data.get("expected_cases")),
+                        "scored_cases": _nonnegative_counter(data.get("scored_cases")),
+                        "expected_attempts": _nonnegative_counter(data.get("expected_attempts")),
+                        "scored_attempts": _nonnegative_counter(data.get("scored_attempts")),
+                        "judge_failures": judge_failures,
+                        "recovered_attempts_total": _nonnegative_counter(data.get("recovered_attempts_total")),
+                        "recovered_attempts": data.get("recovered_attempts", []),
+                        "recovered_trial_failures": data.get("recovered_trial_failures", []),
+                    }
+                    count_key = "num_trials" if variant == "with-skill" else "num_trials_baseline"
+                    num_trials = data.get("num_trials")
+                    if isinstance(num_trials, int) and not isinstance(num_trials, bool) and num_trials >= 0:
+                        agent_info[count_key] = num_trials
+                    reward_row_count_key = "num_reward_rows" if variant == "with-skill" else "num_reward_rows_baseline"
+                    num_reward_rows = data.get("num_reward_rows")
+                    if (
+                        isinstance(num_reward_rows, int)
+                        and not isinstance(num_reward_rows, bool)
+                        and num_reward_rows >= 0
+                    ):
+                        agent_info[reward_row_count_key] = num_reward_rows
+
+        lift_file = agent_dir / "lift.json"
+        if lift_file.exists():
+            lift = _load_bounded_json(lift_file, agent_diagnostics, artifact="lift")
+            if lift is not _INVALID_JSON:
+                agent_info["lift"] = lift
+
+        pass_lift_file = agent_dir / "pass_at_k_lift.json"
+        if pass_lift_file.exists():
+            pass_lift = _load_bounded_json(pass_lift_file, agent_diagnostics, artifact="pass_lift")
+            if pass_lift is not _INVALID_JSON:
+                agent_info["pass_lift"] = pass_lift
+
+        custom_lift_file = agent_dir / "custom_lift.json"
+        if custom_lift_file.exists():
+            custom_lift = _load_bounded_json(custom_lift_file, agent_diagnostics, artifact="custom_lift")
+            if custom_lift is not _INVALID_JSON:
+                agent_info["custom_lift"] = custom_lift if isinstance(custom_lift, dict) else {}
+
+        tolerance_record: Any = None
+        tolerance_file = agent_dir / baseline_timeouts.RECORD_ARTIFACT
+        if tolerance_file.exists():
+            tolerance_record = _load_bounded_json(
+                tolerance_file, agent_diagnostics, artifact="baseline_timeout_tolerance"
+            )
+
+        for variant_key, variant_dir_name in (("rewards", "with-skill"), ("rewards_baseline", "without-skill")):
+            condition = "with_skill" if variant_key == "rewards" else "without_skill"
+            trial_list: list[dict[str, Any]] = []
+            unscored_attempts: list[dict[str, Any]] = []
+            count_key = "num_trials" if variant_key == "rewards" else "num_trials_baseline"
+            reward_row_count_key = "num_reward_rows" if variant_key == "rewards" else "num_reward_rows_baseline"
+            expected_logical_trials = agent_info.get(count_key)
+            expected_reward_rows = agent_info.get(reward_row_count_key)
+            rewards_complete = isinstance(expected_logical_trials, int)
+            trials_dir = agent_dir / variant_dir_name / "trials"
+            if _is_safe_directory(trials_dir, results_dir):
+                try:
+                    trial_dirs, trials_truncated, trial_scan_truncated = _bounded_smallest(
+                        trials_dir.iterdir(),
+                        _MAX_TRIALS_PER_CONDITION,
+                        scan_limit=_MAX_TRIAL_PATHS_SCANNED,
+                        predicate=lambda path: _is_safe_directory(path, results_dir),
+                    )
+                except OSError:
+                    trial_dirs, trials_truncated, trial_scan_truncated = [], False, False
+                    rewards_complete = False
+                if trials_truncated or trial_scan_truncated:
+                    rewards_complete = False
+                if trials_truncated:
+                    _record_truncation(
+                        agent_diagnostics,
+                        code="trial_limit",
+                        artifact=variant_dir_name,
+                        limit=_MAX_TRIALS_PER_CONDITION,
+                    )
+                if trial_scan_truncated:
+                    _record_truncation(
+                        agent_diagnostics,
+                        code="trial_scan_limit",
+                        artifact=variant_dir_name,
+                        limit=_MAX_TRIAL_PATHS_SCANNED,
+                    )
+                for trial_dir in trial_dirs:
+                    reward_file = trial_dir / "reward.json"
+                    if not reward_file.exists():
+                        rewards_complete = False
+                        # Not scored, but its token usage still counts.
+                        unscored_attempts.append(_unscored_attempt_usage(trial_dir))
+                        continue
+                    reward = _load_bounded_json(reward_file, agent_diagnostics, artifact="reward")
+                    if not isinstance(reward, dict) or (
+                        condition_execution.get(condition, {}).get("execution_status") != "succeeded"
+                        and str(reward.get("evaluation_status") or "").casefold() in {"error", "failed"}
+                    ):
+                        rewards_complete = False
+                        unscored_attempts.append(_unscored_attempt_usage(trial_dir))
+                        continue
+                    # Only the trajectory read below names invalid token counters, never the reward file.
+                    reward.pop("_invalid_token_counters", None)
+                    # Derive links from the bounded, admitted on-disk layout rather
+                    # than accepting verifier-authored paths as provenance.
+                    reward["_activation_artifacts"] = {"reward": reward_file.relative_to(results_dir).as_posix()}
+                    if not reward.get("entry_id"):
+                        reward["entry_id"] = trial_dir.name.split("__", 1)[0] if trial_dir.name else "unknown"
+                    result_file = trial_dir / "result.json"
+                    if result_file.exists():
+                        # Timing is optional telemetry. A malformed/oversized timing
+                        # source makes resources unavailable, not score evidence truncated.
+                        trial_result = _load_bounded_json(result_file, [], artifact="trial_result")
+                        if isinstance(trial_result, dict):
+                            seconds = agent_execution_seconds(trial_result)
+                            if seconds is not None:
+                                reward["_agent_seconds"] = seconds
+                    trajectory_file = trial_dir / "trajectory.json"
+                    if trajectory_file.exists():
+                        trajectory = _load_bounded_json(
+                            trajectory_file,
+                            agent_diagnostics,
+                            artifact="trajectory",
+                        )
+                        if isinstance(trajectory, dict):
+                            reward["_activation_artifacts"]["trajectory"] = trajectory_file.relative_to(
+                                results_dir
+                            ).as_posix()
+                            final_metrics = trajectory.get("final_metrics", {})
+                            if not isinstance(final_metrics, dict):
+                                final_metrics = {}
+                            steps = trajectory.get("steps")
+                            reward["_traj"] = {
+                                "steps": len(steps) if isinstance(steps, list) else None,
+                                "prompt_tokens": _trajectory_token_counter(final_metrics.get("total_prompt_tokens")),
+                                "completion_tokens": _trajectory_token_counter(
+                                    final_metrics.get("total_completion_tokens")
+                                ),
+                                "cached_tokens": _trajectory_token_counter(final_metrics.get("total_cached_tokens")),
+                            }
+                            if invalid_counters := _invalid_token_counters(final_metrics):
+                                # ``_traj`` reads them as absent; token usage must not read a bad cache as 0.
+                                reward["_invalid_token_counters"] = invalid_counters
+                            timing = trajectory_timing(trajectory)
+                            if timing is not None:
+                                reward["_traj"]["timing"] = timing
+                    trial_list.append(reward)
+            else:
+                rewards_complete = expected_logical_trials == 0
+            logical_trial_count = len(logical_trial_reward_groups(trial_list))
+            if expected_logical_trials != logical_trial_count:
+                rewards_complete = False
+            if isinstance(expected_reward_rows, int) and expected_reward_rows != len(trial_list):
+                rewards_complete = False
+            agent_info[variant_key] = trial_list
+            agent_info[f"{variant_key}_complete"] = rewards_complete
+            agent_info[_USAGE_ONLY_KEYS["with_skill" if variant_key == "rewards" else "without_skill"]] = (
+                unscored_attempts
+            )
+
+        if "with_skill" not in agent_info:
+            continue
+
+        if "skill_activation" not in agent_info:
+            from skillevaluator.tier3.harbor.activation import summarize_skill_activation
+
+            activation = summarize_skill_activation(agent_info.get("rewards") or [])
+            if agent_info.get("rewards_complete") is False and activation["status"] == "never_activated":
+                activation = dict(activation, status="unknown", reason="Activation evidence is incomplete.")
+            agent_info["skill_activation"] = activation
+
+        active_conditions = list(condition_execution.values())
+        tolerance = _matching_baseline_tolerance(tolerance_record, condition_execution)
+        # A tolerated agent's status and errors follow its with-skill arm; the
+        # attempt totals below still count both conditions.
+        status_conditions = active_conditions if tolerance is None else [condition_execution["with_skill"]]
+        execution_errors = [
+            error for condition in status_conditions for error in condition.get("execution_errors", []) if error
+        ]
+        if not status_conditions or any(
+            condition.get("execution_status") in {"failed", "unknown"} for condition in status_conditions
+        ):
+            execution_status = "failed" if execution_errors else "unknown"
+        elif all(condition.get("execution_status") == "skipped" for condition in status_conditions):
+            execution_status = "skipped"
+        else:
+            execution_status = "succeeded"
+        public_execution_errors = list(dict.fromkeys(execution_errors))
+        if tolerance is not None:
+            agent_info[baseline_timeouts.RECORD_KEY] = tolerance
+        agent_info.update(
+            {
+                "conditions": condition_execution,
+                "execution_status": execution_status,
+                "execution_errors": public_execution_errors,
+                **aggregate_execution_error_details(status_conditions, len(public_execution_errors)),
+                "expected_attempts": sum(
+                    _nonnegative_counter(condition.get("expected_attempts")) for condition in active_conditions
+                ),
+                "scored_attempts": sum(
+                    _nonnegative_counter(condition.get("scored_attempts")) for condition in active_conditions
+                ),
+            }
+        )
+
+        coverage = agent_declarative_checks(agent_info.get("rewards") or [], agent_info.get("rewards_baseline") or [])
+        if coverage:
+            agent_info["declarative_checks"] = coverage
+
+        condition_quality_fields = {
+            "with_skill": (
+                "with_skill",
+                "custom_with_skill",
+                "overall_with_skill",
+                "dimensions_with_skill",
+                "pass_with_skill",
+                "rewards",
+            ),
+            "without_skill": (
+                "without_skill",
+                "custom_without_skill",
+                "overall_without_skill",
+                "dimensions_without_skill",
+                "pass_without_skill",
+                "rewards_baseline",
+            ),
+        }
+        for condition, fields in condition_quality_fields.items():
+            condition_status = _condition_status(agent_info, condition)
+            if condition_status == "succeeded":
+                continue
+            # Both copies of a scored attempt, the diagnostic trial and the usage-only
+            # attempt below, come from the same rows, so they share one identity.
+            scored_rewards = _with_trial_identity(agent_info.get(fields[-1]) or [])
+            agent_info[f"diagnostic_{fields[-1]}"] = [
+                *scored_rewards,
+                *[
+                    {"entry_id": row["entry_id"], "trial_id": row["trial_id"], "_unscored": True}
+                    for row in agent_info.get(_USAGE_ONLY_KEYS[condition], [])
+                ],
+            ]
+            # The arm's scores are withheld below, but its scored attempts used tokens.
+            agent_info[_USAGE_ONLY_KEYS[condition]] = [
+                *_withheld_attempt_usage(scored_rewards),
+                *agent_info.get(_USAGE_ONLY_KEYS[condition], []),
+            ]
+            condition_info = condition_execution.get(condition, {})
+            for field in fields:
+                if field.startswith("pass_") and condition_status in {"failed", "unknown"}:
+                    agent_info[field] = {
+                        "attempts_used": _nonnegative_counter(condition_info.get("scored_attempts")),
+                        "max_attempts_possible": _nonnegative_counter(condition_info.get("expected_attempts")),
+                    }
+                elif field.startswith("overall_"):
+                    agent_info[field] = None
+                else:
+                    agent_info[field] = [] if field.startswith("rewards") else {}
+        for condition, rewards_key in (("with_skill", "rewards"), ("without_skill", "rewards_baseline")):
+            rows = agent_info.get(rewards_key) or []
+            scores = agent_info.get(condition) or {}
+            validated = (
+                _condition_status(agent_info, condition) == "succeeded"
+                and agent_info.get(f"{rewards_key}_complete") is True
+            )
+            agent_info[f"not_applicable_{condition}"] = (
+                [metric for metric in not_applicable_metrics(rows) if score_value(scores.get(metric)) is None]
+                if validated
+                else []
+            )
+            agent_info[f"not_applicable_validated_{condition}"] = validated
+        _attach_truncation(agent_info, agent_diagnostics)
+        agents[agent_name] = agent_info
+    if selection_diagnostics and agents:
+        _attach_truncation(next(iter(agents.values())), selection_diagnostics)
+    return agents
+
+
+def load_dataset(skill_path: Path | None) -> list[dict[str, Any]]:
+    """Load the first supported Tier 3 dataset from a skill directory."""
+    if not skill_path:
+        return []
+    evals_dir = skill_path / "evals"
+    diagnostics: list[dict[str, Any]] = []
+    for name in ("evals.json", "evals.jsonl", "evals.yaml", "evals.yml", "dataset.json"):
+        candidate = evals_dir / name
+        if candidate.exists():
+            try:
+                from skillevaluator.tier3.dataset_utils import normalize_dataset_entries
+
+                if candidate.suffix.lower() == ".json":
+                    payload = _load_bounded_json(candidate, diagnostics, artifact="dataset")
+                    if payload is _INVALID_JSON:
+                        continue
+                else:
+                    raw = _read_bounded_bytes(candidate, diagnostics, artifact="dataset")
+                    if raw is None:
+                        continue
+                    if candidate.suffix.lower() == ".jsonl":
+                        payload = _load_bounded_jsonl(raw, diagnostics)
+                    else:
+                        import yaml
+
+                        payload = yaml.safe_load(raw)
+                        try:
+                            _validate_json_tree(payload)
+                        except _JSONLimitError as exc:
+                            _record_truncation(
+                                diagnostics,
+                                code=exc.code,
+                                artifact="dataset",
+                                limit=exc.limit,
+                            )
+                            continue
+                entries = normalize_dataset_entries(_bounded_dataset_payload(payload, diagnostics))
+                return _dataset_result(entries, diagnostics)
+            except (json.JSONDecodeError, OSError, RecursionError, UnicodeDecodeError, ValueError):
+                pass
+    return _dataset_result([], diagnostics)
+
+
+def load_staged_harbor_dataset(results_dir: Path) -> list[dict[str, Any]]:
+    """Load and deduplicate dataset entries staged into Harbor task trees."""
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    diagnostics: list[dict[str, Any]] = []
+    tasks_dir = results_dir / "_harbor-tasks"
+    if not tasks_dir.exists():
+        return entries
+    try:
+        entry_files, tasks_truncated, task_scan_truncated = _bounded_staged_entry_files(tasks_dir)
+    except OSError:
+        return entries
+    if tasks_truncated:
+        _record_truncation(
+            diagnostics,
+            code="staged_task_limit",
+            artifact="staged_tasks",
+            limit=_MAX_STAGED_TASKS,
+        )
+    if task_scan_truncated:
+        _record_truncation(
+            diagnostics,
+            code="staged_task_scan_limit",
+            artifact="staged_tasks",
+            limit=_MAX_STAGED_PATHS_SCANNED,
+        )
+    for entry_file in entry_files:
+        entry = _load_bounded_json(entry_file, diagnostics, artifact="staged_entry")
+        if not isinstance(entry, dict):
+            continue
+        entry_id = entry.get("id")
+        identity = f"id:{entry_id}" if entry_id is not None else f"payload:{json.dumps(entry, sort_keys=True)}"
+        if identity in seen:
+            continue
+        seen.add(identity)
+        entries.append(entry)
+        if len(entries) >= _MAX_DATASET_RECORDS:
+            if len(entry_files) > len(entries):
+                _record_truncation(
+                    diagnostics,
+                    code="dataset_record_limit",
+                    artifact="staged_dataset",
+                    limit=_MAX_DATASET_RECORDS,
+                )
+            break
+    return _dataset_result(entries, diagnostics)

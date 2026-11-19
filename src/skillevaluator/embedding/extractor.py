@@ -1,0 +1,607 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Unified content extraction for similarity detection.
+
+Normalizes Skills (SKILL.md), Rules (.mdc), and Workflows
+(workflow-rules.mdc) into a common ContentEntry dataclass so
+the embedding pipeline can treat all three types identically.
+"""
+
+from __future__ import annotations
+
+import os
+import stat
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+
+from skillevaluator.constants import (
+    CONTENT_DEDUP_MAX_FILE_BYTES,
+    CONTENT_DEDUP_MAX_TOTAL_BYTES,
+    CONTENT_TYPE_RULES,
+    CONTENT_TYPE_SKILL,
+    CONTENT_TYPE_WORKFLOWS,
+    RULES_FILE_EXTENSION,
+    SCAN_EXCLUDED_DIRS,
+    SIMILARITY_DEFAULT_MAX_ENTRIES,
+    SIMILARITY_MAX_DISCOVERED_PATHS,
+    SKILL_MANIFEST_VARIANTS,
+    WORKFLOWS_MANIFEST_FILE,
+)
+from skillevaluator.deduplication.utils.skill_collector import (
+    _frontmatter_root_kind,
+    _SecureReadError,
+    _SecureRoot,
+)
+from skillevaluator.embedding.limits import validate_max_entries
+from skillevaluator.logging_config import get_logger
+from skillevaluator.utils.structured_data import (
+    StructuredDataLimitError,
+    StructuredDataSyntaxError,
+    load_bounded_yaml,
+    require_bounded_string,
+)
+from skillevaluator.utils.tier2_paths import (
+    contained_directory_alias_target,
+    is_contained_compatibility_alias,
+    safe_path_label,
+)
+from skillevaluator.validators.frontmatter_parser import FRONTMATTER_PATTERN
+
+logger = get_logger(__name__)
+
+MAX_MANIFEST_BYTES = CONTENT_DEDUP_MAX_FILE_BYTES
+MAX_COLLECTION_BYTES = CONTENT_DEDUP_MAX_TOTAL_BYTES
+MAX_DISCOVERED_PATHS = SIMILARITY_MAX_DISCOVERED_PATHS
+DISCOVERY_EXCLUDED_DIRS = SCAN_EXCLUDED_DIRS
+MAX_EXTRACTION_EXCLUSIONS = 100
+MAX_EXCLUSION_PATH_CHARS = 512
+# Longest name or description read from frontmatter, in every embedding mode.
+# It bounds the memory one field can take and equals the registry's per-field
+# catalog text limit (MAX_CATALOG_TEXT_LENGTH). The registry still enforces the
+# combined description embedding-text limit and the catalog limits, and the
+# Tier 1 length rules stay with Tier 1.
+MAX_FRONTMATTER_FIELD_CHARS = 16_384
+
+
+class ManifestEncodingError(ValueError):
+    """A manifest's bytes are not valid UTF-8, so its frontmatter cannot be read."""
+
+
+@dataclass
+class ContentEntry:
+    """Unified representation of a content item for embedding.
+
+    Attributes:
+        name: Skill name or rule/workflow title.
+        description: Description from frontmatter.
+        path: File or directory path (as string for serialization).
+        content_type: One of "skill", "rules", "workflows".
+        full_text: Entire file content including frontmatter, used by --full-body.
+    """
+
+    name: str
+    description: str
+    path: str
+    content_type: str
+    full_text: str = ""
+
+    @property
+    def embedding_text(self) -> str:
+        """Concatenated string used for description-only embedding."""
+        return f"{self.name}: {self.description}"
+
+
+@dataclass
+class ExtractionResult:
+    """Selected-manifest coverage, with a bounded inventory of exclusions.
+
+    ``indexed_count`` counts entries eligible for embedding; provider and index
+    errors still abort the build independently. Paths are relative to the scan
+    root and reasons never include manifest content or YAML parser excerpts.
+    """
+
+    entries: list[ContentEntry]
+    selected_count: int
+    exclusions: list[dict[str, str]]
+
+    @property
+    def indexed_count(self) -> int:
+        return len(self.entries)
+
+    @property
+    def skipped_count(self) -> int:
+        return self.selected_count - self.indexed_count
+
+    def to_metadata(self) -> dict[str, object]:
+        return {
+            "selected_count": self.selected_count,
+            "indexed_count": self.indexed_count,
+            "skipped_count": self.skipped_count,
+            "exclusions": self.exclusions,
+            "omitted_exclusions": self.skipped_count - len(self.exclusions),
+        }
+
+
+@dataclass
+class _ExtractionBudget:
+    """Tracks collection bounds before any embedding request is made."""
+
+    max_entries: int = SIMILARITY_DEFAULT_MAX_ENTRIES
+    entry_count: int = 0
+    total_bytes: int = 0
+    root: Path | None = None
+    exclusions: list[dict[str, str]] = field(default_factory=list)
+
+    def exclude(self, path: Path, reason: str) -> None:
+        if len(self.exclusions) < MAX_EXTRACTION_EXCLUSIONS:
+            label = path.relative_to(self.root).as_posix() if self.root is not None else path.name
+            self.exclusions.append({"path": label[:MAX_EXCLUSION_PATH_CHARS], "reason": reason})
+
+    def reserve(self, file_path: Path, declared_bytes: int) -> None:
+        self.entry_count += 1
+        if self.entry_count > self.max_entries:
+            raise ValueError(
+                f"Collection entry limit exceeded ({self.max_entries}) before embedding; "
+                "increase --max-entries within its supported range to scan the complete collection"
+            )
+        if declared_bytes > MAX_MANIFEST_BYTES:
+            raise ValueError(
+                f"Manifest exceeds the Tier 2 per-file byte limit ({MAX_MANIFEST_BYTES}): {file_path.name}"
+            )
+        self.total_bytes += declared_bytes
+        if self.total_bytes > MAX_COLLECTION_BYTES:
+            raise ValueError(f"Collection total byte limit exceeded ({MAX_COLLECTION_BYTES}) before embedding")
+
+    def reconcile(self, declared_bytes: int, actual_bytes: int) -> None:
+        self.total_bytes += actual_bytes - declared_bytes
+        if self.total_bytes > MAX_COLLECTION_BYTES:
+            raise ValueError(f"Collection total byte limit exceeded ({MAX_COLLECTION_BYTES}) before embedding")
+
+
+# ---------------------------------------------------------------------------
+# Per-type extraction functions
+# ---------------------------------------------------------------------------
+
+
+def extract_from_skill(skill_dir: Path, *, budget: _ExtractionBudget | None = None) -> ContentEntry | None:
+    """Extract name + description from a skill directory's SKILL.md."""
+    try:
+        with _SecureRoot(skill_dir) as secure_root:
+            for variant in SKILL_MANIFEST_VARIANTS:
+                manifest = skill_dir / variant
+                if manifest.exists() or _is_symlink_or_reparse(manifest):
+                    _ensure_safe_content_path(skill_dir, manifest)
+                    return _extract_from_file(
+                        manifest,
+                        name_field="name",
+                        description_field="description",
+                        content_type=CONTENT_TYPE_SKILL,
+                        budget=budget,
+                        secure_root=secure_root,
+                        relative_path=Path(variant),
+                        label=_manifest_label(skill_dir, variant),
+                    )
+    except _SecureReadError as exc:
+        raise ValueError(f"Skill root is a symlink, reparse point, or cannot be securely opened: {skill_dir}") from exc
+    logger.debug("No SKILL.md found in %s", skill_dir)
+    return None
+
+
+def extract_from_rule(rule_path: Path, *, budget: _ExtractionBudget | None = None) -> ContentEntry | None:
+    """Extract title + description from a .mdc rules file."""
+    if rule_path.suffix != RULES_FILE_EXTENSION:
+        logger.debug("Not a valid .mdc file: %s", rule_path)
+        return None
+    try:
+        with _SecureRoot(rule_path.parent) as secure_root:
+            if not rule_path.exists() and not _is_symlink_or_reparse(rule_path):
+                logger.debug("Not a valid .mdc file: %s", rule_path)
+                return None
+            _ensure_safe_content_path(rule_path.parent, rule_path)
+            return _extract_from_file(
+                rule_path,
+                name_field="title",
+                description_field="description",
+                content_type=CONTENT_TYPE_RULES,
+                budget=budget,
+                secure_root=secure_root,
+                relative_path=Path(rule_path.name),
+                label=_manifest_label(rule_path.parent, rule_path.name),
+            )
+    except _SecureReadError as exc:
+        raise ValueError(
+            f"Rule root is a symlink, reparse point, or cannot be securely opened: {rule_path.parent}"
+        ) from exc
+
+
+def extract_from_workflow(workflow_dir: Path, *, budget: _ExtractionBudget | None = None) -> ContentEntry | None:
+    """Extract title + description from a workflow's workflow-rules.mdc."""
+    try:
+        with _SecureRoot(workflow_dir) as secure_root:
+            manifest = workflow_dir / WORKFLOWS_MANIFEST_FILE
+            if not manifest.exists() and not _is_symlink_or_reparse(manifest):
+                logger.debug("No %s found in %s", WORKFLOWS_MANIFEST_FILE, workflow_dir)
+                return None
+            _ensure_safe_content_path(workflow_dir, manifest)
+            return _extract_from_file(
+                manifest,
+                name_field="title",
+                description_field="description",
+                content_type=CONTENT_TYPE_WORKFLOWS,
+                budget=budget,
+                secure_root=secure_root,
+                relative_path=Path(WORKFLOWS_MANIFEST_FILE),
+                label=_manifest_label(workflow_dir, WORKFLOWS_MANIFEST_FILE),
+            )
+    except _SecureReadError as exc:
+        raise ValueError(
+            f"Workflow root is a symlink, reparse point, or cannot be securely opened: {workflow_dir}"
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
+
+
+def discover_and_extract(
+    root: Path, content_type: str, *, max_entries: int = SIMILARITY_DEFAULT_MAX_ENTRIES
+) -> list[ContentEntry]:
+    """Auto-discover content items under a directory and extract entries.
+
+    Args:
+        root: Root directory to scan.
+        content_type: One of "skill", "rules", "workflows".
+        max_entries: Maximum selected manifests, including those with invalid frontmatter.
+
+    Returns:
+        List of successfully extracted ContentEntry objects.
+    """
+    return discover_and_extract_detailed(root, content_type, max_entries=max_entries).entries
+
+
+def discover_and_extract_detailed(
+    root: Path, content_type: str, *, max_entries: int = SIMILARITY_DEFAULT_MAX_ENTRIES
+) -> ExtractionResult:
+    """Extract entries while accounting for every selected manifest.
+
+    Unsafe paths, read failures and resource limits continue to abort discovery;
+    only malformed frontmatter is excluded with a structured reason.
+    """
+    validate_max_entries(max_entries)
+    strategy = _DISCOVERY_STRATEGIES.get(content_type)
+    if strategy is None:
+        logger.warning("Unknown content type '%s' for discovery", content_type)
+        return ExtractionResult([], 0, [])
+    budget = _ExtractionBudget(max_entries=max_entries, root=root)
+    entries = strategy(root, budget)
+    logger.debug("Discovered %d %s entries in %s", len(entries), content_type, safe_path_label(root))
+    return ExtractionResult(entries, budget.entry_count, budget.exclusions)
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+
+def _manifest_label(directory: Path, manifest_name: str) -> str:
+    """Name a manifest read on its own by its directory, such as ``my-skill/SKILL.md``.
+
+    The directory is made absolute and ``..`` is removed lexically, without
+    following links, so ``Path(".")`` or ``Path("..")`` is named by the real
+    directory name.
+    """
+    return PurePosixPath(Path(os.path.normpath(directory.absolute())).name, manifest_name).as_posix()
+
+
+def _is_symlink_or_reparse(path: Path) -> bool:
+    """Return whether *path* redirects traversal through a link or reparse point."""
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    file_attributes = getattr(metadata, "st_file_attributes", 0)
+    return stat.S_ISLNK(metadata.st_mode) or bool(file_attributes & reparse_flag)
+
+
+def _ensure_safe_content_path(root: Path, candidate: Path) -> None:
+    """Reject linked manifests and any path that resolves outside *root*."""
+    root_absolute = root.absolute()
+    candidate_absolute = candidate.absolute()
+    try:
+        relative = candidate_absolute.relative_to(root_absolute)
+    except ValueError as exc:
+        raise ValueError(f"Content path escapes scan root: {candidate}") from exc
+
+    current = root_absolute
+    for part in (None, *relative.parts):
+        if part is not None:
+            current /= part
+        if _is_symlink_or_reparse(current):
+            raise ValueError(f"Content path contains a symlink or reparse point: {current}")
+
+    try:
+        resolved_root = root_absolute.resolve(strict=True)
+        resolved_candidate = candidate_absolute.resolve(strict=True)
+        resolved_candidate.relative_to(resolved_root)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Content path resolves outside its scan root or does not exist: {candidate}") from exc
+
+
+def _extract_from_file(
+    file_path: Path,
+    *,
+    name_field: str,
+    description_field: str,
+    content_type: str,
+    budget: _ExtractionBudget | None = None,
+    secure_root: _SecureRoot | None = None,
+    relative_path: Path | None = None,
+    label: str | None = None,
+) -> ContentEntry | None:
+    """Read once, parse frontmatter, and build a bounded content entry.
+
+    Errors name the manifest by *label*, or else by its path under the scan root.
+    """
+    full_text = _read_bounded_manifest(
+        file_path,
+        budget,
+        secure_root=secure_root,
+        relative_path=relative_path,
+    )
+    match = FRONTMATTER_PATTERN.match(full_text)
+    if not match:
+        if budget is not None:
+            budget.exclude(file_path, "missing_frontmatter")
+        logger.debug("Missing YAML frontmatter in %s", file_path)
+        return None
+
+    frontmatter_yaml, _markdown_content = match.groups()
+    if label is None:
+        label = relative_path.as_posix() if relative_path is not None else file_path.name
+    # Only the parser events up to the root node are read first. A root that
+    # is not a mapping is never built; it is excluded like an empty mapping,
+    # even when the YAML after the root node is also malformed. YAML that is
+    # malformed before its root node goes to the loader, which rejects it as
+    # invalid YAML.
+    root_kind = _frontmatter_root_kind(frontmatter_yaml)
+    try:
+        # Agent clients keep the last value of a repeated frontmatter key.
+        data = load_bounded_yaml(frontmatter_yaml, last_key_wins=True) if root_kind != "other" else None
+    except StructuredDataSyntaxError as exc:
+        if budget is not None:
+            budget.exclude(file_path, "invalid_yaml")
+        logger.debug("Invalid YAML frontmatter in %s: %s", file_path, exc)
+        return None
+    except StructuredDataLimitError as exc:
+        raise ValueError(f"Manifest structured-data complexity limit exceeded: {label}") from exc
+    if not data or not isinstance(data, dict):
+        if budget is not None:
+            budget.exclude(file_path, "invalid_frontmatter_mapping")
+        logger.debug("Frontmatter in %s is not a non-empty mapping", file_path)
+        return None
+    name = data.get(name_field)
+    description = data.get(description_field)
+
+    if not name or not description:
+        if budget is not None:
+            budget.exclude(file_path, "missing_name_or_description")
+        logger.debug(
+            "Missing %s or %s in %s",
+            name_field,
+            description_field,
+            file_path,
+        )
+        return None
+    # Never call str() on a frontmatter value: a list or mapping built from
+    # YAML aliases renders to a string far larger than the manifest. A value
+    # that is not a string makes the entry invalid, with its own reason.
+    if not (isinstance(name, str) and isinstance(description, str)):
+        if budget is not None:
+            budget.exclude(file_path, "non_string_name_or_description")
+        logger.debug("Frontmatter %s or %s is not a string", name_field, description_field)
+        return None
+    try:
+        name = require_bounded_string(name, name_field, max_chars=MAX_FRONTMATTER_FIELD_CHARS, allow_empty=True)
+        description = require_bounded_string(
+            description, description_field, max_chars=MAX_FRONTMATTER_FIELD_CHARS, allow_empty=True
+        )
+    except ValueError as exc:
+        raise ValueError(f"Manifest frontmatter {exc}: {label}") from exc
+
+    return ContentEntry(
+        name=name,
+        description=description,
+        path=str(file_path.parent if content_type == CONTENT_TYPE_SKILL else file_path),
+        content_type=content_type,
+        full_text=full_text,
+    )
+
+
+def _read_bounded_manifest(
+    file_path: Path,
+    budget: _ExtractionBudget | None,
+    *,
+    secure_root: _SecureRoot | None = None,
+    relative_path: Path | None = None,
+) -> str:
+    """Read one regular UTF-8 manifest through its anchored parent directory."""
+    try:
+        if secure_root is None:
+            with _SecureRoot(file_path.parent) as manifest_root:
+                raw_bytes, opened_info = manifest_root.read_bounded(Path(file_path.name), MAX_MANIFEST_BYTES)
+        else:
+            if relative_path is None:
+                raise _SecureReadError("unsafe_path", "Anchored manifest read requires a relative path.")
+            raw_bytes, opened_info = secure_root.read_bounded(relative_path, MAX_MANIFEST_BYTES)
+    except _SecureReadError as exc:
+        raise ValueError(f"Cannot securely read manifest {file_path.name}: {exc}") from exc
+    if budget is not None:
+        budget.reserve(file_path, opened_info.st_size)
+        budget.reconcile(opened_info.st_size, len(raw_bytes))
+    try:
+        return raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ManifestEncodingError(f"Manifest is not valid UTF-8: {file_path.name}") from exc
+
+
+def _is_discovery_manifest_name(name: str) -> bool:
+    """Return whether *name* could be selected as a skill, rule, or workflow manifest."""
+    folded = name.casefold()
+    return any(folded == variant.casefold() for variant in SKILL_MANIFEST_VARIANTS) or folded.endswith(
+        RULES_FILE_EXTENSION
+    )
+
+
+def _iter_discovery_files(root: Path):
+    """Yield bounded files from one pruned inter-skill traversal.
+
+    A contained directory alias such as ``.agents -> .claude`` is never
+    followed. It is skipped only when its name cannot be a manifest and the
+    same walk enumerates its target as a regular directory, so the canonical
+    directory is scanned once. Every other directory redirect is rejected.
+    """
+    if _is_symlink_or_reparse(root):
+        raise ValueError(f"Discovery root is a symlink or reparse point: {root.name}")
+    if not root.is_dir():
+        return
+
+    discovered_paths = 0
+    discovered_files: list[Path] = []
+    regular_directories: set[str] = set()
+    directory_aliases: list[tuple[str, str]] = []
+
+    def _raise_walk_error(error: OSError) -> None:
+        raise ValueError(f"Cannot safely traverse the Tier 2 collection: {error}") from error
+
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=_raise_walk_error, followlinks=False):
+        dirnames.sort()
+        filenames.sort()
+        kept_dirs: list[str] = []
+        for dirname in dirnames:
+            discovered_paths += 1
+            if discovered_paths > MAX_DISCOVERED_PATHS:
+                raise ValueError(f"Collection path limit exceeded ({MAX_DISCOVERED_PATHS}) before embedding")
+            directory = Path(dirpath) / dirname
+            relative = directory.relative_to(root)
+            if dirname in DISCOVERY_EXCLUDED_DIRS:
+                # A pruned regular directory is still a valid alias target;
+                # its contents stay excluded either way.
+                if not _is_symlink_or_reparse(directory):
+                    regular_directories.add(relative.as_posix())
+                continue
+            if _is_symlink_or_reparse(directory):
+                target = (
+                    None
+                    if _is_discovery_manifest_name(dirname)
+                    else contained_directory_alias_target(directory, relative)
+                )
+                if target is None:
+                    raise ValueError(f"Discovery path contains a symlink or reparse point: {dirname}")
+                directory_aliases.append((relative.as_posix(), target))
+                continue
+            regular_directories.add(relative.as_posix())
+            kept_dirs.append(dirname)
+        dirnames[:] = kept_dirs
+
+        sibling_names = frozenset(filenames)
+        for filename in filenames:
+            discovered_paths += 1
+            if discovered_paths > MAX_DISCOVERED_PATHS:
+                raise ValueError(f"Collection path limit exceeded ({MAX_DISCOVERED_PATHS}) before embedding")
+            file_path = Path(dirpath) / filename
+            if _is_symlink_or_reparse(file_path):
+                if is_contained_compatibility_alias(file_path, sibling_names=sibling_names):
+                    logger.debug(
+                        "Skipping compatibility alias in favor of regular target: %s",
+                        file_path.relative_to(root).as_posix(),
+                    )
+                    continue
+                raise ValueError(f"Discovery path contains a symlink or reparse point: {filename}")
+            discovered_files.append(file_path)
+
+    for alias, target in directory_aliases:
+        if target not in regular_directories:
+            raise ValueError(
+                "Discovery path contains a symlink or reparse point whose target is not a regular "
+                f"directory in the scan root: {alias} -> {target}"
+            )
+        logger.debug("Skipping directory alias in favor of regular target: %s -> %s", alias, target)
+    yield from discovered_files
+
+
+def _discover_skills(root: Path, budget: _ExtractionBudget) -> list[ContentEntry]:
+    """Find skill directories by locating SKILL.md files."""
+    entries: list[ContentEntry] = []
+    seen_dirs: set[Path] = set()
+    with _SecureRoot(root) as secure_root:
+        for manifest in _iter_discovery_files(root):
+            if manifest.name not in SKILL_MANIFEST_VARIANTS:
+                continue
+            skill_dir = manifest.parent
+            if skill_dir in seen_dirs:
+                continue
+            seen_dirs.add(skill_dir)
+            entry = _extract_from_file(
+                manifest,
+                name_field="name",
+                description_field="description",
+                content_type=CONTENT_TYPE_SKILL,
+                budget=budget,
+                secure_root=secure_root,
+                relative_path=manifest.relative_to(root),
+            )
+            if entry:
+                entries.append(entry)
+    return entries
+
+
+def _discover_rules(root: Path, budget: _ExtractionBudget) -> list[ContentEntry]:
+    """Find .mdc rule files recursively, excluding workflow manifests."""
+    entries: list[ContentEntry] = []
+    with _SecureRoot(root) as secure_root:
+        for mdc_file in _iter_discovery_files(root):
+            if mdc_file.suffix != RULES_FILE_EXTENSION or mdc_file.name == WORKFLOWS_MANIFEST_FILE:
+                continue
+            entry = _extract_from_file(
+                mdc_file,
+                name_field="title",
+                description_field="description",
+                content_type=CONTENT_TYPE_RULES,
+                budget=budget,
+                secure_root=secure_root,
+                relative_path=mdc_file.relative_to(root),
+            )
+            if entry:
+                entries.append(entry)
+    return entries
+
+
+def _discover_workflows(root: Path, budget: _ExtractionBudget) -> list[ContentEntry]:
+    """Find workflow directories by locating workflow-rules.mdc."""
+    entries: list[ContentEntry] = []
+    with _SecureRoot(root) as secure_root:
+        for manifest in _iter_discovery_files(root):
+            if manifest.name != WORKFLOWS_MANIFEST_FILE:
+                continue
+            entry = _extract_from_file(
+                manifest,
+                name_field="title",
+                description_field="description",
+                content_type=CONTENT_TYPE_WORKFLOWS,
+                budget=budget,
+                secure_root=secure_root,
+                relative_path=manifest.relative_to(root),
+            )
+            if entry:
+                entries.append(entry)
+    return entries
+
+
+_DISCOVERY_STRATEGIES: dict[str, callable] = {
+    CONTENT_TYPE_SKILL: _discover_skills,
+    CONTENT_TYPE_RULES: _discover_rules,
+    CONTENT_TYPE_WORKFLOWS: _discover_workflows,
+}

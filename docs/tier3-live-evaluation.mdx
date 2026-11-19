@@ -1,0 +1,327 @@
+---
+title: "Tier 3: Live Agent Evaluation"
+sidebar-title: "Tier 3: Live Agent Evaluation"
+description: "Prepare reviewed cases, run an agent with and without your skill, and open the comparison report."
+---
+
+Does your skill help an agent complete a task? Run the same tasks **with and
+without your skill**, then open a report showing the difference: **Skill Lift**.
+
+<div id="install-live-evaluation-support">
+
+First, [install SkillEvaluator](/skills/skillevaluator/installation#all-tiers) with the all-tier option,
+then connect a model, prepare your dataset, and run the comparison.
+
+</div>
+
+<CardGroup cols={3}>
+  <Card title="1. Prepare" icon="list-check" href="#prepare-your-dataset">
+    Create and review the tasks the agent will run.
+  </Card>
+  <Card title="2. Run" icon="play" href="#run-your-reviewed-dataset">
+    Evaluate the reviewed cases in Docker.
+  </Card>
+  <Card title="3. See the result" icon="chart-simple" href="#read-the-report">
+    Open the report and inspect the paired outcomes.
+  </Card>
+</CardGroup>
+
+<div id="nemo-gym">
+
+<Note>
+  **NeMo Gym is also available** as an experimental backend for Docker on
+  Linux/macOS. The adapter is included in SkillEvaluator 1.0.1 and requires a
+  separate pinned Gym installation; see [Installation](/skills/skillevaluator/installation#install) for package availability. [Setup and supported agents](/skills/skillevaluator/tier3-runtime#execution-backends).
+  The walkthrough below uses **Harbor**, the default backend.
+</Note>
+
+</div>
+
+## Before you start
+
+Have these ready before starting the agent run:
+
+- A skill folder containing `SKILL.md`; replace `./my-skill` with that folder.
+- A model API key and Docker running.
+- A **reviewed dataset** at `./my-skill/evals/evals.json`. [Create one](/skills/skillevaluator/prepare-dataset) or review your existing cases using the step below.
+
+Native task bundles use the [custom task workflow](/skills/skillevaluator/custom-graders)
+instead of `evals.json`. New to skills? Try the
+[bundled keyless example](/skills/skillevaluator/quickstart) first.
+
+<Steps toc={true}>
+
+### Connect a model
+
+Choose one provider. Run its exports in the same terminal as the evaluation.
+This setup uses one key for the evaluator and the agent; no local GPU is needed.
+
+<Tabs>
+  <Tab title="NVIDIA Build">
+
+Get a key from [NVIDIA Build](https://build.nvidia.com/), then replace the
+placeholder below. This path uses **OpenCode** in Docker.
+
+```bash title="NVIDIA Build"
+export SKILL_EVAL_LLM_PROVIDER=nv_build
+export NVIDIA_API_KEY='nvapi-...'
+```
+
+  </Tab>
+  <Tab title="OpenAI">
+
+Get an [OpenAI API key](https://platform.openai.com/api-keys), then replace the
+placeholder below. This path uses **Codex** in Docker.
+
+```bash title="OpenAI"
+export SKILL_EVAL_LLM_PROVIDER=openai
+export OPENAI_API_KEY='sk-...'
+```
+
+  </Tab>
+</Tabs>
+
+For Anthropic, a different model, or an existing provider setup, use
+[Providers & Credentials](/skills/skillevaluator/configuration).
+
+### Prepare your dataset
+
+**Do this before running the comparison.** The dataset defines the requests
+both agents receive and the outcomes they are graded against.
+
+<Card title="Create or bring your evaluation dataset" icon="list-check" href="/skills/skillevaluator/prepare-dataset">
+  Write task guidance → generate cases → review and validate them.
+  If you already have cases, start at the review step.
+</Card>
+
+Open `./my-skill/evals/evals.json` and check the prompts, expected outcomes,
+and any input files. Then validate:
+
+```bash title="Validate the reviewed dataset"
+skillevaluator tier3 validate ./my-skill --strict
+```
+
+Confirm the file exists first: an absent `evals/` directory can be reported as
+missing without a failing exit code. Resolve errors and warnings before
+continuing. Passing validation checks the
+dataset's structure and flagged wording; you still need to review whether its
+tasks represent how people will use the skill.
+
+### Check readiness
+
+```bash title="Check your provider and Docker setup"
+skillevaluator doctor --env-mode docker
+```
+
+Fix any failed checks before continuing. Docker-mode trials install the agent
+inside their containers. [Runtime setup and troubleshooting](/skills/skillevaluator/agents-and-sandboxes).
+
+</Steps>
+
+<div id="start-with-one-command">
+
+## Run your reviewed dataset
+
+```bash title="Run the reviewed cases with and without the skill"
+skillevaluator tier3 evaluate ./my-skill --env-mode docker --n-attempts 1
+```
+
+This explicit command uses the existing evaluation source. It does not create
+a missing dataset unless you opt into `--autopilot`. **Model calls can incur
+charges.** One attempt means one try per selected case in each arm. Saved run
+settings can limit coverage or affect attempts. [Choose run settings](/skills/skillevaluator/tier3-run-options).
+
+</div>
+
+<Accordion title="Optional: try automatic setup for a workflow check">
+
+```bash title="Generate a starter only when no evaluation source exists"
+skillevaluator tier3 ./my-skill --env-mode docker --n-attempts 1
+```
+
+  This shorter workflow creates one starter case when no source exists, or
+  reuses existing cases. Invalid sources stop the run. A one-case starter
+  checks the workflow; it does not establish performance across intended tasks.
+  Use the reviewed-dataset workflow above for a planned evaluation.
+</Accordion>
+
+## Read the report
+
+```bash title="Open the latest report"
+skillevaluator view ./my-skill
+```
+
+Start with these three checks:
+
+| Look at | What it tells you |
+| --- | --- |
+| **Run status and coverage** | Did both arms finish with enough evidence to compare? Incomplete or inconclusive results need investigation. |
+| **Skill Lift** | How the scored outcomes changed with the skill. Positive means improvement on the evaluated cases; negative means worse outcomes. |
+| **Individual trials** | What the agent did, whether the skill activated, and which cases failed. |
+
+The run prints its output directory. By default, reports are saved under
+`./my-skill/evals/results/`; open that run's `report.html` or inspect `result.json`.
+[Understand scores and verdicts](/skills/skillevaluator/tier3-results).
+
+<div id="next-steps">
+
+## Build on your first run
+
+<CardGroup cols={2}>
+  <Card title="Configure your next run" icon="sliders" href="/skills/skillevaluator/tier3-run-options">
+    Choose an agent, repeat attempts, or open advanced run controls.
+  </Card>
+  <Card title="Run in CI" icon="code-branch" href="/skills/skillevaluator/advanced-ci">
+    Use committed evaluation cases in the automatic CI workflow.
+  </Card>
+  <Card title="Choose an agent or sandbox" icon="terminal" href="/skills/skillevaluator/agents-and-sandboxes">
+    Configure another agent, local execution, or a cloud backend.
+  </Card>
+  <Card title="Test skill activation and interactions" icon="flask" href="/skills/skillevaluator/tier3-experiments">
+    Check routing expectations or measure skills used together.
+  </Card>
+</CardGroup>
+
+</div>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="The provider or agent cannot authenticate">
+    Replace the example key and export it in the terminal running
+    `skillevaluator`. Keep credentials out of `evals/config.yml`.
+    Run `skillevaluator doctor --env-mode docker` again. See
+    [provider setup](/skills/skillevaluator/configuration).
+  </Accordion>
+  <Accordion title="Docker or the selected model is unavailable">
+    Start Docker and check `docker info`. For a model override, pass
+    `--agent-model AGENT=MODEL` with a model supported by that agent and
+    provider. See [agents and readiness](/skills/skillevaluator/agents-and-sandboxes).
+  </Accordion>
+  <Accordion title="The report is incomplete or the skill never activated">
+    Inspect the failed trials before interpreting the scores. A completed
+    command alone does not prove that the skill helped. See
+    [result interpretation](/skills/skillevaluator/tier3-results) and
+    [runtime troubleshooting](/skills/skillevaluator/tier3-runtime#troubleshooting).
+  </Accordion>
+</AccordionGroup>
+
+## Advanced topics
+
+<div id="prepare-and-review-a-fuller-evaluation">
+<div id="generate-an-eval-dataset">
+<div id="review-the-cases">
+<div id="run-the-comparison">
+<div id="plan-for-cost">
+<div id="cost-and-local-mode">
+<div id="tune-the-run">
+<div id="reuse-a-baseline">
+<div id="compare-skill-versions">
+<div id="baseline-only-runs">
+<div id="baseline-timeouts">
+<div id="cost-limits">
+
+<Accordion title="Datasets, run options, and cost">
+  - [Prepare and review a fuller evaluation](/skills/skillevaluator/tier3-run-reference#prepare-and-review-a-fuller-evaluation)
+  - [Check readiness](/skills/skillevaluator/tier3-run-reference#check-readiness)
+  - [Generate an eval dataset](/skills/skillevaluator/tier3-run-reference#generate-an-eval-dataset)
+  - [Review the cases](/skills/skillevaluator/tier3-run-reference#review-the-cases)
+  - [Run the comparison](/skills/skillevaluator/tier3-run-reference#run-the-comparison)
+  - [Read the report](/skills/skillevaluator/tier3-run-reference#read-the-report)
+  - [Plan for cost](/skills/skillevaluator/tier3-run-reference#plan-for-cost)
+  - [Cost and local mode](/skills/skillevaluator/tier3-run-reference#cost-and-local-mode)
+  - [Tune the run](/skills/skillevaluator/tier3-run-reference#tune-the-run)
+  - [Reuse a baseline](/skills/skillevaluator/tier3-run-reference#reuse-a-baseline)
+  - [Compare skill versions](/skills/skillevaluator/tier3-run-reference#compare-skill-versions)
+  - [Baseline only runs](/skills/skillevaluator/tier3-run-reference#baseline-only-runs)
+  - [Baseline timeouts](/skills/skillevaluator/tier3-run-reference#baseline-timeouts)
+  - [Cost limits](/skills/skillevaluator/tier3-run-reference#cost-limits)
+</Accordion>
+
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+
+
+<div id="how-a-run-works">
+<div id="where-agents-run">
+<div id="execution-backends">
+<div id="harbor-025-compatibility">
+<div id="two-ways-to-run-tier-3">
+<div id="paired-tier-3-in-automatic-ci">
+
+<Accordion title="Runtime, backends, and CI">
+  - [How a run works](/skills/skillevaluator/tier3-runtime#how-a-run-works)
+  - [Where agents run](/skills/skillevaluator/tier3-runtime#where-agents-run)
+  - [Execution backends](/skills/skillevaluator/tier3-runtime#execution-backends)
+  - [Harbor 025 compatibility](/skills/skillevaluator/tier3-runtime#harbor-025-compatibility)
+  - [Two ways to run tier 3](/skills/skillevaluator/tier3-runtime#two-ways-to-run-tier-3)
+  - [Paired tier 3 in automatic ci](/skills/skillevaluator/tier3-runtime#paired-tier-3-in-automatic-ci)
+</Accordion>
+
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+
+
+<div id="what-a-live-eval-measures">
+<div id="reading-results">
+<div id="which-dimensions-apply-to-each-arm">
+
+<Accordion title="Scores, verdicts, and applicability">
+  - [What a live eval measures](/skills/skillevaluator/tier3-results#what-a-live-eval-measures)
+  - [Reading results](/skills/skillevaluator/tier3-results#reading-results)
+  - [Which dimensions apply to each arm](/skills/skillevaluator/tier3-results#which-dimensions-apply-to-each-arm)
+</Accordion>
+
+</div>
+</div>
+</div>
+
+
+<div id="how-standard-grading-judges-a-trial">
+<div id="the-graded-trajectory">
+<div id="character-sensitive-judging">
+<div id="evidence-budgets">
+<div id="judge-requests-and-retries">
+<div id="judge-fallback-and-retry-policies">
+
+<Accordion title="Judges and evidence">
+  - [How standard grading judges a trial](/skills/skillevaluator/tier3-grading#how-standard-grading-judges-a-trial)
+  - [The graded trajectory](/skills/skillevaluator/tier3-grading#the-graded-trajectory)
+  - [Character sensitive judging](/skills/skillevaluator/tier3-grading#character-sensitive-judging)
+  - [Evidence budgets](/skills/skillevaluator/tier3-grading#evidence-budgets)
+  - [Judge requests and retries](/skills/skillevaluator/tier3-grading#judge-requests-and-retries)
+  - [Judge fallback and retry policies](/skills/skillevaluator/tier3-grading#judge-fallback-and-retry-policies)
+</Accordion>
+
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+
+
+<div id="skill-interaction-experiments">
+<div id="repeatable-activation-validation">
+
+<Accordion title="Activation and skill interactions">
+  - [Skill interaction experiments](/skills/skillevaluator/tier3-experiments#skill-interaction-experiments)
+  - [Repeatable activation validation](/skills/skillevaluator/tier3-experiments#repeatable-activation-validation)
+</Accordion>
+
+</div>
+</div>

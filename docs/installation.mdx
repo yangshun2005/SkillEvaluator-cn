@@ -1,0 +1,234 @@
+---
+title: "Install SkillEvaluator"
+sidebar-title: "Installation"
+description: "Start with the lightweight SkillEvaluator CLI, then add all-tier dependencies when you need them."
+---
+
+Start with the **lightweight CLI** for quality scoring and basic static checks.
+Choose your package manager below. Need all three tiers? [Add the all-tier dependencies](#all-tiers).
+
+<div id="install">
+<div id="install-the-cli">
+<div id="requirements">
+
+<Tabs>
+  <Tab title="pip (PyPI)">
+
+Use **Python 3.12–3.14** in an activated virtual environment.
+
+```bash title="Install the PyPI release"
+python -m pip install --upgrade skillevaluator
+```
+
+<Accordion title="Create a virtual environment first">
+  <Tabs>
+    <Tab title="macOS / Linux">
+
+```bash
+python3.13 -m venv .venv
+source .venv/bin/activate
+```
+
+    </Tab>
+    <Tab title="Windows (untested)">
+
+```powershell
+py -3.13 -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+    </Tab>
+  </Tabs>
+
+  These examples use an installed Python 3.13; Python 3.12 and 3.14 also work.
+  Run the install command after activation. Keep this environment activated
+  whenever you use SkillEvaluator.
+</Accordion>
+
+  </Tab>
+  <Tab title="uv tool (PyPI)">
+
+uv creates an isolated tool environment and sets up Python 3.13 automatically.
+
+```bash title="Install the PyPI release with uv"
+uv tool install --python 3.13 skillevaluator
+```
+
+Need uv first? Use the **Install uv** section below.
+
+  </Tab>
+  <Tab title="GitHub source">
+
+Use this for changes not yet available in a published package.
+You need Git and either uv or an activated Python 3.12–3.14 environment.
+
+```bash title="Install current source with uv"
+uv tool install --python 3.13 --reinstall "skillevaluator @ git+https://github.com/NVIDIA/SkillEvaluator.git"
+```
+
+Or, in your activated environment:
+
+```bash title="Install current source with pip"
+python -m pip install --upgrade --force-reinstall "skillevaluator @ git+https://github.com/NVIDIA/SkillEvaluator.git"
+```
+
+When reinstalling, keep any extras you need; see the [all-tier option](#all-tiers).
+The repository can contain unreleased changes. For an editable checkout,
+use the [development guide](/skills/skillevaluator/developer-guide#set-up-a-development-environment).
+
+  </Tab>
+</Tabs>
+
+</div>
+</div>
+</div>
+
+Harness Check, JUnit reports, and the NeMo Gym adapter are included in
+SkillEvaluator **1.0.1**. Check the [published PyPI versions](https://pypi.org/project/skillevaluator/#history);
+if 1.0.1 is not yet available, use the GitHub source option above.
+See [release differences](/skills/skillevaluator/installation-options#release-and-source-differences).
+Use the [all-tier option](#all-tiers) below when you need model-backed checks or live evaluation.
+
+<div id="get-uv">
+
+<Accordion title="Install uv">
+  Choose one method. With pip, use an activated Python environment; the
+  standalone installers work without an existing Python installation.
+
+  <Tabs>
+    <Tab title="pip">
+
+```bash title="Install uv with pip"
+python -m pip install --upgrade uv
+uv --version
+```
+
+    </Tab>
+    <Tab title="macOS / Linux">
+
+```bash title="Install uv"
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+    </Tab>
+    <Tab title="Windows (untested)">
+
+```powershell title="Install uv in PowerShell"
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+    </Tab>
+  </Tabs>
+
+  Open a new terminal after using a standalone installer, then run the
+  `uv tool install` command above. See [uv's installation guide](https://docs.astral.sh/uv/getting-started/installation/)
+  for other package managers.
+</Accordion>
+
+</div>
+
+<Accordion title="What does the lightweight install include?">
+  `pip install skillevaluator` or `uv tool install skillevaluator` installs
+  the lightweight CLI for quality scoring and basic static checks.
+
+  On PyPI 0.9.0, the base install does not include model clients for rubric
+  reviews or Tier 2, the Tier 3 agent runtime, Bandit, or pip-audit. Full static
+  validation can report **INCOMPLETE** until scanner requirements are met.
+  `[all]` includes the `tier2`, `tier3`, and `security` extras; provider keys,
+  Docker, and the optional dashboard still have separate setup.
+
+  Add [all evaluation dependencies](#all-tiers) later, or
+  choose [individual extras](/skills/skillevaluator/installation-options#choosing-extras).
+  In 1.0.1, the base package also includes Harness Check, Bandit, and uv.
+  Model clients, the Tier 3 runtime, and pip-audit still require their extras.
+</Accordion>
+
+## Verify your install
+
+```bash title="Check the CLI"
+skillevaluator --version
+```
+
+You should see a version number. With pip, keep your virtual environment
+activated. With uv, run `uv tool update-shell` and open a new terminal if the
+command is not found.
+
+<div id="all-tiers">
+
+## Add all tiers
+
+Use `skillevaluator[all]` for Tier 1 security dependencies, Tier 2, and Tier 3.
+These commands also add the extras to an existing lightweight installation.
+
+<Tabs>
+  <Tab title="pip">
+
+In your activated Python environment:
+
+```bash title="Install all evaluation dependencies"
+python -m pip install --upgrade "skillevaluator[all]"
+```
+
+  </Tab>
+  <Tab title="uv tool">
+
+```bash title="Install all evaluation dependencies with uv"
+uv tool install --python 3.13 --reinstall "skillevaluator[all]"
+```
+
+  </Tab>
+  <Tab title="GitHub source">
+
+With uv:
+
+```bash
+uv tool install --python 3.13 --reinstall "skillevaluator[all] @ git+https://github.com/NVIDIA/SkillEvaluator.git"
+```
+
+Or in your activated Python environment:
+
+```bash
+python -m pip install --upgrade --force-reinstall "skillevaluator[all] @ git+https://github.com/NVIDIA/SkillEvaluator.git"
+```
+
+  </Tab>
+</Tabs>
+
+Provider credentials, Docker, and [scanner setup](/skills/skillevaluator/installation-options#system-tools)
+still depend on the checks you run. The dashboard is a separate extra.
+For just one capability, [choose individual extras](/skills/skillevaluator/installation-options#choosing-extras).
+
+</div>
+
+<div id="next-steps">
+
+## Choose an evaluation
+
+| Guide | What you need next |
+| --- | --- |
+| [Tier 1: Validation](/skills/skillevaluator/tier1-validation) | A skill folder and [scanner setup](/skills/skillevaluator/installation-options#system-tools) for full validation. No API key for static checks. |
+| [Tier 1: Harness Check](/skills/skillevaluator/harness-check) | SkillEvaluator 1.0.1 and a skill folder. No API key or agent run. |
+| [Tier 2: Deduplication](/skills/skillevaluator/tier2-deduplication) | The [all-tier option](#all-tiers) and a provider for embeddings and model analysis. |
+| [Tier 3: Live Agent Evaluation](/skills/skillevaluator/tier3-live-evaluation) | The [all-tier option](#all-tiers), a [reviewed dataset](/skills/skillevaluator/prepare-dataset), a model API key, and Docker. |
+
+Need an example skill? Start with the [quickstart](/skills/skillevaluator/quickstart).
+
+</div>
+
+<div id="upgrade">
+<div id="other-installation-methods">
+<div id="choosing-extras">
+<div id="system-tools">
+<div id="troubleshooting">
+
+**More options:** [Upgrade](/skills/skillevaluator/installation-options#upgrade),
+[Docker](/skills/skillevaluator/installation-options#other-installation-methods),
+[smaller installs](/skills/skillevaluator/installation-options#choosing-extras),
+[security scanners](/skills/skillevaluator/installation-options#system-tools),
+or [troubleshooting](/skills/skillevaluator/installation-options#troubleshooting).
+
+</div>
+</div>
+</div>
+</div>
+</div>

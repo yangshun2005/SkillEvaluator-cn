@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Harbor multi-agent evaluation mode.
+
+Converts skill eval datasets to Harbor tasks, runs them against multiple
+agents (Claude Code, Codex, Cursor, etc.) in isolated containers, grades
+trajectories with SkillEvaluator metrics, and collects results.
+
+Harbor mode is self-contained.
+
+Environment modes are Harbor's built-in environment types. Docker is the
+default, with cloud environments enabled through the corresponding Harbor
+extra and provider credentials.
+"""
+
+from skillevaluator.tier3_environments import (
+    DEFAULT_ENV_MODE,
+    ENV_MODE_LOCAL,
+    HARBOR_ENV_MODES,
+    HARBOR_ENVIRONMENTS,
+    HARBOR_NATIVE_ENV_MODES,
+)
+
+# Local mode plugs into Harbor as a custom environment/agents via import paths.
+LOCAL_ENV_IMPORT_PATH = "skillevaluator.tier3.harbor.local_environment:SkillEvaluatorLocalEnvironment"
+HERMES_VERSION = "v2026.9.24"
+LOCAL_HARBOR_AGENTS = frozenset({"claude-code", "codex", "opencode"})
+LOCAL_AGENT_IMPORT_PATHS = {
+    "claude-code": "skillevaluator.tier3.harbor.local_agents:SkillEvaluatorLocalClaudeCode",
+    "codex": "skillevaluator.tier3.harbor.local_agents:SkillEvaluatorLocalCodex",
+    "opencode": "skillevaluator.tier3.harbor.local_agents:SkillEvaluatorLocalOpenCode",
+}
+CONTAINER_AGENT_IMPORT_PATHS = {
+    "claude-code": "skillevaluator.tier3.harbor.local_agents:SkillEvaluatorClaudeCode",
+}
+
+# Per-trial runtime dirs local-mode Codex creates under Harbor's agent log dir.
+# ``codex-secrets/auth.json`` holds the credential (written from OPENAI_API_KEY
+# or uploaded from a host auth.json) and ``codex-home/auth.json`` links to it.
+# Both are private runtime state, never retained trial evidence.
+LOCAL_CODEX_HOME_DIRNAME = "codex-home"
+LOCAL_CODEX_SECRETS_DIRNAME = "codex-secrets"
+
+# Docker wrappers retain Harbor's installers while avoiding redundant Node/npm
+# packages on the branches that bootstrap their own runtime. Codex and OpenCode
+# install their own Node with NVM on glibc images. Claude Code uses the
+# container wrapper, which builds on that installer fix and adds Vertex AI
+# routing and rich MCP server declarations.
+DOCKER_AGENT_IMPORT_PATHS = {
+    "codex": "skillevaluator.tier3.harbor.installed_agents:SkillEvaluatorCodex",
+    "opencode": "skillevaluator.tier3.harbor.installed_agents:SkillEvaluatorOpenCode",
+    "claude-code": CONTAINER_AGENT_IMPORT_PATHS["claude-code"],
+    "hermes": "skillevaluator.tier3.harbor.hermes_agent:SkillEvaluatorHermes",
+}
+
+HARBOR_AGENTS_SUPPORTED = frozenset(
+    {
+        "claude-code",
+        "codex",
+        "opencode",
+    }
+)
+
+HARBOR_AGENTS_EXPERIMENTAL: frozenset[str] = frozenset({"hermes"})
+
+HARBOR_AGENTS = HARBOR_AGENTS_SUPPORTED | HARBOR_AGENTS_EXPERIMENTAL
+
+AGENT_ALIASES = {"claude": "claude-code"}
+
+# Accuracy, custom goal, and behavior can each make two sequential 90-second
+# direct public-provider attempts. The remaining minute covers verifier
+# overhead and fail-closed artifact writes.
+DEFAULT_LLM_VERIFIER_TIMEOUT_SEC = 600.0
+
+
+def canonical_agent_name(agent: str) -> str:
+    """Return the Harbor agent identifier for a public CLI/config name."""
+    return AGENT_ALIASES.get(agent, agent)
+
+
+__all__ = [
+    "AGENT_ALIASES",
+    "CONTAINER_AGENT_IMPORT_PATHS",
+    "DEFAULT_ENV_MODE",
+    "DEFAULT_LLM_VERIFIER_TIMEOUT_SEC",
+    "DOCKER_AGENT_IMPORT_PATHS",
+    "ENV_MODE_LOCAL",
+    "HARBOR_AGENTS",
+    "HARBOR_AGENTS_EXPERIMENTAL",
+    "HARBOR_AGENTS_SUPPORTED",
+    "HARBOR_ENVIRONMENTS",
+    "HARBOR_ENV_MODES",
+    "HARBOR_NATIVE_ENV_MODES",
+    "LOCAL_AGENT_IMPORT_PATHS",
+    "LOCAL_CODEX_HOME_DIRNAME",
+    "LOCAL_CODEX_SECRETS_DIRNAME",
+    "LOCAL_ENV_IMPORT_PATH",
+    "LOCAL_HARBOR_AGENTS",
+    "canonical_agent_name",
+]

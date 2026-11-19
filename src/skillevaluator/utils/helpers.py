@@ -1,0 +1,272 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Helper utilities for SkillEvaluator."""
+
+import os
+import re
+import subprocess
+from datetime import UTC, datetime
+from pathlib import Path
+
+from skillevaluator.constants import SCAN_EXCLUDED_DIRS, SKILL_MANIFEST_FILE, SKILL_MANIFEST_VARIANTS
+from skillevaluator.utils.path_security import matches_filesystem_name
+from skillevaluator.utils.tier2_paths import is_link_or_reparse
+
+
+def make_timestamped_basename(prefix: str, suffix: str = "") -> str:
+    """Return ``<prefix>-YYYYMMDDHHMMSS<suffix>`` for report artifacts.
+
+    Used so each combined ``validate`` run writes a distinct, sortable report
+    file rather than overwriting the previous one (SkillEvaluator parity). ``suffix``
+    is the optional file extension (e.g. ``".html"``); omit it to get the bare
+    timestamped basename.
+    """
+    stamp = datetime.now(tz=UTC).strftime("%Y%m%d%H%M%S")
+    return f"{prefix}-{stamp}{suffix}"
+
+
+def _linked_directory_contains_skill(directory: Path) -> bool:
+    """Inspect a linked target for manifests without following further links."""
+    if any((directory / name).exists() or (directory / name).is_symlink() for name in SKILL_MANIFEST_VARIANTS):
+        return True
+
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    for dirpath, dirnames, filenames in os.walk(directory, onerror=raise_walk_error, followlinks=False):
+        if any(name in filenames or name in dirnames for name in SKILL_MANIFEST_VARIANTS):
+            return True
+        base = Path(dirpath)
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if not matches_filesystem_name(base / name, SCAN_EXCLUDED_DIRS) and not is_link_or_reparse(base / name)
+        ]
+    return False
+
+
+def find_skills_in_directory(root_path: Path, *, problems: dict[Path, str] | None = None) -> list[Path]:
+    """Find live skill directories containing a supported manifest.
+
+    Prunes configured scan exclusions and never validates linked directories.
+    External linked targets are inspected to report skipped skills as failures.
+    Stops at each skill boundary so bundled templates are not separate skills.
+    Both ``SKILL.md`` and ``skill.md`` are accepted. Manifest validation stays
+    with the per-skill validators, as it does for direct skill targets.
+
+    Args:
+        root_path: Root directory or SKILL.md file path to search
+        problems: Collect discovery failures by directory instead of raising.
+            Failed directories are included in the result for catalog reporting.
+
+    Returns:
+        Sorted list of unique paths to skill directories
+    """
+    skill_dirs: set[Path] = set()
+
+    def record_problem(directory: Path, message: str) -> None:
+        if problems is None:
+            raise ValueError(message)
+        problems[directory] = message
+        skill_dirs.add(directory)
+
+    if root_path.is_file():
+        if root_path.name.upper() == SKILL_MANIFEST_FILE.upper():
+            skill_dirs.add(root_path.parent)
+        return sorted(skill_dirs)
+
+    if is_link_or_reparse(root_path):
+        record_problem(root_path, f"Skill discovery root must be an unlinked directory: {root_path}")
+        return sorted(skill_dirs)
+
+    def record_walk_error(error: OSError) -> None:
+        record_problem(Path(error.filename) if error.filename else root_path, f"Cannot discover skills: {error}")
+
+    resolved_root = Path(os.path.realpath(root_path))
+    for dirpath, dirnames, filenames in os.walk(root_path, onerror=record_walk_error, followlinks=False):
+        base = Path(dirpath)
+        if any(name in filenames or name in dirnames for name in SKILL_MANIFEST_VARIANTS):
+            skill_dirs.add(base)
+            dirnames.clear()
+            continue
+        retained = []
+        for name in dirnames:
+            directory = base / name
+            if matches_filesystem_name(directory, SCAN_EXCLUDED_DIRS):
+                continue
+            if is_link_or_reparse(directory):
+                try:
+                    # Internal aliases are already covered through their real paths.
+                    if Path(os.path.realpath(directory)).is_relative_to(resolved_root):
+                        continue
+                    has_manifest = _linked_directory_contains_skill(directory)
+                except OSError as exc:
+                    record_problem(directory, f"Cannot inspect linked skill directory {directory}: {exc}")
+                    continue
+                if has_manifest:
+                    record_problem(directory, f"Linked skill directory is not followed: {directory}")
+                continue
+            retained.append(name)
+        dirnames[:] = retained
+
+    return sorted(skill_dirs)
+
+
+def find_bundled_plugin_skills(plugin_root: Path) -> list[Path]:
+    """Find live skills under a plugin's ``skills/`` directory."""
+    skills_root = plugin_root / "skills"
+    if not skills_root.is_dir():
+        return []
+    return [
+        skill_dir
+        for skill_dir in find_skills_in_directory(skills_root)
+        if not any(part in SCAN_EXCLUDED_DIRS for part in skill_dir.relative_to(skills_root).parts)
+    ]
+
+
+def _git_output(args: list[str], cwd: Path) -> str:
+    """Run git in ``cwd`` and return its stripped stdout decoded as UTF-8.
+
+    Remote URLs and ref names are UTF-8 text, so the locale code page (cp1252
+    on many Windows hosts) must not be used to decode them. Undecodable bytes
+    are replaced, so decoding cannot raise and the result can be written to
+    UTF-8 reports.
+    """
+    return subprocess.check_output(
+        ["git", *args],
+        cwd=str(cwd),
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    ).strip()
+
+
+def resolve_git_root(local_path: Path) -> Path | None:
+    """Return the containing Git repository root without importing optional tiers."""
+    resolved = local_path.resolve()
+    working_dir = resolved if resolved.is_dir() else resolved.parent
+    try:
+        # Git prints the root as raw file-name bytes; decode them the way Python
+        # encodes paths, not with the locale code page, so the result names the real directory.
+        root = os.fsdecode(
+            subprocess.check_output(
+                ["git", "rev-parse", "--show-toplevel"], cwd=str(working_dir), stderr=subprocess.DEVNULL
+            )
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return None
+    return Path(root).resolve() if root else None
+
+
+def resolve_git_remote_url(local_path: Path) -> str | None:
+    """Resolve a local path to a browsable HTTPS URL if inside a git repo.
+
+    Detects the git remote origin, converts SSH/HTTPS URLs to a browsable
+    HTTPS URL, and appends the relative path within the repo.
+
+    Examples:
+        /home/user/project/skills/ with remote git@github.com:org/project.git
+        -> https://github.com/org/project/tree/main/skills
+
+    Args:
+        local_path: Absolute path to resolve
+
+    Returns:
+        HTTPS URL string, or None if not inside a git repo
+    """
+    resolved = local_path.resolve()
+    repo_root = resolve_git_root(resolved)
+    if repo_root is None:
+        return None
+
+    try:
+        # Get the remote origin URL
+        remote_url = _git_output(["remote", "get-url", "origin"], repo_root)
+
+        # Get the current branch.
+        # In CI pipelines (detached HEAD), git returns "HEAD" so prefer an
+        # explicitly supplied branch name.
+        branch = os.environ.get("GITHUB_REF_NAME", "")
+        if re.fullmatch(r"\d+/merge", branch):
+            # A pull request merge ref belongs to the workflow repository, but
+            # local_path may point into a different checkout. Resolve the
+            # revision from the repository that contains local_path.
+            try:
+                branch = _git_output(["rev-parse", "HEAD"], repo_root)
+            except subprocess.CalledProcessError:
+                branch = ""
+        if not branch:
+            try:
+                branch = _git_output(["rev-parse", "--abbrev-ref", "HEAD"], repo_root)
+            except subprocess.CalledProcessError:
+                branch = "main"
+        if branch == "HEAD":
+            branch = "main"
+
+        # Convert SSH URL to HTTPS.
+        https_url = _ssh_to_https(remote_url)
+        if not https_url:
+            return None
+
+        # Compute the relative path within the repo
+        try:
+            rel_path = str(resolved.relative_to(repo_root))
+        except ValueError:
+            rel_path = ""
+
+        if rel_path and rel_path != ".":
+            tree_segment = "/tree/" if https_url.startswith("https://github.com/") else "/-/tree/"
+            return f"{https_url}{tree_segment}{branch}/{rel_path}"
+        return https_url
+
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return None
+
+
+def _ssh_to_https(remote_url: str) -> str | None:
+    """Convert a git remote URL to a browsable HTTPS URL.
+
+    Handles:
+        ssh://git@host:port/group/repo.git -> https://host/group/repo
+        git@host:group/repo.git            -> https://host/group/repo
+        https://host/group/repo.git        -> https://host/group/repo
+    """
+    url = remote_url.strip().rstrip("/")
+
+    # Remove .git suffix
+    url = url.removesuffix(".git")
+
+    # ssh://git@host:port/path
+    match = re.match(r"ssh://[^@]+@([^:/]+)(?::\d+)?(/.*)", url)
+    if match:
+        return f"https://{match.group(1)}{match.group(2)}"
+
+    # git@host:path
+    match = re.match(r"[^@]+@([^:]+):(.+)", url)
+    if match:
+        return f"https://{match.group(1)}/{match.group(2)}"
+
+    # Already HTTPS — strip any embedded credentials before rendering a link.
+    if url.startswith("https://"):
+        match = re.match(r"https://[^@]+@(.+)", url)
+        if match:
+            return f"https://{match.group(1)}"
+        return url
+
+    return None
+
+
+def get_skill_name_from_path(skill_path: Path) -> str:
+    """Extract skill name from path.
+
+    Args:
+        skill_path: Path to skill directory
+
+    Returns:
+        Skill name (directory name)
+    """
+    if skill_path.is_file():
+        return skill_path.parent.name
+    return skill_path.name

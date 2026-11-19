@@ -1,0 +1,200 @@
+---
+title: "Tier 1: Validation"
+sidebar-title: "Tier 1: Validation"
+description: "Run static checks on a skill, read the saved report, and fix the findings. No model key required."
+---
+
+Check a skill's structure, security, quality, and dependencies before using it.
+[Install SkillEvaluator](/skills/skillevaluator/installation#install) first.
+This walkthrough needs no model key, GPU, or Docker.
+
+<Steps toc={true}>
+
+### Choose your skill
+
+Use a folder containing `SKILL.md`. Replace `./my-skill` below with that folder.
+Need an example? Start with the [bundled skill](/skills/skillevaluator/quickstart#get-the-example).
+
+Before full static validation, complete [scanner setup](/skills/skillevaluator/installation-options#system-tools).
+Add the `security` extra for the full scanner workflow. PyPI 0.9.0 also needs
+uv for SkillSpector provisioning; 1.0.1 includes Bandit and uv but
+still uses the extra for Python dependency audits. First-use downloads need network access.
+
+### Run static validation
+
+```bash title="Run Tier 1 without model calls"
+skillevaluator tier1 ./my-skill --no-llm -o reports/tier1
+```
+
+This runs Tier 1 only. Keep the output folder outside the skill so later scans
+do not inspect generated reports. The terminal prints findings and saves HTML
+and JSON reports automatically.
+
+### Read the result
+
+Open `reports/tier1/skillevaluator-tier1.html` in your browser. Use
+`reports/tier1/skillevaluator-tier1.json` for automation.
+
+| Result | Next action |
+| --- | --- |
+| **Passed** | The selected static checks passed. This does not measure live agent performance. |
+| **Failed** | Fix the listed findings, then run the same command again. |
+| **Incomplete** | Restore missing scanner evidence before treating the check as passed. |
+
+Exit `0` means the Tier 1 gate passed; `1` means a check failed or required
+evidence is incomplete. Exit `2` indicates a command or configuration error.
+LLM stages are skipped in this walkthrough. The quality threshold defaults to
+**70/100**; serious findings can still fail the gate.
+
+</Steps>
+
+## Choose another check
+
+<AccordionGroup>
+  <Accordion title="Check scanner readiness">
+    ```bash
+    skillevaluator doctor --tier 1
+    ```
+
+    Inspect scanner paths and versions. Semgrep is optional unless
+    `SKILLEVALUATOR_REQUIRE_SEMGREP=1` is set; its absence alone does not make
+    validation incomplete. See [scanner setup](/skills/skillevaluator/installation-options#system-tools)
+    for provisioning, offline preparation, and missing-tool fixes.
+  </Accordion>
+  <Accordion title="Start with structure and quality only">
+    ```bash
+    skillevaluator tier1 ./my-skill --no-llm --checks schema,quality -o reports/tier1-focused
+    ```
+
+    This needs no external scanners. It is a partial check, so a passing result
+    does not establish complete Tier 1 evidence.
+  </Accordion>
+  <Accordion title="Add model feedback">
+    Add the [llm extra](/skills/skillevaluator/installation-options#choosing-extras)
+    or use the [all-tier installation](/skills/skillevaluator/installation#all-tiers),
+    then [configure a provider](/skills/skillevaluator/configuration) and run:
+
+    ```bash
+    skillevaluator tier1 ./my-skill --llm -o reports/tier1-model
+    ```
+
+    This adds rubric judging, LLM security analysis, and finding verification.
+    Model calls can incur charges. See the
+    [LLM check reference](/skills/skillevaluator/tier1-reference#add-llm-analysis-optional)
+    for verdicts and report details.
+  </Accordion>
+</AccordionGroup>
+
+## Next steps
+
+- [Harness Check](/skills/skillevaluator/harness-check): see how agents load the skill. Included in 1.0.1; see [Installation](/skills/skillevaluator/installation#install) for availability.
+- [Tier 2: Deduplication](/skills/skillevaluator/tier2-deduplication): find repeated or overlapping guidance.
+- [Add a CI gate](/skills/skillevaluator/ci-integration): enforce the result on changes to your skills.
+
+## Detailed reference
+
+<div id="tier-1-in-automatic-ci">
+<div id="what-tier-1-checks">
+<div id="run-the-combined-or-focused-validation-commands">
+<div id="run-the-default-suite">
+<div id="run-static-checks-only">
+<div id="narrow-to-specific-checks">
+<div id="add-llm-analysis-optional">
+
+[Commands and CI](/skills/skillevaluator/tier1-reference#run-the-combined-or-focused-validation-commands) — combined runs, selected checks, and model analysis.
+
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+
+<div id="content-types">
+<div id="validation-profiles-and-policies">
+<div id="write-a-custom-policy-overlay">
+<div id="permit-reviewed-ownership-contacts-without-allowing-other-email-addresses">
+<div id="author-attribution-and-contact-emails">
+<div id="pii-waivers">
+
+[Profiles and content types](/skills/skillevaluator/tier1-reference#content-types) — policy rules, ownership contacts, and PII waivers.
+
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+
+<div id="the-checks">
+<div id="schema--frontmatter-and-repository-governance">
+<div id="harness--harness-compatibility">
+<div id="security--vulnerability-scanning">
+<div id="pii--pii-credentials-and-local-identifiers">
+<div id="license--compliance">
+<div id="code-integrity--code-risk-secrets-and-hygiene">
+<div id="unicode--smuggling-detection">
+<div id="quality--weighted-scoring">
+<div id="rubric-eval--llm-as-judge-requires-a-provider">
+<div id="lint--script-linting-advisory">
+<div id="version--semantic-version-check">
+<div id="dependency--cve-audit-opt-in">
+
+[Every validation check](/skills/skillevaluator/tier1-reference#the-checks) — rules, severity, scoring, and fixes.
+
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+
+<div id="scanner-setup">
+<div id="audited-skillspector-baselines">
+
+[Scanner behavior and baselines](/skills/skillevaluator/tier1-reference#scanner-setup) — tool resolution and reviewed exceptions.
+
+</div>
+</div>
+
+<div id="exit-behavior-and-scoring">
+
+[Exit behavior and scoring](/skills/skillevaluator/tier1-reference#exit-behavior-and-scoring) — gate membership, report formats, and thresholds.
+
+</div>
+
+<div id="troubleshooting">
+<div id="why-is-skillspector-analysis-incomplete">
+<div id="gitleaks-is-not-installed">
+<div id="a-scanner-is-missing">
+<div id="skillspector-reports-incomplete-analysis-for-a-valid-helper-script">
+<div id="skillspector-could-not-fully-model-the-hooks">
+<div id="skillspector-times-out">
+<div id="the-skillspector-llm-provider-keeps-failing">
+<div id="an-llm-backed-stage-fails-immediately">
+<div id="no-scannable-files-are-found">
+<div id="an-executable-override-is-rejected">
+<div id="skillspector-stops-at-a-runtime-limit">
+
+[Troubleshooting](/skills/skillevaluator/tier1-reference#troubleshooting) — incomplete analysis, timeouts, and scanner failures.
+
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>

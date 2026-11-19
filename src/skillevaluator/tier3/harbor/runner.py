@@ -1,0 +1,7112 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Public Harbor runner for live agent skill evaluation."""
+
+from __future__ import annotations
+
+import codecs
+import hashlib
+import importlib.util
+import ipaddress
+import json
+import logging
+import math
+import os
+import re
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tomllib
+import unicodedata
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
+from contextlib import ExitStack, contextmanager, suppress
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
+from functools import wraps
+from pathlib import Path
+from queue import Empty, SimpleQueue
+from types import MappingProxyType
+from typing import Any, NoReturn
+from uuid import uuid4
+
+from skillevaluator import __version__
+from skillevaluator.evaluation.tier3_report import render_agent_eval_html_report
+from skillevaluator.provider_config import (
+    ADC_DISCOVERY_ENV_VARS,
+    CHAT_DEFAULT_ANTHROPIC,
+    CHAT_DEFAULT_NVIDIA,
+    CHAT_DEFAULT_OPENAI,
+    CREDENTIAL_EXPIRY_ENV,
+    CREDENTIAL_SOURCE_ADC,
+    CREDENTIAL_SOURCE_ENV,
+    GATEWAY_AGENT_DEFAULT_MODELS,
+    OPENCODE_OPENAI_DEFAULT_MODEL,
+    ProviderConfig,
+    ProviderConfigurationError,
+    _get_google_access_token,
+    _is_vertex_openapi_endpoint,
+    _normalize_anthropic_base_url,
+    _normalize_expiry_epoch,
+    compute_adc_job_timeout,
+    effective_reasoning_effort,
+    get_adc_token_expiry,
+    is_claude_5_5_or_later,
+    refresh_host_vertex_adc_environment,
+    resolve_llm_provider,
+)
+from skillevaluator.publication_identity import (
+    PUBLICATION_ANY_DEPTH_EXCLUDED_NAMES,
+    publication_source_path_is_excluded,
+    publication_target_from_path,
+)
+from skillevaluator.source_identity import normalized_evaluated_source
+from skillevaluator.tier3.baseline_store import (
+    baseline_description,
+    baseline_task_tree_digest,
+    comparison_identity,
+    identity_dataset_digest,
+    select_baseline,
+)
+from skillevaluator.tier3.case_ids import validate_case_ids
+from skillevaluator.tier3.declarative_coverage import compact_declarative_checks
+from skillevaluator.tier3.eval_core.llm_judge import JUDGE_REASONING_EFFORT
+from skillevaluator.tier3.evals_config import (
+    _GKE_INFRASTRUCTURE_KWARGS,
+    MAX_HARBOR_TIMEOUT_MULTIPLIER,
+    EvalsConfigError,
+    _is_sensitive_environment_kwarg_name,
+    encode_environment_kwarg,
+    load_evals_config,
+    validate_environment_kwargs,
+)
+from skillevaluator.tier3.harbor import (
+    CONTAINER_AGENT_IMPORT_PATHS,
+    DOCKER_AGENT_IMPORT_PATHS,
+    HERMES_VERSION,
+    LOCAL_CODEX_HOME_DIRNAME,
+    LOCAL_CODEX_SECRETS_DIRNAME,
+    baseline_timeouts,
+)
+from skillevaluator.tier3.harbor.adapter import (
+    _RUNTIME_PROCESS_CONTROL_ENV_NAMES,
+    _RUNTIME_PROCESS_CONTROL_ENV_PREFIXES,
+    _VERIFIER_BUDGET_ENV_VARS,
+    _VERIFIER_JUDGE_CONTROL_ENV_VARS,
+    _VERIFIER_JUDGE_MODEL_ENV_VARS,
+    _VERIFIER_RETRY_ENV_VARS,
+    _native_entry_id,
+    _prevalidate_baseline_skill_candidates,
+    _read_regular_evals_file,
+    build_eval_base_image,
+    find_evals_file,
+    generate_harbor_tasks,
+    private_evaluator_skill_snapshot,
+    stage_native_harbor_tasks,
+    validate_output_provenance_key_location,
+    validate_results_root_location,
+)
+from skillevaluator.tier3.harbor.artifact_retention import HarborArtifactLifecycle, RetentionOutcome
+from skillevaluator.tier3.harbor.collector import (
+    TRUNCATED_AGGREGATE_ATTEMPT_PREFIX,
+    _score_definition_for_policy,
+    collect_harbor_results,
+    harbor_job_passed,
+    harbor_timeout_job_recovered,
+    validate_harbor_job_result,
+)
+from skillevaluator.tier3.harbor.gke_environment import (
+    GKE_ALLOW_WORKLOAD_IDENTITY_ENV,
+    GKE_BOUND_SERVICE_ACCOUNT_ERROR_TEMPLATE,
+    GKE_HOST_UNVERIFIED_VERTEX_AUTH_DETAIL,
+    SECURE_GKE_ENV_IMPORT_PATH,
+    inspect_bound_gcp_service_account,
+    is_gke_workload_identity_allowed,
+)
+from skillevaluator.tier3.harbor.kubeconfig import _resolve_single_kubeconfig
+from skillevaluator.tier3.harbor.local_runtime import PINNED_RUNTIME_VERSIONS
+from skillevaluator.tier3.harbor.metrics import DEFAULT_METRICS, score_policy_for_metrics
+from skillevaluator.tier3.harbor.progress import (
+    MIN_EXACT_SECRET_CHARS,
+    NullProgressReporter,
+    ProgressEvent,
+    ProgressReporter,
+    Tier3RunPlan,
+    redact_progress_detail,
+    safe_progress_reporter,
+    secret_values_from_environment,
+)
+from skillevaluator.tier3.harbor.report_data import (
+    DatasetSnapshotContractError,
+    build_dataset_snapshot,
+    dataset_snapshot_manifest,
+    encode_dataset_snapshot,
+    load_staged_harbor_dataset,
+)
+from skillevaluator.tier3.harbor.secure_copy import IgnoreCallback, _absolute_lexical, copytree_secure
+from skillevaluator.tier3.harbor.secure_docker_environment import (
+    SECURE_DOCKER_ENV_IMPORT_PATH,
+    SECURE_KATA_ENV_IMPORT_PATH,
+)
+from skillevaluator.tier3.harbor.sensitive_stdin import (
+    NVIDIA_BUILD_KEY_STDIN_ENV as _NVIDIA_BUILD_KEY_STDIN_ENV,
+)
+from skillevaluator.tier3.harbor.sensitive_stdin import (
+    NVIDIA_BUILD_STDIN_SENTINEL as _NVIDIA_BUILD_STDIN_SENTINEL,
+)
+from skillevaluator.tier3.harbor.stream_redaction import (
+    MAX_COMMAND_OUTPUT_BYTES,
+    CommandOutputByteBudget,
+    StreamingLogRedactor,
+    StreamingSecretRedactor,
+)
+from skillevaluator.tier3.output_provenance import (
+    mark_generated_output_root,
+    remove_generated_output_root_if_owned,
+    remove_output_reservation_if_identity_matches,
+    write_output_file_atomically,
+)
+from skillevaluator.tier3.results_location import publish_latest_results
+from skillevaluator.tier3.version_comparison import compare_versions, select_prior_version
+from skillevaluator.tier3_environments import (
+    DEFAULT_ENV_MODE,
+    ENV_MODE_LOCAL,
+    HARBOR_DOCKER_ENGINE_ENV_MODES,
+    HARBOR_ENV_MODES,
+    HARBOR_ENVIRONMENT_ALIAS_KWARGS,
+    HARBOR_ENVIRONMENT_EXTRAS,
+    HARBOR_ENVIRONMENT_KWARGS,
+    HARBOR_VERSION,
+    SKILLEVALUATOR_GKE_EXTRA_ENVIRONMENT_KWARGS,
+    EnvironmentBackendError,
+    EnvironmentBackendSpec,
+    custom_backend_names,
+    harbor_environment_type,
+    is_env_mode,
+    load_custom_backend,
+)
+from skillevaluator.utils.path_security import matches_filesystem_name
+from skillevaluator.utils.redaction import is_sensitive_key, redact_sensitive_text
+from skillevaluator.utils.secure_fs import SecurePathError, SecureRoot
+
+logger = logging.getLogger(__name__)
+_MAX_REPO_CONTEXT_METADATA_BYTES = 16 * 1024 * 1024
+
+
+def _runtime_source_is_bound_to_target(source: Path, target: Path) -> bool:
+    """Return whether one staged runtime source is covered by the target digest."""
+    try:
+        source.absolute().relative_to(target.absolute())
+        metadata = source.lstat()
+        reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        if stat.S_ISLNK(metadata.st_mode) or getattr(metadata, "st_file_attributes", 0) & reparse_point:
+            return False
+        resolved_source = source.resolve(strict=True)
+        resolved_target = target.resolve(strict=True)
+        resolved_source.relative_to(resolved_target)
+        if publication_source_path_is_excluded(resolved_target, resolved_source):
+            return False
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
+
+
+def _task_stages_digest_excluded_entries(task_path: Path) -> bool:
+    """Return whether a generated task carries entries the source digest omits.
+
+    Task inputs (``evals/files`` and per-entry ``files`` references) and the
+    custom ``evals/environment`` are copied as authored, while the digest omits
+    ``.git``, ``.venv``, ``__pycache__`` and ``node_modules`` at any depth. Such
+    staged bytes could change Tier 3 inputs or outcomes without changing the
+    certified digest. Generated task content never uses these names, and
+    runtime skill and repository projections already omit them.
+    """
+    try:
+        for dirpath, dirnames, filenames in os.walk(task_path, followlinks=False):
+            base = Path(dirpath)
+            for name in (*dirnames, *filenames):
+                if matches_filesystem_name(base / name, PUBLICATION_ANY_DEPTH_EXCLUDED_NAMES):
+                    return True
+    except (OSError, RuntimeError, ValueError):
+        return True
+    return False
+
+
+def _runtime_context_is_bound_to_publication_target(
+    skill_path: Path,
+    task_paths: Sequence[Path],
+    *,
+    reference_skills_dir: Path | None,
+    workspace_skill_paths: Sequence[Path],
+) -> bool:
+    """Check that every staged runtime source is covered by the skill digest.
+
+    ``publication_target`` deliberately identifies only the evaluated target
+    tree. Repository links, full-repository context, and separately configured
+    reference/workspace skills can add agent-visible bytes outside that tree.
+    Until those inputs have their own versioned publication identity, retain
+    the evaluation but fail its publication evidence closed.
+    """
+    try:
+        target = skill_path.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+    if reference_skills_dir is not None:
+        try:
+            reference_metadata = reference_skills_dir.stat()
+            if not stat.S_ISDIR(reference_metadata.st_mode):
+                return False
+            if not _runtime_source_is_bound_to_target(reference_skills_dir, target):
+                return False
+            reference_candidates: list[Path] = []
+            for path in reference_skills_dir.iterdir():
+                if path.name.startswith("."):
+                    continue
+                child_metadata = path.stat()
+                if stat.S_ISDIR(child_metadata.st_mode):
+                    reference_candidates.append(path)
+            if any(not _runtime_source_is_bound_to_target(path, target) for path in reference_candidates):
+                return False
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    if any(not _runtime_source_is_bound_to_target(path, target) for path in workspace_skill_paths):
+        return False
+
+    for task_path in task_paths:
+        if _task_stages_digest_excluded_entries(task_path):
+            return False
+        environment_path = task_path / "environment"
+        context_path = environment_path / "repo-context.json"
+        staged_repo_context = False
+        for staged_name in ("repo", "repo-linked-root"):
+            try:
+                (environment_path / staged_name).lstat()
+                staged_repo_context = True
+            except FileNotFoundError:
+                continue
+            except (OSError, RuntimeError, ValueError):
+                return False
+        try:
+            context_path.lstat()
+        except FileNotFoundError:
+            if staged_repo_context:
+                return False
+            continue
+        except (OSError, RuntimeError, ValueError):
+            return False
+        try:
+            encoded_context = _read_regular_evals_file(
+                context_path,
+                label="Repo context metadata",
+                max_bytes=_MAX_REPO_CONTEXT_METADATA_BYTES,
+                allowed_root=task_path,
+            )
+            context = json.loads(encoded_context.decode("utf-8"))
+            files = context.get("files") if isinstance(context, dict) else None
+        except (OSError, RecursionError, UnicodeError, ValueError):
+            return False
+        if not isinstance(files, list):
+            return False
+        mode = context.get("mode")
+        if mode not in {"full", "linked"}:
+            return False
+        for entry in files:
+            source = entry.get("source") if isinstance(entry, dict) else None
+            if (
+                not isinstance(source, str)
+                or not source
+                or not Path(source).is_absolute()
+                or not _runtime_source_is_bound_to_target(Path(source), target)
+            ):
+                return False
+        # Repository projection depends on source bytes and topology outside
+        # the target-only digest (and full mode additionally depends on
+        # excluded Git/operator selection state). Keep the run, but do not let
+        # any nonempty repo context certify this target identity.
+        if files or staged_repo_context:
+            return False
+    return True
+
+
+PUBLISHED_EXECUTION_ERRORS_MAX = 256
+PUBLISHED_EXECUTION_ERROR_MAX_CHARS = 4096
+PUBLISHED_EXECUTION_ERROR_MAX_SERIALIZED_BYTES = 4096
+PUBLISHED_EXECUTION_ERRORS_MAX_SERIALIZED_BYTES = 64 * 1024
+_EXECUTION_ERROR_TRUNCATION_MARKER = "...<truncated>"
+_MAX_JSON_SAFE_INTEGER = (1 << 53) - 1
+FINAL_RESULT_MAX_BYTES = 2 * 1024 * 1024
+FINAL_RESULT_MAX_DEPTH = 64
+FINAL_RESULT_MAX_NODES = 50_000
+_FINAL_RESULT_PROJECTION_SCHEMA_VERSION = "1.0"
+_FINAL_RESULT_CONTRACT_ERROR = (
+    "Final Tier 3 result exceeds the 2 MiB, depth-64, or 50,000-node publication limit after artifact projection"
+)
+# Shared with the NeMo Gym backend, so both give the same advice for a skill without a dataset.
+_MISSING_EVALS_DATASET_ERROR = (
+    "No evals/evals.json found. Add task guidance in evals/EVAL.md or pass --prompt to "
+    "create-eval-dataset; add --grounding skill for an explicit skill-only starter, or author a dataset."
+)
+
+
+class _FinalResultContractError(ValueError):
+    """Raised before publishing a result the report loader cannot read."""
+
+
+def _reject_nonfinite_json_constant(_constant: str) -> NoReturn:
+    """Reject JSON constants that are outside the interoperable JSON grammar."""
+    raise ValueError("non-finite JSON number")
+
+
+def _validate_final_result_tree(value: object) -> None:
+    """Match the structural envelope enforced by the report JSON loader."""
+    nodes = 0
+    stack: list[tuple[object, int]] = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > FINAL_RESULT_MAX_NODES:
+            raise _FinalResultContractError(_FINAL_RESULT_CONTRACT_ERROR)
+        if not isinstance(current, dict | list):
+            continue
+        if depth > FINAL_RESULT_MAX_DEPTH or nodes + len(current) > FINAL_RESULT_MAX_NODES:
+            raise _FinalResultContractError(_FINAL_RESULT_CONTRACT_ERROR)
+        children = current.values() if isinstance(current, dict) else current
+        stack.extend((child, depth + 1) for child in children)
+
+
+def _encode_final_result(value: dict[str, Any]) -> bytes:
+    """Serialize one final result only when the browser/report loader can consume it."""
+    _validate_final_result_tree(value)
+    encoded = _serialize_final_result(value)
+    if len(encoded) > FINAL_RESULT_MAX_BYTES:
+        raise _FinalResultContractError(_FINAL_RESULT_CONTRACT_ERROR)
+    return encoded
+
+
+def _serialize_final_result(value: dict[str, Any]) -> bytes:
+    """Serialize valid JSON without applying the publication size envelope."""
+    try:
+        return json.dumps(value, indent=2, allow_nan=False).encode("utf-8")
+    except (MemoryError, RecursionError, TypeError, UnicodeError, ValueError):
+        raise _FinalResultContractError(_FINAL_RESULT_CONTRACT_ERROR) from None
+
+
+def _result_artifact_reference(run_dir: Path, relative: Path) -> dict[str, Any] | None:
+    """Describe one regular contained artifact by stable relative path and digest."""
+    if relative.is_absolute() or not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        return None
+    try:
+        with SecureRoot(run_dir) as secure_root:
+            raw, _metadata = secure_root.read_bytes(relative, FINAL_RESULT_MAX_BYTES)
+        decoded = json.loads(
+            raw,
+            parse_constant=_reject_nonfinite_json_constant,
+        )
+        if not isinstance(decoded, dict):
+            return None
+        _validate_final_result_tree(decoded)
+    except (OSError, RecursionError, RuntimeError, SecurePathError, UnicodeError, ValueError):
+        return None
+    return {
+        "path": relative.as_posix(),
+        "bytes": len(raw),
+        "sha256": f"sha256:{hashlib.sha256(raw).hexdigest()}",
+    }
+
+
+def _compact_pass_detail(value: object, *, artifact_key: str) -> object:
+    """Retain exact pass aggregates while referencing persisted case details."""
+    if not isinstance(value, dict):
+        return value
+    compact = dict(value)
+    if isinstance(compact.get("cases"), dict):
+        compact["cases"] = {}
+    if isinstance(compact.get("extra_cases"), list):
+        compact["extra_cases"] = []
+    compact["detail_projection"] = {
+        "artifact": artifact_key,
+        "json_pointer": "/pass_at_k",
+    }
+    return compact
+
+
+def _compact_condition_detail(value: object, *, artifact_key: str) -> object:
+    """Retain condition truth while sampling diagnostics stored in its summary."""
+    if not isinstance(value, dict):
+        return value
+    compact = dict(value)
+    raw_errors = compact.get("execution_errors")
+    errors = [str(error) for error in raw_errors if str(error)] if isinstance(raw_errors, list) else []
+    total = compact.get("execution_error_details_total")
+    exact_total = (
+        total if isinstance(total, int) and not isinstance(total, bool) and total >= len(errors) else len(errors)
+    )
+    compact["execution_errors"] = errors[:1]
+    compact["execution_error_details_total"] = exact_total
+    compact["execution_error_details_shown"] = len(compact["execution_errors"])
+    compact["execution_error_details_truncated"] = len(compact["execution_errors"]) < exact_total
+    compact["detail_projection"] = {
+        "artifact": artifact_key,
+        "json_pointer": "",
+    }
+    return compact
+
+
+def _compact_agent_result(
+    agent: str,
+    value: object,
+    *,
+    run_dir: Path,
+) -> tuple[object, dict[str, Any], list[str]]:
+    """Project duplicated agent detail only when its canonical artifact exists."""
+    if not isinstance(value, dict) or Path(agent).name != agent or agent in {"", ".", ".."}:
+        return value, {}, []
+    compact = dict(value)
+    artifact_paths = {
+        "with_skill_summary": Path(agent) / "with-skill" / "summary.json",
+        "without_skill_summary": Path(agent) / "without-skill" / "summary.json",
+        "lift": Path(agent) / "lift.json",
+        "custom_lift": Path(agent) / "custom_lift.json",
+        "pass_at_k_lift": Path(agent) / "pass_at_k_lift.json",
+        "security_attribution": Path(agent) / "security_attribution.json",
+    }
+    references = {
+        key: reference
+        for key, relative in artifact_paths.items()
+        if (reference := _result_artifact_reference(run_dir, relative)) is not None
+    }
+    omitted: list[str] = []
+
+    raw_pass = compact.get("pass_at_k")
+    if isinstance(raw_pass, dict):
+        pass_at_k = dict(raw_pass)
+        for condition, artifact_key in (
+            ("with_skill", "with_skill_summary"),
+            ("without_skill", "without_skill_summary"),
+        ):
+            condition_pass = pass_at_k.get(condition)
+            if artifact_key not in references or not isinstance(condition_pass, dict):
+                continue
+            omitted_pass_fields: list[str] = []
+            if isinstance(condition_pass.get("cases"), dict) and condition_pass["cases"]:
+                omitted_pass_fields.append("cases")
+            if isinstance(condition_pass.get("extra_cases"), list) and condition_pass["extra_cases"]:
+                omitted_pass_fields.append("extra_cases")
+            if omitted_pass_fields:
+                pass_at_k[condition] = _compact_pass_detail(condition_pass, artifact_key=artifact_key)
+                omitted.extend(f"pass_at_k.{condition}.{field}" for field in omitted_pass_fields)
+        compact["pass_at_k"] = pass_at_k
+
+    if "security_attribution" in references and isinstance(compact.get("security_attribution"), dict):
+        security = dict(compact["security_attribution"])
+        if isinstance(security.get("cases"), dict) and security["cases"]:
+            security["cases"] = {}
+            omitted.append("security_attribution.cases")
+            security["detail_projection"] = {
+                "artifact": "security_attribution",
+                "json_pointer": "",
+            }
+            compact["security_attribution"] = security
+
+    conditions = compact.get("conditions")
+    if isinstance(conditions, dict):
+        compact_conditions = dict(conditions)
+        for condition, artifact_key in (
+            ("with_skill", "with_skill_summary"),
+            ("without_skill", "without_skill_summary"),
+        ):
+            condition_detail = compact_conditions.get(condition)
+            if (
+                artifact_key in references
+                and isinstance(condition_detail, dict)
+                and isinstance(condition_detail.get("execution_errors"), list)
+                and condition_detail["execution_errors"]
+            ):
+                compact_conditions[condition] = _compact_condition_detail(
+                    condition_detail,
+                    artifact_key=artifact_key,
+                )
+                omitted.append(f"conditions.{condition}.execution_errors")
+        compact["conditions"] = compact_conditions
+
+    for failure_field in ("agent_runtime_failures", "trial_failures"):
+        raw_failures = compact.get(failure_field)
+        if not isinstance(raw_failures, dict):
+            continue
+        projected_failures = dict(raw_failures)
+        for condition, artifact_key in (
+            ("with_skill", "with_skill_summary"),
+            ("without_skill", "without_skill_summary"),
+        ):
+            if (
+                artifact_key in references
+                and isinstance(projected_failures.get(condition), list)
+                and projected_failures[condition]
+            ):
+                projected_failures[condition] = []
+                omitted.append(f"{failure_field}.{condition}")
+        compact[failure_field] = projected_failures
+
+    job_failures = compact.get("job_failures")
+    if isinstance(job_failures, dict):
+        projected_job_failures = dict(job_failures)
+        for condition, artifact_key in (
+            ("with_skill", "with_skill_summary"),
+            ("without_skill", "without_skill_summary"),
+        ):
+            if (
+                artifact_key in references
+                and isinstance(projected_job_failures.get(condition), str)
+                and projected_job_failures[condition]
+            ):
+                projected_job_failures[condition] = ""
+                omitted.append(f"job_failures.{condition}")
+        compact["job_failures"] = projected_job_failures
+
+    raw_agent_errors = compact.get("execution_errors")
+    if isinstance(raw_agent_errors, list) and raw_agent_errors and references:
+        agent_errors = [str(error) for error in raw_agent_errors if str(error)]
+        total = compact.get("execution_error_details_total")
+        exact_total = (
+            total
+            if isinstance(total, int) and not isinstance(total, bool) and total >= len(agent_errors)
+            else len(agent_errors)
+        )
+        compact["execution_errors"] = agent_errors[:1]
+        compact["execution_error_details_total"] = exact_total
+        compact["execution_error_details_shown"] = len(compact["execution_errors"])
+        compact["execution_error_details_truncated"] = len(compact["execution_errors"]) < exact_total
+        omitted.append("execution_errors")
+
+    raw_coverage = compact.get("declarative_checks")
+    if isinstance(raw_coverage, dict):
+        # Cap the per-check rows; every count and per-reward denominator stays exact.
+        compact_coverage, dropped_checks = compact_declarative_checks(raw_coverage)
+        if dropped_checks:
+            compact["declarative_checks"] = compact_coverage
+            omitted.extend(
+                f"declarative_checks.{arm}.results"
+                for arm, data in compact_coverage.items()
+                if data is not raw_coverage[arm]
+            )
+
+    if omitted:
+        compact["detail_projection"] = {
+            "artifacts": sorted(references),
+            "omitted_fields": sorted(set(omitted)),
+        }
+    return compact, references, sorted(set(omitted))
+
+
+def _persisted_result_projection(result: dict[str, Any], *, run_dir: Path) -> dict[str, Any]:
+    """Build a compact on-disk result while leaving the returned result complete."""
+    projected = dict(result)
+    projected_agents: dict[str, Any] = {}
+    projection_agents: dict[str, Any] = {}
+    omitted_fields: dict[str, list[str]] = {}
+    raw_agents = result.get("agents")
+    if isinstance(raw_agents, dict):
+        for agent, value in raw_agents.items():
+            compact, references, omitted = _compact_agent_result(str(agent), value, run_dir=run_dir)
+            projected_agents[str(agent)] = compact
+            if references:
+                projection_agents[str(agent)] = references
+            if omitted:
+                omitted_fields[str(agent)] = omitted
+        projected["agents"] = projected_agents
+
+    root_omitted: list[str] = []
+    has_summary_references = any(
+        "with_skill_summary" in references or "without_skill_summary" in references
+        for references in projection_agents.values()
+    )
+    raw_root_errors = projected.get("execution_errors")
+    if has_summary_references and isinstance(raw_root_errors, list):
+        root_errors, observed_total = _published_execution_errors(raw_root_errors)
+        declared_total = projected.get("execution_error_details_total")
+        exact_total = (
+            declared_total
+            if isinstance(declared_total, int)
+            and not isinstance(declared_total, bool)
+            and declared_total >= observed_total
+            else observed_total
+        )
+        compact_root_errors = root_errors[:1]
+        if compact_root_errors != raw_root_errors:
+            projected["execution_errors"] = compact_root_errors
+            root_omitted.append("execution_errors")
+        projected["execution_error_details_total"] = exact_total
+        projected["execution_error_details_shown"] = len(compact_root_errors)
+        projected["execution_error_details_truncated"] = len(compact_root_errors) < exact_total
+        if projected.get("error") != compact_root_errors:
+            projected["error"] = compact_root_errors
+            root_omitted.append("error")
+
+    projection = {
+        "schema_version": _FINAL_RESULT_PROJECTION_SCHEMA_VERSION,
+        "mode": "artifact_referenced" if omitted_fields or root_omitted else "inline",
+        "returned_result": "full",
+        "persisted_result": "compact" if omitted_fields or root_omitted else "inline",
+        "agents": projection_agents,
+        "omitted_detail_fields": omitted_fields,
+        "omitted_root_detail_fields": sorted(set(root_omitted)),
+    }
+    result["result_projection"] = projection
+    projected["result_projection"] = projection
+    return projected
+
+
+def _write_final_result(result_path: Path, result: dict[str, Any]) -> dict[str, Any]:
+    """Project, validate, and atomically publish the final result contract."""
+    inline_projection = {
+        "schema_version": _FINAL_RESULT_PROJECTION_SCHEMA_VERSION,
+        "mode": "inline",
+        "returned_result": "full",
+        "persisted_result": "inline",
+        "agents": {},
+        "omitted_detail_fields": {},
+        "omitted_root_detail_fields": [],
+    }
+    result["result_projection"] = inline_projection
+    full_encoded = _serialize_final_result(result)
+    try:
+        _validate_final_result_tree(result)
+    except _FinalResultContractError:
+        pass
+    else:
+        if len(full_encoded) <= FINAL_RESULT_MAX_BYTES:
+            write_output_file_atomically(result_path, full_encoded)
+            return result
+
+    projected = _persisted_result_projection(result, run_dir=result_path.parent)
+    encoded = _encode_final_result(projected)
+    write_output_file_atomically(result_path, encoded)
+    return projected
+
+
+def _serialized_json_bytes(value: object) -> int:
+    """Return bytes produced by the same JSON settings used for result files."""
+    return len(json.dumps(value, indent=2).encode("utf-8"))
+
+
+def _bounded_execution_error(value: object) -> str:
+    """Redact and bound one diagnostic by characters and serialized bytes."""
+    redacted = redact_sensitive_text(str(value))
+    safe = "".join(character if character.isprintable() else " " for character in redacted).strip()
+    if not safe:
+        return ""
+    if (
+        len(safe) <= PUBLISHED_EXECUTION_ERROR_MAX_CHARS
+        and _serialized_json_bytes(safe) <= PUBLISHED_EXECUTION_ERROR_MAX_SERIALIZED_BYTES
+    ):
+        return safe
+
+    maximum_prefix_chars = min(
+        len(safe),
+        PUBLISHED_EXECUTION_ERROR_MAX_CHARS - len(_EXECUTION_ERROR_TRUNCATION_MARKER),
+    )
+    lower = 0
+    upper = maximum_prefix_chars
+    while lower < upper:
+        middle = (lower + upper + 1) // 2
+        candidate = safe[:middle] + _EXECUTION_ERROR_TRUNCATION_MARKER
+        if _serialized_json_bytes(candidate) <= PUBLISHED_EXECUTION_ERROR_MAX_SERIALIZED_BYTES:
+            lower = middle
+        else:
+            upper = middle - 1
+    return safe[:lower] + _EXECUTION_ERROR_TRUNCATION_MARKER
+
+
+def _published_execution_errors(errors: list[object]) -> tuple[list[str], int]:
+    """Return a redacted, byte-bounded, de-duplicated diagnostic sample."""
+    published: list[str] = []
+    seen_details: set[str] = set()
+    seen_publications: set[str] = set()
+    for error in errors:
+        redacted = redact_sensitive_text(str(error))
+        detail = "".join(character if character.isprintable() else " " for character in redacted).strip()
+        if not detail or detail in seen_details:
+            continue
+        seen_details.add(detail)
+        safe = _bounded_execution_error(detail)
+        if safe in seen_publications:
+            continue
+        seen_publications.add(safe)
+        if (
+            len(published) < PUBLISHED_EXECUTION_ERRORS_MAX
+            and _serialized_json_bytes([*published, safe]) <= PUBLISHED_EXECUTION_ERRORS_MAX_SERIALIZED_BYTES
+        ):
+            published.append(safe)
+    return published, len(seen_details)
+
+
+def _merge_launch_execution_errors(result: dict[str, Any], launch_errors: list[object]) -> None:
+    """Overlay launch diagnostics without discarding hidden collector counts."""
+    raw_existing = result.get("execution_errors", [])
+    if isinstance(raw_existing, list):
+        existing: list[object] = raw_existing
+    elif raw_existing:
+        existing = [raw_existing]
+    else:
+        existing = []
+
+    _, observed_existing_total = _published_execution_errors(existing)
+    execution_errors, observed_combined_total = _published_execution_errors([*existing, *launch_errors])
+    new_launch_total = max(0, observed_combined_total - observed_existing_total)
+
+    raw_declared_total = result.get("execution_error_details_total")
+    if isinstance(raw_declared_total, int) and not isinstance(raw_declared_total, bool) and raw_declared_total >= 0:
+        declared_total = min(raw_declared_total, _MAX_JSON_SAFE_INTEGER)
+    else:
+        declared_total = observed_existing_total
+    declared_total = max(declared_total, observed_existing_total)
+
+    collector_truncated = result.get("execution_error_details_truncated") is True
+    error_total = min(_MAX_JSON_SAFE_INTEGER, declared_total + new_launch_total)
+
+    result["execution_status"] = "failed"
+    result["execution_errors"] = execution_errors
+    result["execution_error_details_total"] = error_total
+    result["execution_error_details_shown"] = len(execution_errors)
+    result["execution_error_details_truncated"] = collector_truncated or len(execution_errors) < error_total
+    # ``execution_errors`` is authoritative; ``error`` remains a compact
+    # list-shaped compatibility alias for older callers.
+    result["error"] = execution_errors[:1]
+
+
+def _persist_dataset_truth(run_dir: Path, *, fallback_task_ids: list[str]) -> dict[str, Any]:
+    """Persist immutable dataset and evaluator identity before staging cleanup."""
+    entries = load_staged_harbor_dataset(run_dir)
+    if getattr(entries, "_report_truncation", None):
+        raise DatasetSnapshotContractError
+    if not entries:
+        entries = [{"id": task_id} for task_id in fallback_task_ids]
+    try:
+        snapshot = build_dataset_snapshot(entries, evaluator_version=__version__)
+        encoded = encode_dataset_snapshot(snapshot)
+    except DatasetSnapshotContractError:
+        raise
+    except (MemoryError, RecursionError, TypeError, UnicodeError, ValueError):
+        raise DatasetSnapshotContractError from None
+    target = run_dir / "dataset_snapshot.json"
+    write_output_file_atomically(target, encoded)
+    return snapshot
+
+
+def _dataset_generation_provenance(skill_path: Path) -> dict[str, Any] | None:
+    source = find_evals_file(skill_path)
+    if source is None or source.suffix.lower() not in {".json", ".yaml", ".yml"}:
+        return None
+    import yaml
+
+    try:
+        if source.suffix.lower() == ".json":
+            document = json.loads(source.read_text(encoding="utf-8"))
+        else:
+            document = yaml.safe_load(source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, yaml.YAMLError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    from skillevaluator.tier3.dataset_provenance import sanitize_generation_record
+
+    generation = document.get("generation")
+    if isinstance(generation, dict):
+        generation = dict(generation)
+        eval_entries = document.get("evals")
+        if isinstance(eval_entries, list):
+            needs_review_count = sum(
+                1
+                for entry in eval_entries
+                if isinstance(entry, dict)
+                and isinstance(entry.get("review"), dict)
+                and entry["review"].get("status") == "needs_review"
+            )
+            generation["needs_review_count"] = needs_review_count
+            if needs_review_count > 0:
+                generation["review_state"] = "needs_review"
+            elif generation.get("review_state") == "needs_review":
+                generation["review_state"] = "unreviewed"
+    return sanitize_generation_record(generation)
+
+
+_NVIDIA_BUILD_FILE_SENTINEL = "skillevaluator-file-backed-nvidia-key"
+_NVIDIA_BUILD_KEY_FILE_ENV = "SKILLEVALUATOR_NVIDIA_API_KEY_FILE"
+_NVIDIA_BUILD_AGENT_DEFAULT_MODEL = CHAT_DEFAULT_NVIDIA
+_GATEWAY_CODEX_IMPORT_PATH = "skillevaluator.tier3.harbor.local_agents:SkillEvaluatorGatewayCodex"
+_GATEWAY_CLAUDE_IMPORT_PATH = "skillevaluator.tier3.harbor.local_agents:SkillEvaluatorGatewayClaudeCode"
+# The OpenAI-compatible gateway wrappers and container agent wrappers are
+# allowed on Harbor-native backends (including GKE).
+_NATIVE_BACKEND_AGENT_IMPORT_PATHS = frozenset(
+    {
+        _GATEWAY_CODEX_IMPORT_PATH,
+        _GATEWAY_CLAUDE_IMPORT_PATH,
+        *CONTAINER_AGENT_IMPORT_PATHS.values(),
+    }
+)
+_HARBOR_RUN_OUTPUT_MAX_BYTES = MAX_COMMAND_OUTPUT_BYTES
+_HARBOR_RUN_DIAGNOSTIC_TAIL_CHARS = 16 * 1024
+_HARBOR_RUN_OUTPUT_READ_BYTES = 64 * 1024
+_HARBOR_RUN_POLL_SECONDS = 0.01
+_HARBOR_RUN_TERMINATE_SECONDS = 0.1
+# Harbor turns SIGTERM into KeyboardInterrupt and then stops its trial
+# environments (for example removing Docker containers). An interrupted run
+# waits this long for that cleanup before it kills the process group.
+_HARBOR_RUN_CANCEL_GRACE_SECONDS = 30.0
+_HARBOR_RUN_CANCEL_POLL_SECONDS = 0.1
+# Progress detail for an agent whose Harbor jobs are stopping. The hint comes
+# first and is short, so the Rich progress row, which is cut to the terminal
+# width, still shows it at 80 columns next to the longest built-in stage label,
+# with columns to spare.
+_HARBOR_RUN_STOPPING_DETAIL = (
+    f"2nd Ctrl+C skips wait; stopping Harbor jobs, up to {_HARBOR_RUN_CANCEL_GRACE_SECONDS:g}s of environment cleanup"
+)
+_HARBOR_RUN_REAP_SECONDS = 5.0
+# ``taskkill /T /F`` has to look the task tree up before it kills anything, and
+# that lookup can take longer than reaping a process that was already signalled.
+# Cutting it short leaves the tree running and replaces the run's own error with
+# a cleanup error, so the tree kill gets its own, longer bound. A second Ctrl+C
+# (``_HarborRunCancellation.forced``) still ends the wait early.
+_HARBOR_WINDOWS_TREE_KILL_SECONDS = 30.0
+
+
+@dataclass(frozen=True)
+class _BoundedHarborProcessResult:
+    returncode: int
+    output_tail: str
+    output_exceeded: bool
+
+
+class _HarborRunTimeoutError(RuntimeError):
+    """Raised after timed-out Harbor orchestration cleanup completes."""
+
+
+class _HarborRunCancelledError(BaseException):
+    """Raised on a worker thread once an interrupted run's Harbor job is contained.
+
+    Like ``KeyboardInterrupt``, it bypasses ``except Exception`` handlers that
+    record ordinary job failures, so a cancelled run stops instead of moving on
+    to its next attempt or condition.
+    """
+
+
+class _HarborCancellationEvent(threading.Event):
+    def __init__(self) -> None:
+        super().__init__()
+        self._callbacks: list[Callable[[], None]] = []
+        self._callback_lock = threading.Lock()
+
+    def add_callback(self, callback: Callable[[], None]) -> None:
+        with self._callback_lock:
+            self._callbacks.append(callback)
+        if self.is_set():
+            callback()
+
+    def remove_callback(self, callback: Callable[[], None]) -> None:
+        with self._callback_lock:
+            self._callbacks.remove(callback)
+
+    def set(self) -> None:
+        super().set()
+        with self._callback_lock:
+            callbacks = tuple(self._callbacks)
+        for callback in callbacks:
+            callback()
+
+
+@dataclass(frozen=True, eq=False)
+class _HarborRunCancellation:
+    """Cross-thread stop request for the Harbor jobs of an interrupted run.
+
+    Ctrl+C reaches only the coordinating thread. Setting ``requested`` stops new
+    Harbor launches and sends running jobs SIGTERM with a cleanup grace period;
+    setting ``forced`` (a second Ctrl+C) ends that grace period early.
+    """
+
+    requested: _HarborCancellationEvent = field(default_factory=_HarborCancellationEvent)
+    forced: threading.Event = field(default_factory=threading.Event)
+
+    def raise_if_requested(self) -> None:
+        if self.requested.is_set():
+            raise _HarborRunCancelledError("Tier 3 evaluation was interrupted before this Harbor job started")
+
+
+def _redact_harbor_diagnostic(detail: object, *, secret_values: set[str]) -> str:
+    """Normalize a complete diagnostic, then remove synthesized exact secrets."""
+    normalized = redact_progress_detail(detail, secret_values=secret_values)
+    exact_redactor = StreamingSecretRedactor(value for value in secret_values if len(value) >= 4)
+    return exact_redactor.feed(normalized) + exact_redactor.finish()
+
+
+def _reserve_run_dir(results_root: Path, timestamp: str) -> Path:
+    """Atomically reserve and authenticate a unique run directory."""
+    results_root.mkdir(parents=True, exist_ok=True)
+    for _ in range(100):
+        run_id = f"{timestamp}_{os.getpid()}_{uuid4().hex[:12]}"
+        run_dir = results_root / run_id
+        try:
+            run_dir.mkdir()
+        except FileExistsError:
+            continue
+        reservation_metadata = run_dir.lstat()
+        reservation_identity = reservation_metadata.st_dev, reservation_metadata.st_ino
+        try:
+            mark_generated_output_root(run_dir)
+        except Exception:
+            if not remove_generated_output_root_if_owned(run_dir, expected_identity=reservation_identity):
+                remove_output_reservation_if_identity_matches(run_dir, reservation_identity)
+            raise
+        return run_dir
+    raise RuntimeError("Could not reserve a unique Tier 3 run directory")
+
+
+_TRUSTED_NETWORK_HOST_ENV_VARS = frozenset(
+    {
+        "ALL_PROXY",
+        "CURL_CA_BUNDLE",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "NO_PROXY",
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    }
+)
+_HARBOR_BASE_ENV_VARS = _TRUSTED_NETWORK_HOST_ENV_VARS | {
+    "COMSPEC",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "PATH",
+    "PATHEXT",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMW6432",
+    "PYTHONIOENCODING",
+    "PYTHONUTF8",
+    "SKILLEVALUATOR_ALLOWED_MCP_HOSTS",
+    "SKILLEVALUATOR_ALLOWED_MCP_SECRETS",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USERPROFILE",
+    "WINDIR",
+    "XDG_RUNTIME_DIR",
+}
+_AWS_HOST_ENV_VARS = frozenset(
+    {
+        "AWS_ACCOUNT_ID",
+        "AWS_ACCOUNT_ID_ENDPOINT_MODE",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_AUTH_SCHEME_PREFERENCE",
+        "AWS_CA_BUNDLE",
+        "AWS_CONFIG_FILE",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CREDENTIAL_EXPIRATION",
+        "AWS_CREDENTIAL_FILE",
+        "AWS_CSM_CLIENT_ID",
+        "AWS_CSM_ENABLED",
+        "AWS_CSM_HOST",
+        "AWS_CSM_PORT",
+        "AWS_DATA_PATH",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_DEFAULT_REGION",
+        "AWS_DEFAULTS_MODE",
+        "AWS_DISABLE_HOST_PREFIX_INJECTION",
+        "AWS_DISABLE_REQUEST_COMPRESSION",
+        "AWS_EC2_METADATA_DISABLED",
+        "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+        "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE",
+        "AWS_EC2_METADATA_V1_DISABLED",
+        "AWS_ENDPOINT_DISCOVERY_ENABLED",
+        "AWS_ENDPOINT_URL",
+        "AWS_ENDPOINT_URL_SIGNIN",
+        "AWS_ENDPOINT_URL_SSO",
+        "AWS_ENDPOINT_URL_SSO_OIDC",
+        "AWS_ENDPOINT_URL_STS",
+        "AWS_EXECUTION_ENV",
+        "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS",
+        "AWS_IMDS_USE_IPV6",
+        "AWS_LOGIN_CACHE_DIRECTORY",
+        "AWS_MAX_ATTEMPTS",
+        "AWS_METADATA_SERVICE_NUM_ATTEMPTS",
+        "AWS_METADATA_SERVICE_TIMEOUT",
+        "AWS_NEW_RETRIES_2026",
+        "AWS_PROFILE",
+        "AWS_REGION",
+        "AWS_REQUEST_CHECKSUM_CALCULATION",
+        "AWS_REQUEST_MIN_COMPRESSION_SIZE_BYTES",
+        "AWS_RESPONSE_CHECKSUM_VALIDATION",
+        "AWS_RETRY_MODE",
+        "AWS_ROLE_ARN",
+        "AWS_ROLE_SESSION_NAME",
+        "AWS_SDK_LOAD_CONFIG",
+        "AWS_SDK_UA_APP_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SECURITY_TOKEN",
+        "AWS_SESSION_TOKEN",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_SIGV4A_SIGNING_REGION_SET",
+        "AWS_STS_REGIONAL_ENDPOINTS",
+        "AWS_USE_DUALSTACK_ENDPOINT",
+        "AWS_USE_FIPS_ENDPOINT",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "BOTOCORE_TCP_KEEPALIVE",
+    }
+)
+_ADC_HOST_ENV_VARS = ADC_DISCOVERY_ENV_VARS
+_VERTEX_HOST_ENV_VARS = frozenset(
+    {
+        "ANTHROPIC_VERTEX_PROJECT_ID",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLOUD_ML_REGION",
+        "SKILLEVALUATOR_GKE_ALLOW_WORKLOAD_IDENTITY",
+        *_ADC_HOST_ENV_VARS,
+    }
+)
+_EC2_HOST_ENV_VARS = _AWS_HOST_ENV_VARS | {"AWS_ENDPOINT_URL_EC2", "SSH_AUTH_SOCK"}
+_DOCKER_HOST_ENV_VARS = frozenset(
+    {
+        "COMPOSE_ANSI",
+        "COMPOSE_HTTP_TIMEOUT",
+        "COMPOSE_IGNORE_ORPHANS",
+        "COMPOSE_PARALLEL_LIMIT",
+        "COMPOSE_PROGRESS",
+        "COMPOSE_STATUS_STDOUT",
+        "DOCKER_API_VERSION",
+        "DOCKER_AUTH_CONFIG",
+        "DOCKER_CERT_PATH",
+        "DOCKER_CONFIG",
+        "DOCKER_CONTEXT",
+        "DOCKER_CUSTOM_HEADERS",
+        "DOCKER_DEFAULT_PLATFORM",
+        "DOCKER_HOST",
+        "DOCKER_TLS",
+        "DOCKER_TLS_VERIFY",
+        "SSH_AUTH_SOCK",
+    }
+)
+_HARBOR_ENV_MODE_VARS = {
+    "docker": _DOCKER_HOST_ENV_VARS,
+    "kata": _DOCKER_HOST_ENV_VARS,
+    "daytona": frozenset(
+        {
+            "DAYTONA_API_KEY",
+            "DAYTONA_API_URL",
+            "DAYTONA_HAPPY_EYEBALLS_DELAY",
+            "DAYTONA_JWT_TOKEN",
+            "DAYTONA_ORGANIZATION_ID",
+            "DAYTONA_SERVER_URL",
+            "DAYTONA_TARGET",
+        }
+    ),
+    "e2b": frozenset({"E2B_API_KEY", "E2B_API_URL", "E2B_DOMAIN", "E2B_SANDBOX_URL"}),
+    "modal": frozenset(
+        {
+            "MODAL_CONFIG_PATH",
+            "MODAL_ENVIRONMENT",
+            "MODAL_OVERRIDE_HEADERS",
+            "MODAL_PROFILE",
+            "MODAL_SERVER_URL",
+            "MODAL_TOKEN_ID",
+            "MODAL_TOKEN_SECRET",
+        }
+    ),
+    "runloop": frozenset({"RUNLOOP_API_KEY", "RUNLOOP_BASE_URL", "RUNLOOP_CUSTOM_HEADERS"}),
+    "langsmith": frozenset(
+        {
+            "LANGCHAIN_API_KEY",
+            "LANGCHAIN_ENDPOINT",
+            "LANGSMITH_API_KEY",
+            "LANGSMITH_CONFIG_FILE",
+            "LANGSMITH_ENDPOINT",
+            "LANGSMITH_PROFILE",
+            "LANGSMITH_SANDBOX_API_URL",
+            "LANGSMITH_WORKSPACE_ID",
+        }
+    ),
+    "ec2": _EC2_HOST_ENV_VARS,
+    "gke": frozenset(
+        {
+            "CLOUDSDK_ACTIVE_CONFIG_NAME",
+            "CLOUDSDK_AUTH_ACCESS_TOKEN",
+            "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+            "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT",
+            "CLOUDSDK_CONFIG",
+            "CLOUDSDK_CORE_ACCOUNT",
+            "CLOUDSDK_CORE_PROJECT",
+            "GCP_PROJECT",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_CLOUD_PROJECT",
+            "GOOGLE_CLOUD_QUOTA_PROJECT",
+            "KUBECONFIG",
+            "SKILLEVALUATOR_GKE_ALLOW_WORKLOAD_IDENTITY",
+            "SKILLEVALUATOR_GKE_AUTOPILOT",
+            "SKILLEVALUATOR_GKE_METADATA_PROBE_IMAGE",
+        }
+    ),
+    "ack": _DOCKER_HOST_ENV_VARS
+    | {
+        "KUBECONFIG",
+        "KUBERNETES_SERVICE_HOST",
+        "KUBERNETES_SERVICE_PORT",
+    },
+    "openshift": frozenset({"KUBECONFIG"}),
+    "novita": frozenset(
+        {
+            "NOVITA_ACCESS_TOKEN",
+            "NOVITA_API_KEY",
+            "NOVITA_API_URL",
+            "NOVITA_BASE_URL",
+            "NOVITA_DOMAIN",
+            "NOVITA_SANDBOX_URL",
+        }
+    ),
+    "apple-container": frozenset(),
+    "singularity": frozenset(
+        {
+            "APPTAINER_AUTHFILE",
+            "APPTAINER_CONFIGDIR",
+            "APPTAINER_DOCKER_PASSWORD",
+            "APPTAINER_DOCKER_USERNAME",
+            "SINGULARITY_AUTHFILE",
+            "SINGULARITY_CONFIGDIR",
+            "SINGULARITY_DOCKER_PASSWORD",
+            "SINGULARITY_DOCKER_USERNAME",
+        }
+    ),
+    "islo": frozenset({"ISLO_API_KEY", "ISLO_API_URL", "ISLO_COMPUTE_URL"}),
+    "tensorlake": frozenset(
+        {
+            "TENSORLAKE_API_KEY",
+            "TENSORLAKE_API_URL",
+            "TENSORLAKE_ORGANIZATION_ID",
+            "TENSORLAKE_PAT",
+            "TENSORLAKE_PROJECT_ID",
+            "TENSORLAKE_SANDBOX_PROXY_URL",
+        }
+    ),
+    "cwsandbox": frozenset({"CWSANDBOX_API_KEY", "CWSANDBOX_BASE_URL"}),
+    "wandb": frozenset({"NETRC", "WANDB_API_KEY", "WANDB_BASE_URL", "WANDB_ENTITY", "WANDB_PROJECT"}),
+    "use-computer": frozenset(
+        {"USE_COMPUTER_API_KEY", "USE_COMPUTER_HOST", "USE_COMPUTER_SNAPSHOT", "USE_COMPUTER_VERSION"}
+    ),
+    "blaxel": frozenset(
+        {
+            "BL_API_KEY",
+            "BL_API_VERSION",
+            "BL_CLIENT_CREDENTIALS",
+            "BL_ENV",
+            "BL_REGION",
+            "BL_WORKSPACE",
+        }
+    ),
+    "beam": frozenset(
+        {
+            "API_HOST",
+            "API_PORT",
+            "BEAM_TOKEN",
+            "GATEWAY_HOST",
+            "GATEWAY_PORT",
+            "INTERNAL_API_HOST",
+            "INTERNAL_API_PORT",
+            "REALTIME_HOST",
+        }
+    ),
+    "skypilot": _DOCKER_HOST_ENV_VARS
+    | frozenset(
+        {
+            "HARBOR_SKYPILOT_REGISTRY",
+            "SKYPILOT_API_SERVER_ENDPOINT",
+            "SKYPILOT_GLOBAL_CONFIG",
+            "SKYPILOT_PROJECT_CONFIG",
+            "SKYPILOT_SERVICE_ACCOUNT_TOKEN",
+        }
+    ),
+    "hyperbrowser": _DOCKER_HOST_ENV_VARS | frozenset({"HYPERBROWSER_API_KEY", "HYPERBROWSER_BASE_URL"}),
+    "vercel": frozenset({"VERCEL_OIDC_TOKEN", "VERCEL_PROJECT_ID", "VERCEL_TEAM_ID", "VERCEL_TOKEN"}),
+    "runta": frozenset({"RUNTA_CONFIG", "RUNTA_ENDPOINT", "RUNTA_TOKEN"}),
+    # The Mosaic SDK still reads the MAR_* names its MOSAIC_* names replaced.
+    "mosaic": frozenset(
+        {
+            "MAR_API_TOKEN",
+            "MAR_CONFIG",
+            "MAR_ENDPOINT",
+            "MOSAIC_API_TOKEN",
+            "MOSAIC_API_URL",
+            "MOSAIC_CONFIG",
+            "MOSAIC_REGISTRY_PASSWORD",
+            "MOSAIC_REGISTRY_USERNAME",
+            "MOSAIC_RETRIES",
+        }
+    ),
+}
+_BEDROCK_HOST_ENV_VARS = _AWS_HOST_ENV_VARS | {
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_CSM_ENABLED",
+    "AWS_CSM_PORT",
+    "AWS_ENDPOINT_URL_BEDROCK",
+    "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+}
+_RUNTIME_ENV_HOST_CONTROL_NAMES = (
+    _RUNTIME_PROCESS_CONTROL_ENV_NAMES
+    | _BEDROCK_HOST_ENV_VARS
+    | _VERTEX_HOST_ENV_VARS
+    | _VERIFIER_JUDGE_CONTROL_ENV_VARS
+)
+_RUNTIME_ENV_HOST_CONTROL_PREFIXES = _RUNTIME_PROCESS_CONTROL_ENV_PREFIXES
+_OPERATOR_OWNED_AGENT_ENV = frozenset(
+    {
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_VERTEX_PROJECT_ID",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLOUD_ML_REGION",
+        "GCP_PROJECT",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CLOUD_PROJECT",
+        "NVIDIA_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        CREDENTIAL_EXPIRY_ENV,
+        CREDENTIAL_SOURCE_ENV,
+        GKE_ALLOW_WORKLOAD_IDENTITY_ENV,
+    }
+)
+_VERTEX_ADC_MAX_JOB_TIMEOUT_SEC = 3300.0
+VERTEX_ADC_JOB_TIMEOUT_ENV = "SKILLEVALUATOR_VERTEX_ADC_JOB_TIMEOUT_SEC"
+GKE_WORKLOAD_IDENTITY_ERROR_MESSAGE = (
+    "CLAUDE_CODE_USE_VERTEX=1 in GKE mode uses single-pod Kubernetes Workload Identity, "
+    "which shares the pod service account and GKE metadata server with evaluated skill "
+    "commands. Restrict this mode to trusted skills by setting "
+    "SKILLEVALUATOR_GKE_ALLOW_WORKLOAD_IDENTITY=1 or --ek allow_workload_identity=1."
+)
+GKE_WORKLOAD_IDENTITY_WARNING_MESSAGE = (
+    "GKE Workload Identity mode shares pod-level GCP Service Account permissions with skill setup scripts "
+    "and agent subprocesses via the Kubernetes metadata server; evaluate only trusted skills in this mode."
+)
+_OPERATOR_SECRET_PREFIXES = (
+    "ANTHROPIC_",
+    "AWS_",
+    "CLAUDE_CODE_",
+    "DAYTONA_",
+    "E2B_",
+    "GCLOUD_",
+    "GCP_",
+    "GOOGLE_",
+    "MODAL_",
+    "NVIDIA_",
+    "OPENAI_",
+    "RUNLOOP_",
+    "SKILL_EVAL_",
+    "SKILLEVALUATOR_",
+)
+
+
+def is_operator_owned_or_provider_secret(name: str) -> bool:
+    """Return True if an environment variable name belongs to operator, provider, or cloud credentials."""
+    cleaned = name.strip()
+    if not cleaned:
+        return False
+    upper = cleaned.upper()
+    if upper in _OPERATOR_OWNED_AGENT_ENV or upper in _VERIFIER_JUDGE_MODEL_ENV_VARS or upper == "KUBECONFIG":
+        return True
+    return upper.startswith(_OPERATOR_SECRET_PREFIXES)
+
+
+# Harbor's stock agents read these from the Harbor process and can copy them into
+# the trial sandbox, so a backend may never forward them.
+_BACKEND_REFUSED_HOST_ENV_PREFIXES = (
+    "ANTHROPIC_",
+    "CLAUDE_",
+    "CODEX_",
+    "GEMINI_",
+    "GH_",
+    "GITHUB_",
+    "GITLAB_",
+    "HF_",
+    "HUGGING_FACE_",
+    "OPENAI_",
+    "OPENCODE_",
+)
+# Shared, non-secret cluster configuration a Kubernetes-backed backend may need.
+_BACKEND_ALLOWED_SHARED_HOST_ENV = frozenset({"KUBECONFIG"})
+
+
+def _backend_may_forward(name: str) -> bool:
+    upper = name.upper()
+    if upper in _HARBOR_BASE_ENV_VARS or upper in _BACKEND_ALLOWED_SHARED_HOST_ENV:
+        return True
+    other_backend_secret = any(upper in names and is_sensitive_key(upper) for names in _HARBOR_ENV_MODE_VARS.values())
+    return not (
+        upper in _OPERATOR_OWNED_AGENT_ENV
+        or upper in _RUNTIME_ENV_HOST_CONTROL_NAMES
+        or upper.startswith(_RUNTIME_ENV_HOST_CONTROL_PREFIXES)
+        or upper.startswith(_BACKEND_REFUSED_HOST_ENV_PREFIXES)
+        or is_operator_owned_or_provider_secret(upper)
+        or other_backend_secret
+    )
+
+
+def _custom_backend(env_mode: str) -> EnvironmentBackendSpec | None:
+    """Load an installed ``--env-mode`` backend and check the host variables it forwards."""
+    try:
+        backend = load_custom_backend(env_mode)
+    except EnvironmentBackendError as exc:
+        # Import and factory failures can quote backend configuration such as
+        # endpoint URLs with credentials; redact them like preflight failures.
+        detail = redact_progress_detail(str(exc), secret_values=secret_values_from_environment(os.environ))
+        raise EnvironmentBackendError(detail or f"Custom execution backend '{env_mode}' could not be loaded") from None
+    if backend is None:
+        return None
+    # A backend forwards its own backend settings only. Agent, provider, and other
+    # backends' credentials, judge settings, and process-control variables stay
+    # under evaluator policy.
+    blocked = sorted(name for name in backend.host_env_vars if not _backend_may_forward(name))
+    if blocked:
+        raise EnvironmentBackendError(
+            f"Custom execution backend '{env_mode}' may not forward evaluator-owned variable(s): {', '.join(blocked)}"
+        )
+    return backend
+
+
+def _env_mode_host_path_env_vars(env_mode: str) -> frozenset[str]:
+    """Return a backend's host variables that name files, anchored before Harbor changes directory."""
+    if env_mode in _HARBOR_ENV_MODE_VARS:
+        return frozenset()
+    try:
+        backend = _custom_backend(env_mode)
+    except EnvironmentBackendError:
+        return frozenset()
+    return backend.host_path_env_vars if backend is not None else frozenset()
+
+
+def _supported_env_modes() -> frozenset[str]:
+    return HARBOR_ENV_MODES | frozenset(custom_backend_names())
+
+
+def _env_mode_host_env_vars(env_mode: str) -> frozenset[str]:
+    """Return the backend host variables forwarded to Harbor for ``env_mode``."""
+    if env_mode in _HARBOR_ENV_MODE_VARS:
+        return _HARBOR_ENV_MODE_VARS[env_mode]
+    try:
+        backend = _custom_backend(env_mode)
+    except EnvironmentBackendError:
+        # Prerequisite checks report the load failure before any run starts.
+        return frozenset()
+    return backend.host_env_vars if backend is not None else frozenset()
+
+
+def is_gke_vertex_workload_identity_active(
+    env_mode: str,
+    agents: Sequence[str] = ("claude-code",),
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    """Return True when GKE mode is paired with Claude Code and CLAUDE_CODE_USE_VERTEX=1."""
+    if env_mode != "gke" or "claude-code" not in agents:
+        return False
+    lookup_env = env if env is not None else os.environ
+    return (
+        str(lookup_env.get("CLAUDE_CODE_USE_VERTEX", "")).strip() == "1"
+        or os.environ.get("CLAUDE_CODE_USE_VERTEX", "").strip() == "1"
+    )
+
+
+@dataclass(frozen=True)
+class AgentRuntimePlan:
+    """One agent's immutable model, credential, and Harbor environment plan."""
+
+    agent: str
+    model: str
+    provider: ProviderConfig
+    staged_env: Mapping[str, str]
+    subprocess_env: Mapping[str, str]
+
+
+def _harbor_bin() -> str:
+    """Return the Harbor executable installed with the active interpreter."""
+    bin_dir = Path(os.sys.executable).parent
+    # Windows installs the console script as harbor.exe; the suffix-less probe
+    # below only matches POSIX layouts.
+    for name in ("harbor", "harbor.exe", "harbor.cmd"):
+        candidate = bin_dir / name
+        if candidate.exists():
+            return str(candidate)
+    return shutil.which("harbor") or "harbor"
+
+
+# Harbor loads ``.env.local`` from its working directory, and Harbor and LiteLLM
+# call ``load_dotenv()`` on import. Every Harbor process therefore starts in an
+# empty evaluator-owned directory with dotenv loading and telemetry disabled, so
+# no file outside the allowlisted environment can add credentials or settings.
+# These controls are applied at launch, outside the secret-tracked environment.
+_HARBOR_LAUNCH_ENV = MappingProxyType({"HARBOR_TELEMETRY": "0", "PYTHON_DOTENV_DISABLED": "1"})
+# Harbor installs the latest agent CLI unless given a ``version``. Pin the
+# releases SkillEvaluator was validated with, so trials do not change when a
+# new CLI ships. Local mode runs the operator's installed CLI instead, and its
+# wrappers check a minimum version for the selected model.
+_CODEX_VERSION = PINNED_RUNTIME_VERSIONS["codex"]
+_CLAUDE_CODE_VERSION = PINNED_RUNTIME_VERSIONS["claude-code"]
+OPENCODE_VERSION = PINNED_RUNTIME_VERSIONS["opencode"]
+# Harbor 0.22's Codex agent ran with ``model_reasoning_effort=high``; later
+# releases defer to Codex's own default. Pin the effort SkillEvaluator was
+# validated with so scores and cost stay comparable across Harbor upgrades.
+_HARBOR_AGENT_KWARGS: Mapping[str, Mapping[str, str]] = MappingProxyType(
+    {
+        "codex": MappingProxyType({"reasoning_effort": "high", "version": _CODEX_VERSION}),
+        "claude-code": MappingProxyType({"version": _CLAUDE_CODE_VERSION}),
+        "opencode": MappingProxyType({"version": OPENCODE_VERSION}),
+        "hermes": MappingProxyType({"version": HERMES_VERSION}),
+    }
+)
+# Claude Code's default effort depends on the model, and Claude Opus 5 ran at
+# ``high``. Claude 5.5 or later runs at ``medium``, set explicitly so the effort
+# is visible in the Harbor command. Older models keep Claude Code's default.
+_CLAUDE_CODE_REASONING_EFFORT = "medium"
+# Allowlisted host variables that name a file or directory. A relative value keeps
+# its meaning by being anchored to the operator's working directory.
+_HARBOR_HOST_PATH_ENV_VARS = frozenset(
+    {
+        "APPTAINER_AUTHFILE",
+        "APPTAINER_CONFIGDIR",
+        "AWS_CA_BUNDLE",
+        "AWS_CONFIG_FILE",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+        "AWS_CREDENTIAL_FILE",
+        "AWS_LOGIN_CACHE_DIRECTORY",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+        "CLOUDSDK_CONFIG",
+        "DOCKER_CERT_PATH",
+        "DOCKER_CONFIG",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "LANGSMITH_CONFIG_FILE",
+        "MAR_CONFIG",
+        "MODAL_CONFIG_PATH",
+        "MOSAIC_CONFIG",
+        "NETRC",
+        "REQUESTS_CA_BUNDLE",
+        "RUNTA_CONFIG",
+        "SINGULARITY_AUTHFILE",
+        "SINGULARITY_CONFIGDIR",
+        "SKYPILOT_GLOBAL_CONFIG",
+        "SKYPILOT_PROJECT_CONFIG",
+        "SSL_CERT_FILE",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+    }
+)
+_HARBOR_HOST_PATH_LIST_ENV_VARS = frozenset({"AWS_DATA_PATH", "KUBECONFIG", "SSL_CERT_DIR"})
+_HOST_PATH_ENVIRONMENT_KWARGS: Mapping[str, frozenset[str]] = MappingProxyType(
+    {
+        "ack": frozenset({"kubeconfig"}),
+        "ec2": frozenset({"ssh_key_path", "ssh_known_hosts_path"}),
+        "singularity": frozenset({"singularity_image_cache_dir"}),
+    }
+)
+
+
+def _absolute_host_path(value: str) -> str:
+    """Anchor a relative host path to the operator's working directory."""
+    if not value or value.startswith("~"):
+        return value
+    path = Path(value)
+    return value if path.is_absolute() else str(path.absolute())
+
+
+def _harbor_launch_environment(env: Mapping[str, str]) -> dict[str, str]:
+    """Return a Harbor child environment that no longer depends on the caller's directory."""
+    launch_env = dict(env)
+    for name in _HARBOR_HOST_PATH_ENV_VARS & launch_env.keys():
+        launch_env[name] = _absolute_host_path(launch_env[name])
+    for name in _HARBOR_HOST_PATH_LIST_ENV_VARS & launch_env.keys():
+        launch_env[name] = os.pathsep.join(_absolute_host_path(entry) for entry in launch_env[name].split(os.pathsep))
+    launch_env.update(_HARBOR_LAUNCH_ENV)
+    return launch_env
+
+
+def _absolute_host_path_kwargs(env_mode: str, environment_kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Anchor relative host-path constructor kwargs before Harbor changes directory."""
+    anchored = dict(environment_kwargs)
+    path_kwargs = _HOST_PATH_ENVIRONMENT_KWARGS.get(env_mode, frozenset())
+    if env_mode not in _HOST_PATH_ENVIRONMENT_KWARGS and (backend := _custom_backend(env_mode)) is not None:
+        path_kwargs = backend.host_path_environment_kwargs
+    for name in path_kwargs & anchored.keys():
+        if isinstance(anchored[name], str):
+            anchored[name] = _absolute_host_path(anchored[name])
+    return anchored
+
+
+@contextmanager
+def _harbor_launch_cwd() -> Iterator[Path]:
+    """Yield a private, empty working directory for one Harbor process."""
+    with tempfile.TemporaryDirectory(prefix="skillevaluator-harbor-", ignore_cleanup_errors=True) as directory:
+        yield Path(directory)
+
+
+def _harbor_supports_yes() -> bool:
+    """The supported Harbor CLI accepts ``--yes`` for non-interactive runs."""
+    return True
+
+
+def format_harbor_view_command(jobs_dir: Path | str, *, multiline: bool = False) -> str:
+    """Return the portable command for inspecting retained Harbor artifacts."""
+    path = shlex.quote(str(jobs_dir))
+    command = "skillevaluator tier3 harbor-view"
+    return f"{command} {path}" if not multiline else f"{command} \\\n  {path}"
+
+
+@dataclass(frozen=True)
+class _NvidiaBuildKeyHandoff:
+    """Sanitized child environment plus an optional stdin credential payload."""
+
+    subprocess_env: dict[str, str] = field(repr=False)
+    stdin_text: str | None = field(default=None, repr=False, compare=False)
+
+
+def _nvidia_build_key_handoff(
+    run_env: Mapping[str, str],
+    *,
+    env_mode: str,
+) -> _NvidiaBuildKeyHandoff:
+    """Replace the host Build key with a stdin-backed sentinel."""
+    subprocess_env = dict(run_env)
+    subprocess_env.pop(_NVIDIA_BUILD_KEY_FILE_ENV, None)
+    subprocess_env.pop(_NVIDIA_BUILD_KEY_STDIN_ENV, None)
+    api_key = subprocess_env.get("NVIDIA_API_KEY", "")
+    if (
+        env_mode in HARBOR_DOCKER_ENGINE_ENV_MODES
+        and subprocess_env.get("SKILL_EVAL_LLM_PROVIDER") == "nv_build"
+        and api_key
+        and api_key not in {_NVIDIA_BUILD_FILE_SENTINEL, _NVIDIA_BUILD_STDIN_SENTINEL}
+    ):
+        subprocess_env["NVIDIA_API_KEY"] = _NVIDIA_BUILD_STDIN_SENTINEL
+        subprocess_env[_NVIDIA_BUILD_KEY_STDIN_ENV] = "1"
+        return _NvidiaBuildKeyHandoff(subprocess_env, api_key)
+    return _NvidiaBuildKeyHandoff(subprocess_env)
+
+
+_GKE_ENV_VAR_MAPPINGS: Mapping[str, str] = MappingProxyType(
+    {
+        "cluster_name": "SKILLEVALUATOR_GKE_CLUSTER",
+        "region": "SKILLEVALUATOR_GKE_REGION",
+        "namespace": "SKILLEVALUATOR_GKE_NAMESPACE",
+        "registry_location": "SKILLEVALUATOR_GKE_REGISTRY_LOCATION",
+        "registry_name": "SKILLEVALUATOR_GKE_REGISTRY_NAME",
+    }
+)
+
+_GKE_REQUIRED_KWARGS = tuple(_GKE_ENV_VAR_MAPPINGS)
+
+
+def _missing_gke_kwargs(kwargs: Mapping[str, Any]) -> list[str]:
+    """Return required GKE kwargs that are missing or empty."""
+    return [k for k in _GKE_REQUIRED_KWARGS if not isinstance(kwargs.get(k), str) or not str(kwargs.get(k, "")).strip()]
+
+
+def _resolve_environment_kwargs(
+    env_mode: str,
+    *,
+    config_kwargs: Mapping[str, Any] | None = None,
+    cli_kwargs: Mapping[str, Any] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Resolve environment kwargs with CLI > environment variable > config precedence."""
+    resolved: dict[str, Any] = {}
+    env = environ if environ is not None else os.environ
+
+    if config_kwargs:
+        for k, v in config_kwargs.items():
+            if v is not None and k not in _GKE_INFRASTRUCTURE_KWARGS:
+                resolved[k] = v.strip() if isinstance(v, str) else v
+
+    if env_mode == "gke":
+        for kwarg, env_var in _GKE_ENV_VAR_MAPPINGS.items():
+            if val := env.get(env_var, "").strip():
+                resolved[kwarg] = val
+
+    if cli_kwargs:
+        for k, v in cli_kwargs.items():
+            if v is not None:
+                resolved[k] = v.strip() if isinstance(v, str) else v
+
+    return resolved
+
+
+_HARBOR_RUNTIME_POLICY_KWARGS = frozenset(
+    {
+        "auto_mounting",
+        "auto_mounts",
+        "context_id",
+        "cpu_enforcement_policy",
+        "delete",
+        "enable_environment_dir_upload",
+        "environment_dir",
+        "environment_name",
+        "extra_allowed_hosts",
+        "extra_docker_compose",
+        "force_build",
+        "keep_containers",
+        "logger",
+        "memory_enforcement_policy",
+        "mounts",
+        "mounts_json",
+        "network_policy",
+        "override_cpus",
+        "override_gpus",
+        "override_memory_mb",
+        "override_storage_mb",
+        "override_tpu",
+        "persistent_env",
+        "pod_capabilities_add",
+        "pod_capabilities_drop",
+        "pod_overrides",
+        "pod_privileged",
+        "pod_run_as_group",
+        "pod_run_as_user",
+        "phase_network_policies",
+        "session_id",
+        "stream",
+        "suppress_override_warnings",
+        "extra_env",
+        "extra_volume_mounts",
+        "extra_volumes",
+        "init_containers",
+        "task_env_config",
+        "trial_paths",
+    }
+)
+
+_HARBOR_ENVIRONMENT_RUNTIME_POLICY_KWARGS: dict[str, frozenset[str]] = {
+    "ack": frozenset(
+        {
+            "build_job_namespace",
+            "buildkit_address",
+            "dind_image",
+            "memory_limit_multiplier",
+            "pod_annotations",
+            "pod_labels",
+            "sandbox_env_vars",
+            "service_account",
+            "use_buildkit",
+        }
+    ),
+    "blaxel": frozenset({"dind_extra_args"}),
+    # SkillEvaluator owns credential strategy selection and prevents arbitrary
+    # host environment values from reaching remote task Compose interpolation.
+    "cwsandbox": frozenset({"auth", "forward_compose_env"}),
+    "daytona": frozenset({"network_block_all"}),
+    "ec2": frozenset({"iam_instance_profile", "strict_host_key_checking"}),
+    "gke": frozenset({"memory_limit_multiplier"}),
+    "modal": frozenset({"volumes"}),
+    # Persistent volumes, persisted sandboxes, SSH access, and alternate build
+    # inputs would let state or access outlive one isolated trial or skip
+    # evaluator-staged Dockerfile layers.
+    "mosaic": frozenset({"build_args", "build_target", "enable_ssh", "persist", "volume"}),
+    "openshift": frozenset({"service_account_name"}),
+    # Direct mode runs commands in Runta's base runtime and ignores the task
+    # image; Harbor's automatic selection honors the task's Dockerfile or Compose.
+    "runta": frozenset({"mode"}),
+    "singularity": frozenset({"singularity_no_mount"}),
+    "use-computer": frozenset({"resources"}),
+    "vercel": frozenset({"ports"}),
+    "wandb": frozenset({"auth", "forward_compose_env"}),
+}
+
+
+_KATA_RUNTIME_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+_KATA_DNS_SERVER_RE = re.compile(r"[0-9A-Fa-f:.]{2,45}")
+
+
+def _environment_kwarg_policy_error(env_mode: str, environment_kwargs: Mapping[str, Any]) -> str | None:
+    if not environment_kwargs:
+        return None
+    if env_mode == "docker":
+        return "Environment kwargs are not supported for SkillEvaluator Docker mode"
+    if env_mode == ENV_MODE_LOCAL:
+        return "Environment kwargs are not supported for SkillEvaluator local mode"
+    try:
+        backend = _custom_backend(env_mode)
+    except EnvironmentBackendError as exc:
+        return str(exc)
+    reserved = _HARBOR_RUNTIME_POLICY_KWARGS | _HARBOR_ENVIRONMENT_RUNTIME_POLICY_KWARGS.get(env_mode, frozenset())
+    if backend is not None:
+        reserved = reserved | backend.reserved_environment_kwargs
+    if collisions := sorted(reserved & environment_kwargs.keys()):
+        return "Environment kwarg(s) reserved for Harbor runtime policy: " + ", ".join(collisions)
+    if backend is not None:
+        if unknown := sorted(environment_kwargs.keys() - backend.environment_kwargs):
+            return f"Custom execution backend '{env_mode}' does not accept environment kwarg(s): " + ", ".join(unknown)
+        return None
+    allowed_kwargs = HARBOR_ENVIRONMENT_KWARGS[env_mode]
+    if env_mode == "gke":
+        allowed_kwargs = allowed_kwargs | SKILLEVALUATOR_GKE_EXTRA_ENVIRONMENT_KWARGS
+    if unknown := sorted(environment_kwargs.keys() - allowed_kwargs):
+        return f"Harbor {HARBOR_VERSION} environment '{env_mode}' does not accept environment kwarg(s): " + ", ".join(
+            unknown
+        )
+    if env_mode == "kata":
+        return _kata_environment_kwarg_error(environment_kwargs)
+    return None
+
+
+def _kata_environment_kwarg_error(environment_kwargs: Mapping[str, Any]) -> str | None:
+    """Keep Kata's runtime overlay pointed at a Kata handler and literal DNS servers."""
+    runtime = environment_kwargs.get("kata_runtime", "kata")
+    # Harbor treats Docker runtimes whose names contain "kata" as Kata handlers;
+    # any other handler, such as runc, would silently drop the microVM boundary.
+    if not isinstance(runtime, str) or "kata" not in runtime or not _KATA_RUNTIME_NAME_RE.fullmatch(runtime):
+        return "Harbor environment 'kata' requires kata_runtime to name a registered Kata runtime handler"
+    # Harbor writes each server into the microVM's resolv.conf. Parse them the
+    # way Harbor does (comma strings are split and trimmed) and allow only IP
+    # literals: an IPv6 zone ID (%...) could otherwise carry resolver directives.
+    if "kata_dns" not in environment_kwargs:
+        return None
+    dns = environment_kwargs["kata_dns"]
+    if isinstance(dns, str):
+        servers = [server.strip() for server in dns.split(",") if server.strip()]
+    elif isinstance(dns, list) and all(isinstance(server, str) for server in dns):
+        servers = dns
+    else:
+        return "Harbor environment 'kata' requires kata_dns to be a list of IP addresses"
+    # Without a server Harbor keeps Docker's embedded resolver, which a Kata VM cannot reach.
+    if not servers:
+        return "Harbor environment 'kata' requires kata_dns to list at least one IP address"
+    for server in servers:
+        if not _KATA_DNS_SERVER_RE.fullmatch(server):
+            return "Harbor environment 'kata' requires kata_dns to be a list of IP addresses"
+        try:
+            ipaddress.ip_address(server)
+        except ValueError:
+            return "Harbor environment 'kata' requires kata_dns to be a list of IP addresses"
+    return None
+
+
+def _staged_task_environment_error(env_mode: str, task_dirs: Iterable[Path]) -> str | None:
+    """Reject staged task environments the selected backend cannot run."""
+    if (backend := _custom_backend(env_mode)) is not None:
+        if backend.supports_docker_compose:
+            return None
+        for task_dir in task_dirs:
+            if (task_dir / "environment" / "docker-compose.yaml").exists():
+                return (
+                    f"Custom execution backend '{env_mode}' cannot run Docker Compose task '{task_dir.name}'; "
+                    "use a Dockerfile-only environment or another backend."
+                )
+        return None
+    if env_mode == "mosaic":
+        for task_dir in task_dirs:
+            if (task_dir / "environment" / "docker-compose.yaml").exists():
+                return (
+                    f"Harbor environment 'mosaic' runs one VM per trial and cannot run Docker Compose task "
+                    f"'{task_dir.name}'; use a Dockerfile-only environment or another backend."
+                )
+        return None
+    if env_mode != "kata":
+        return None
+    import yaml
+
+    for task_dir in task_dirs:
+        compose_path = task_dir / "environment" / "docker-compose.yaml"
+        if not compose_path.is_file():
+            continue
+        try:
+            compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, yaml.YAMLError):
+            return f"Could not read the Docker Compose model of task '{task_dir.name}'"
+        services = compose.get("services") if isinstance(compose, dict) else None
+        if sidecars := sorted(str(name) for name in services or {} if name != "main"):
+            # Kata replaces each service's resolv.conf, so Compose service-name DNS stops working.
+            return (
+                f"Harbor environment 'kata' cannot run task '{task_dir.name}' with Compose sidecar services "
+                f"({', '.join(sidecars)}): services in Kata microVMs cannot resolve each other by name"
+            )
+    return None
+
+
+def _validated_timeout_multiplier(value: object) -> float:
+    """Return one finite positive timeout scale accepted by every entry point."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError("timeout_multiplier must be a finite number greater than 0")
+    try:
+        normalized = float(value)
+    except OverflowError:
+        raise ValueError("timeout_multiplier must be a finite number greater than 0") from None
+    if not math.isfinite(normalized) or normalized <= 0:
+        raise ValueError("timeout_multiplier must be a finite number greater than 0")
+    if normalized > MAX_HARBOR_TIMEOUT_MULTIPLIER:
+        raise ValueError("timeout_multiplier must yield finite Harbor timeouts")
+    return normalized
+
+
+def _validated_pass_threshold(value: object) -> float:
+    """Return one finite unit-interval attempt threshold."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError("pass_threshold must be a finite number between 0.0 and 1.0")
+    try:
+        normalized = float(value)
+    except OverflowError:
+        raise ValueError("pass_threshold must be a finite number between 0.0 and 1.0") from None
+    if not math.isfinite(normalized) or not 0.0 <= normalized <= 1.0:
+        raise ValueError("pass_threshold must be a finite number between 0.0 and 1.0")
+    return normalized
+
+
+def _harbor_agent_kwargs(agent: str, model: str | None, env_mode: str) -> dict[str, str]:
+    """Return the Harbor agent kwargs SkillEvaluator pins for ``agent`` running ``model``."""
+    kwargs = dict(_HARBOR_AGENT_KWARGS.get(agent, {}))
+    if env_mode == ENV_MODE_LOCAL:
+        kwargs.pop("version", None)
+    if agent == "claude-code" and model and is_claude_5_5_or_later(model):
+        kwargs["reasoning_effort"] = _CLAUDE_CODE_REASONING_EFFORT
+    return kwargs
+
+
+def build_harbor_run_command(
+    *,
+    dataset_path: str | Path,
+    agent: str,
+    job_name: str,
+    env_mode: str,
+    n_attempts: int = 1,
+    n_concurrent: int = 4,
+    model: str | None = None,
+    jobs_dir: Path | None = None,
+    timeout_multiplier: float = 1.0,
+    disable_verification: bool = False,
+    include_task_names: list[str] | None = None,
+    override_cpus: int | None = None,
+    override_memory_mb: int | None = None,
+    override_storage_mb: int | None = None,
+    agent_import_path: str | None = None,
+    verifier_env: Mapping[str, str] | None = None,
+    environment_kwargs: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Build a Harbor invocation for a built-in or backend environment, or local mode."""
+    if not is_env_mode(env_mode):
+        raise ValueError(f"env_mode must be one of: {', '.join(sorted(_supported_env_modes()))}")
+    backend = _custom_backend(env_mode)
+    timeout_multiplier = _validated_timeout_multiplier(timeout_multiplier)
+    if (
+        agent_import_path
+        and env_mode not in HARBOR_DOCKER_ENGINE_ENV_MODES | {ENV_MODE_LOCAL}
+        and agent_import_path not in _NATIVE_BACKEND_AGENT_IMPORT_PATHS
+        and agent_import_path not in _native_plugin_agent_import_paths()
+        and (backend is None or agent_import_path not in backend.agent_import_paths.values())
+    ):
+        raise ValueError("agent_import_path is supported only with --env docker, kata, or local")
+    validated_environment_kwargs = validate_environment_kwargs(
+        dict(environment_kwargs or {}),
+        env_mode=env_mode,
+    )
+    if policy_error := _environment_kwarg_policy_error(env_mode, validated_environment_kwargs):
+        raise ValueError(policy_error)
+    validated_environment_kwargs = _absolute_host_path_kwargs(env_mode, validated_environment_kwargs)
+
+    command = [
+        _harbor_bin(),
+        "run",
+        "--job-name",
+        job_name,
+        "--n-attempts",
+        str(n_attempts),
+        "--n-concurrent",
+        str(n_concurrent),
+        "-p",
+        str(Path(dataset_path).absolute()),
+    ]
+    if env_mode == ENV_MODE_LOCAL:
+        # Local mode is a custom SkillEvaluator environment + agent wrappers,
+        # dispatched as import paths through Harbor's unified --agent/--env
+        # flags, with sandbox knobs passed as environment-kwargs (--ek). The
+        # custom agent wrapper skips the Debian apt-get bootstrap used by the
+        # stock agent.
+        from skillevaluator.tier3.harbor import LOCAL_AGENT_IMPORT_PATHS, LOCAL_ENV_IMPORT_PATH, local_sandbox
+        from skillevaluator.tier3.harbor.local_runtime import default_runtime_root
+
+        agent_import_path = agent_import_path or LOCAL_AGENT_IMPORT_PATHS.get(agent)
+        if not agent_import_path:
+            raise ValueError(f"--env-mode local does not support agent: {agent}")
+        command.extend(["--agent", agent_import_path])
+        command.extend(["--env", LOCAL_ENV_IMPORT_PATH])
+        command.extend(["--ek", f"runtime_root={default_runtime_root()}"])
+        command.extend(["--ek", f"runtime_agent={agent}"])
+        command.extend(["--ek", f"sandbox_mode={local_sandbox.resolve_mode(None)}"])
+        command.extend(
+            [
+                "--ek",
+                f"allow_net={str(local_sandbox.coerce_flag(None, env_var=local_sandbox.ALLOW_NET_ENV, default=True)).lower()}",
+            ]
+        )
+        command.extend(
+            [
+                "--ek",
+                f"strict_reads={str(local_sandbox.coerce_flag(None, env_var=local_sandbox.STRICT_READS_ENV)).lower()}",
+            ]
+        )
+        command.extend(
+            [
+                "--ek",
+                f"inherit_agent_keys={str(local_sandbox.coerce_flag(None, env_var=local_sandbox.INHERIT_AGENT_KEYS_ENV)).lower()}",
+            ]
+        )
+    elif env_mode in HARBOR_DOCKER_ENGINE_ENV_MODES or env_mode == "gke":
+        default_import_paths = (
+            DOCKER_AGENT_IMPORT_PATHS if env_mode in HARBOR_DOCKER_ENGINE_ENV_MODES else CONTAINER_AGENT_IMPORT_PATHS
+        )
+        command.extend(["--agent", agent_import_path or default_import_paths.get(agent, agent)])
+        if env_mode == "gke":
+            env_import_path = SECURE_GKE_ENV_IMPORT_PATH
+        elif env_mode == "kata":
+            env_import_path = SECURE_KATA_ENV_IMPORT_PATH
+        else:
+            env_import_path = SECURE_DOCKER_ENV_IMPORT_PATH
+        command.extend(["--env", env_import_path])
+    elif backend is not None:
+        command.extend(["--agent", agent_import_path or backend.agent_import_paths.get(agent, agent)])
+        command.extend(["--env", backend.import_path])
+    else:
+        command.extend(["--agent", agent_import_path or agent, "--env", harbor_environment_type(env_mode)])
+    for name, value in sorted(_harbor_agent_kwargs(agent, model, env_mode).items()):
+        command.extend(["--ak", encode_environment_kwarg(name, value)])
+    for name, value in sorted(validated_environment_kwargs.items()):
+        # A SkillEvaluator GKE wrapper option, not a Harbor constructor kwarg.
+        if env_mode == "gke" and name == "allow_workload_identity":
+            continue
+        command.extend(["--ek", encode_environment_kwarg(name, value)])
+    # Alias kwargs come after operator kwargs, which may never set them.
+    for name, value in sorted(HARBOR_ENVIRONMENT_ALIAS_KWARGS.get(env_mode, {}).items()):
+        command.extend(["--ek", encode_environment_kwarg(name, value)])
+    if jobs_dir is not None:
+        command.extend(["--jobs-dir", str(Path(jobs_dir).absolute())])
+    if disable_verification:
+        command.append("--disable-verification")
+    for task_name in include_task_names or []:
+        command.extend(["--include-task-name", task_name])
+    if model:
+        command.extend(["--model", model])
+    if timeout_multiplier != 1.0:
+        command.extend(["--timeout-multiplier", str(timeout_multiplier)])
+    if override_cpus is not None:
+        command.extend(["--override-cpus", str(override_cpus)])
+    if override_memory_mb is not None:
+        command.extend(["--override-memory-mb", str(override_memory_mb)])
+    if override_storage_mb is not None:
+        command.extend(["--override-storage-mb", str(override_storage_mb)])
+    for name, value in sorted((verifier_env or {}).items()):
+        str_val = str(value)
+        if (
+            is_operator_owned_or_provider_secret(name) or _is_sensitive_environment_kwarg_name(name)
+        ) and not re.fullmatch(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", str_val):
+            raise ValueError(
+                f"Sensitive key detected in verifier_env: {name}. "
+                "Credentials and operator-owned settings must use ${VAR} placeholder indirection."
+            )
+        command.extend(["--verifier-env", f"{name}={value}"])
+    if _harbor_supports_yes():
+        command.append("--yes")
+    return command
+
+
+def _provider_environment(config: ProviderConfig) -> dict[str, str]:
+    """Build evaluator-owned verifier variables from provider config and host overrides."""
+    environment = {
+        "SKILL_EVAL_LLM_PROVIDER": config.provider,
+        "SKILL_EVAL_LLM_MODEL": config.model,
+    }
+    environment.update(
+        {
+            name: value
+            for name in (_VERIFIER_JUDGE_CONTROL_ENV_VARS | _VERIFIER_BUDGET_ENV_VARS | _VERIFIER_RETRY_ENV_VARS)
+            if (value := os.environ.get(name, "").strip())
+        }
+    )
+    if getattr(config, "credential_env", None) == CREDENTIAL_SOURCE_ADC:
+        fresh_token = _get_google_access_token()
+        api_key = fresh_token or getattr(config, "api_key", None) or ""
+        environment[CREDENTIAL_SOURCE_ENV] = CREDENTIAL_SOURCE_ADC
+        expiry_epoch = get_adc_token_expiry(api_key)
+        if expiry_epoch is None and not fresh_token:
+            expiry_epoch = getattr(config, "credential_expiry", None)
+        if expiry_epoch is not None:
+            environment[CREDENTIAL_EXPIRY_ENV] = str(expiry_epoch)
+    else:
+        api_key = getattr(config, "api_key", None) or ""
+
+    if config.provider == "anthropic":
+        environment["ANTHROPIC_API_KEY"] = api_key
+        if config.base_url:
+            environment["ANTHROPIC_BASE_URL"] = config.base_url
+    elif config.provider == "bedrock":
+        environment["AWS_REGION"] = config.region or "us-west-2"
+        environment.update({name: os.environ[name] for name in _BEDROCK_HOST_ENV_VARS if os.environ.get(name)})
+    elif config.provider == "nv_build":
+        environment["NVIDIA_API_KEY"] = api_key
+    else:
+        environment["OPENAI_API_KEY"] = api_key
+        environment["OPENAI_BASE_URL"] = config.base_url or ""
+    return {name: value for name, value in environment.items() if value}
+
+
+def _local_agent_credentials(config: ProviderConfig) -> dict[str, str]:
+    """Map the resolved provider to the env vars local-mode agent CLIs read.
+
+    opencode/codex read OPENAI_API_KEY/OPENAI_BASE_URL; claude-code reads
+    ANTHROPIC_API_KEY/ANTHROPIC_BASE_URL. NVIDIA Build is OpenAI-compatible, so
+    it maps to the OPENAI_* pair pointing at its base URL.
+    """
+    if config.provider == "anthropic":
+        env = {"ANTHROPIC_API_KEY": config.api_key or ""}
+        if config.base_url:
+            env["ANTHROPIC_BASE_URL"] = config.base_url
+    else:  # openai, nv_build, or any OpenAI-compatible provider
+        env = {"OPENAI_API_KEY": config.api_key or "", "OPENAI_BASE_URL": config.base_url or ""}
+    return {name: value for name, value in env.items() if value}
+
+
+def _validate_agent_provider_credentials(
+    provider: ProviderConfig,
+    agents: list[str],
+    agent_runtime_env: dict[str, str],
+    agent_model_sources: dict[str, str] | None = None,
+    *,
+    env_mode: str = DEFAULT_ENV_MODE,
+    agent_models: Mapping[str, str] | None = None,
+    environment_kwargs: Mapping[str, str] | None = None,
+) -> list[str]:
+    """Reject provider-to-agent combinations that cannot use the selected API."""
+    model_sources = agent_model_sources or {}
+    models = agent_models or {}
+
+    if "hermes" in agents:
+        if provider.provider != "nv_build" or env_mode != "docker":
+            return ["Experimental hermes supports only NVIDIA Build with --env-mode docker."]
+        if not agent_runtime_env.get("NVIDIA_API_KEY", "").strip():
+            return ["hermes with NVIDIA Build requires NVIDIA_API_KEY."]
+        model = models.get("hermes", "")
+        if model and (model.count("/") != 1 or any(not part.strip() for part in model.split("/"))):
+            return ["hermes requires a full NVIDIA Build catalog model ID in publisher/model form."]
+
+    opencode_model = models.get("opencode")
+    expected_opencode_provider = {
+        "anthropic": "anthropic",
+        "nv_build": "nvidia",
+        "openai": "openai",
+        "openai-compatible": "openai",
+    }.get(provider.provider)
+    if (
+        "opencode" in agents
+        and opencode_model
+        and expected_opencode_provider
+        and "/" in opencode_model
+        and opencode_model.split("/", maxsplit=1)[0].casefold() != expected_opencode_provider
+    ):
+        return [
+            "OpenCode's provider-qualified model must match the evaluator provider so each agent route uses "
+            "only its selected provider credential."
+        ]
+
+    has_vertex = (
+        agent_runtime_env.get("CLAUDE_CODE_USE_VERTEX", "").strip() == "1"
+        or os.environ.get("CLAUDE_CODE_USE_VERTEX", "").strip() == "1"
+    )
+    if "claude-code" in agents and has_vertex:
+        if env_mode != "gke":
+            return [
+                f"vertex ai live agents do not support {env_mode} mode; use --env-mode gke or a supported cloud backend."
+            ]
+        if not is_gke_workload_identity_allowed(environment_kwargs, agent_runtime_env):
+            return [GKE_WORKLOAD_IDENTITY_ERROR_MESSAGE]
+        from skillevaluator.tier3.harbor.runtime_preflight import _resolve_vertex_project_id
+
+        has_project = bool(_resolve_vertex_project_id(agent_runtime_env) or _resolve_vertex_project_id())
+        if not has_project:
+            return [
+                "CLAUDE_CODE_USE_VERTEX=1 requires a Google Cloud project ID. "
+                "Set ANTHROPIC_VERTEX_PROJECT_ID, GOOGLE_CLOUD_PROJECT, or GCP_PROJECT."
+            ]
+
+    if provider.provider != "nv_build":
+        supported_agents = {
+            "openai": {"claude-code", "codex", "opencode"},
+            "openai-compatible": {"claude-code", "codex", "opencode"},
+            "anthropic": {"claude-code", "codex", "opencode"},
+            "bedrock": {"claude-code"},
+        }.get(provider.provider, set())
+        unsupported = [agent for agent in agents if agent not in supported_agents]
+        if unsupported:
+            return [
+                f"{provider.provider} does not support live agent(s): {', '.join(unsupported)}. "
+                "Choose a compatible evaluator provider and agent."
+            ]
+        if env_mode == ENV_MODE_LOCAL and provider.provider == "anthropic" and "opencode" in agents:
+            return ["anthropic with opencode does not support local mode; use Docker/cloud or select claude-code."]
+        if env_mode == ENV_MODE_LOCAL and provider.provider == "bedrock":
+            return ["bedrock live agents do not support local mode; use Docker or a supported cloud backend."]
+        if provider.provider == "bedrock" and "claude-code" in agents:
+            has_bearer = bool(agent_runtime_env.get("AWS_BEARER_TOKEN_BEDROCK", "").strip())
+            has_access_pair = bool(
+                agent_runtime_env.get("AWS_ACCESS_KEY_ID", "").strip()
+                and agent_runtime_env.get("AWS_SECRET_ACCESS_KEY", "").strip()
+            )
+            if not has_bearer and not has_access_pair:
+                return [
+                    "bedrock with claude-code requires an explicit AWS access-key pair or "
+                    "AWS_BEARER_TOKEN_BEDROCK for the agent environment."
+                ]
+
+        if provider.provider == "openai" and "claude-code" in agents:
+            has_anthropic_key = bool(agent_runtime_env.get("ANTHROPIC_API_KEY", "").strip())
+            has_vertex = env_mode == "gke" and agent_runtime_env.get("CLAUDE_CODE_USE_VERTEX", "").strip() == "1"
+            if not has_anthropic_key and not has_vertex:
+                suffix = " or CLAUDE_CODE_USE_VERTEX=1" if env_mode == "gke" else ""
+                return [
+                    f"claude-code with the OpenAI evaluator provider requires an independent ANTHROPIC_API_KEY{suffix} "
+                    "in the operator host environment."
+                ]
+            if model_sources.get("claude-code", "public provider default") == "public provider default":
+                return [
+                    "claude-code needs an explicit Anthropic model when OpenAI is the evaluator provider; "
+                    "set --agent-model claude-code=MODEL or harbor.agents.claude-code.model."
+                ]
+
+        if provider.provider == "anthropic":
+            if "opencode" in agents and model_sources.get("opencode", "public provider default") == (
+                "public provider default"
+            ):
+                return [
+                    "opencode needs an explicit provider-qualified model when Anthropic is the evaluator provider; "
+                    "set --agent-model opencode=PROVIDER/MODEL or harbor.agents.opencode.model."
+                ]
+            if "codex" in agents:
+                openai_key = agent_runtime_env.get("OPENAI_API_KEY", "").strip()
+                openai_base_url = agent_runtime_env.get("OPENAI_BASE_URL", "").strip()
+                if not openai_key or not openai_base_url:
+                    return [
+                        "codex with the Anthropic evaluator provider requires independent OPENAI_API_KEY and "
+                        "OPENAI_BASE_URL values in the operator host environment."
+                    ]
+                if model_sources.get("codex", "public provider default") == "public provider default":
+                    return [
+                        "codex needs an explicit OpenAI-compatible model when Anthropic is the evaluator provider; "
+                        "set --agent-model codex=MODEL or harbor.agents.codex.model."
+                    ]
+        return []
+
+    unsupported = [agent for agent in agents if agent not in {"claude-code", "codex", "opencode", "hermes"}]
+    if unsupported:
+        return [
+            "nv_build does not support live agent(s): "
+            + ", ".join(unsupported)
+            + ". Choose opencode, claude-code, or codex."
+        ]
+
+    if env_mode == ENV_MODE_LOCAL:
+        from skillevaluator.tier3.harbor import local_sandbox
+
+        if not local_sandbox.coerce_flag(None, env_var=local_sandbox.ALLOW_NET_ENV, default=True):
+            return [
+                "NVIDIA Build local agents require network access; unset SKILLEVALUATOR_LOCAL_ALLOW_NET or set it to 1."
+            ]
+
+    if env_mode in HARBOR_DOCKER_ENGINE_ENV_MODES | {ENV_MODE_LOCAL}:
+        for agent in agents:
+            model = models.get(agent, "")
+            raw_model = model.removeprefix("nvidia/") if agent == "opencode" else model
+            is_explicit = model_sources.get(agent) in {"CLI", "evals/config.yml"}
+            if is_explicit and model and ("/" not in raw_model or raw_model.startswith("/") or raw_model.endswith("/")):
+                return [
+                    f"{agent} with NVIDIA Build requires a full NVIDIA Build catalog model ID "
+                    "in publisher/model form; native provider model names are not routed by the compatibility bridge."
+                ]
+        # Codex and Claude Code use the in-container compatibility bridge;
+        # local mode uses an authenticated in-process host bridge. OpenCode
+        # continues to use NVIDIA Build's native provider adapter.
+        return []
+
+    if "claude-code" in agents:
+        has_anthropic_key = bool(agent_runtime_env.get("ANTHROPIC_API_KEY", "").strip())
+        has_vertex = env_mode == "gke" and agent_runtime_env.get("CLAUDE_CODE_USE_VERTEX", "").strip() == "1"
+        if not has_anthropic_key and not has_vertex:
+            suffix = " or CLAUDE_CODE_USE_VERTEX=1" if env_mode == "gke" else ""
+            return [
+                f"claude-code with NVIDIA Build requires an independent ANTHROPIC_API_KEY{suffix} in the agent runtime "
+                "environment; NVIDIA_API_KEY is not an Anthropic credential."
+            ]
+        model_source = (agent_model_sources or {}).get("claude-code", "public provider default")
+        if model_source == "public provider default":
+            return [
+                "claude-code needs an explicit Anthropic model when NVIDIA Build is the evaluator provider; "
+                "set --agent-model claude-code=MODEL or harbor.agents.claude-code.model."
+            ]
+
+    if "codex" not in agents:
+        return []
+
+    # NVIDIA Build exposes /v1/responses, but only for basic function tools — it
+    # rejects codex-cli's namespace/multi-agent tool schema (`unified_exec`), so
+    # codex cannot complete a run against NVIDIA Build. codex needs a full
+    # OpenAI-compatible Responses provider; require the user to supply one.
+    openai_key = agent_runtime_env.get("OPENAI_API_KEY", "").strip()
+    openai_base_url = agent_runtime_env.get("OPENAI_BASE_URL", "").rstrip("/")
+    if not openai_key or not openai_base_url or openai_base_url == (provider.base_url or "").rstrip("/"):
+        return [
+            "codex requires a full OpenAI Responses API credential — NVIDIA Build's /responses does not "
+            "support codex's tool schema. Set OPENAI_API_KEY + OPENAI_BASE_URL to an OpenAI-compatible "
+            "Responses provider (e.g. https://api.openai.com/v1) in the operator's host environment for Codex."
+        ]
+
+    model_source = (agent_model_sources or {}).get("codex", "public provider default")
+    if model_source == "public provider default":
+        return [
+            "codex needs an explicit OpenAI-compatible model when NVIDIA Build is the evaluator provider; "
+            "set --agent-model codex=MODEL or harbor.agents.codex.model."
+        ]
+    return []
+
+
+def _environment_kwarg_prerequisite_errors(
+    env_mode: str,
+    environment_kwargs: Mapping[str, Any] | None,
+) -> list[str]:
+    """Validate constructor requirements Harbor cannot check in ``preflight``."""
+    try:
+        kwargs = validate_environment_kwargs(
+            dict(environment_kwargs or {}),
+            env_mode=env_mode,
+        )
+    except (RecursionError, TypeError, ValueError) as exc:
+        return [f"Invalid --environment-kwarg: {exc}"]
+    if policy_error := _environment_kwarg_policy_error(env_mode, kwargs):
+        return [policy_error]
+
+    def invalid_strings(*names: str) -> list[str]:
+        return [name for name in names if not isinstance(kwargs.get(name), str) or not kwargs[name].strip()]
+
+    required: tuple[str, ...] = ()
+    if (backend := _custom_backend(env_mode)) is not None:
+        required = backend.required_environment_kwargs
+    elif env_mode == "gke":
+        required = ("cluster_name", "region", "namespace", "registry_location", "registry_name")
+    elif env_mode == "ack":
+        required = ("namespace",)
+    elif env_mode == "ec2":
+        required = ("region",)
+    if invalid := invalid_strings(*required):
+        return [
+            f"Harbor environment '{env_mode}' requires non-empty string --environment-kwarg for: " + ", ".join(invalid)
+        ]
+    if env_mode == "ack" and (
+        invalid := invalid_strings(*(name for name in ("context", "kubeconfig") if name in kwargs))
+    ):
+        return ["Harbor environment 'ack' requires non-empty string --environment-kwarg for: " + ", ".join(invalid)]
+    if env_mode == "ec2":
+        launch_mode_value = kwargs.get("launch_mode", "ephemeral")
+        if not isinstance(launch_mode_value, str):
+            return ["Harbor environment 'ec2' requires launch_mode to be 'ephemeral' or 'attach'"]
+        launch_mode = launch_mode_value
+        if launch_mode not in {"ephemeral", "attach"}:
+            return ["Harbor environment 'ec2' requires launch_mode to be 'ephemeral' or 'attach'"]
+        conditional = "ami_id" if launch_mode == "ephemeral" else "instance_id"
+        if invalid_strings(conditional):
+            return [
+                f"Harbor environment 'ec2' launch_mode={launch_mode!r} requires --environment-kwarg {conditional}=VALUE"
+            ]
+        if (ssh_key_path := kwargs.get("ssh_key_path")) is not None:
+            try:
+                ssh_key_exists = isinstance(ssh_key_path, str) and Path(ssh_key_path).expanduser().is_file()
+            except (OSError, RuntimeError):
+                ssh_key_exists = False
+            if not ssh_key_exists:
+                return ["Harbor environment 'ec2' requires ssh_key_path to name an existing regular file"]
+        if launch_mode == "ephemeral" and kwargs.get("use_public_ip") is False and invalid_strings("subnet_id"):
+            return ["Harbor environment 'ec2' use_public_ip=False requires a non-empty subnet_id"]
+    return []
+
+
+# Backend SDK configuration files that operators may name in the host environment.
+_BACKEND_CONFIG_FILE_ENV_VARS: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {"mosaic": ("MOSAIC_CONFIG", "MAR_CONFIG"), "runta": ("RUNTA_CONFIG",)}
+)
+
+
+def _backend_config_prerequisite_errors(env_mode: str) -> list[str]:
+    """Check Runta and Mosaic credential inputs against what Harbor's child will see."""
+    errors: list[str] = []
+    for name in _BACKEND_CONFIG_FILE_ENV_VARS.get(env_mode, ()):
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        try:
+            is_file = bool(raw.strip()) and Path(raw).expanduser().is_file()
+        except (OSError, RuntimeError):
+            is_file = False
+        if not is_file:
+            errors.append(f"Harbor environment '{env_mode}' requires {name} to name an existing regular file.")
+    if env_mode == "mosaic" and not errors:
+        try:
+            from mosaic_sandbox.credentials import resolve_token
+        except ImportError:
+            return errors  # Harbor's preflight reports the missing extra.
+        _token, source = resolve_token()
+        # The SDK accepts a Mosaic token in E2B_API_KEY for E2B migrations, but
+        # that variable belongs to the e2b backend and never reaches Mosaic.
+        if source == "e2b_environment":
+            errors.append(
+                "Harbor environment 'mosaic' does not forward E2B_API_KEY; set MOSAIC_API_TOKEN or run `mos login`."
+            )
+    return errors
+
+
+def _harbor_missing_dependency_summary(exc: ImportError) -> str:
+    """Keep Harbor's diagnosis, without its unpinned install commands or cloud-bundle hint."""
+    lines = str(exc).strip().splitlines()
+    summary = lines[0] if lines else type(exc).__name__
+    for suffix in (" Install it with:", " Install them with:"):
+        summary = summary.removesuffix(suffix)
+    return summary.strip().rstrip(".")
+
+
+def _cwsandbox_prerequisite_errors(env_mode: str) -> list[str]:
+    """Check what Harbor's cwsandbox backend needs; Harbor 0.24 no longer checks it."""
+    if harbor_environment_type(env_mode) != "cwsandbox":
+        return []
+    required_modules = ("cwsandbox", "wandb") if env_mode == "wandb" else ("cwsandbox",)
+    if missing := [name for name in required_modules if importlib.util.find_spec(name) is None]:
+        return [
+            f"Harbor environment '{env_mode}' needs optional dependencies: {', '.join(missing)}. "
+            f"{_environment_extra_install_hint(env_mode)}"
+        ]
+    if env_mode == "wandb":
+        netrc_paths = [os.environ.get("NETRC", ""), str(Path.home() / ".netrc"), str(Path.home() / "_netrc")]
+        if not os.environ.get("WANDB_API_KEY", "").strip() and not any(
+            path and Path(path).expanduser().is_file() for path in netrc_paths
+        ):
+            return ["Harbor environment 'wandb' requires WANDB_API_KEY or a netrc file from `wandb login`."]
+    elif not os.environ.get("CWSANDBOX_API_KEY", "").strip():
+        return ["Harbor environment 'cwsandbox' requires CWSANDBOX_API_KEY."]
+    return []
+
+
+def _environment_extra_install_hint(env_mode: str) -> str:
+    if env_mode not in HARBOR_ENV_MODES and env_mode in custom_backend_names():
+        try:
+            backend = _custom_backend(env_mode)
+        except EnvironmentBackendError:
+            backend = None
+        if backend is not None and backend.install_hint:
+            return backend.install_hint
+        return f"Reinstall the package that provides custom execution backend '{env_mode}'."
+    extra = HARBOR_ENVIRONMENT_EXTRAS.get(env_mode)
+    if extra is not None:
+        return f"Install 'harbor[{extra}]=={HARBOR_VERSION}'."
+    system_hints = {
+        "apple-container": "Install the Apple container CLI; Harbor has no Python extra for this backend.",
+        "openshift": "Install the OpenShift oc CLI; Harbor has no Python extra for this backend.",
+        "singularity": "Install the singularity CLI; Harbor has no Python extra for this backend.",
+    }
+    return system_hints.get(env_mode, "Reinstall SkillEvaluator with its Tier 3 extra.")
+
+
+def _check_ack_cluster_readiness(environment_kwargs: Mapping[str, Any]) -> None:
+    """Load ACK credentials and run a bounded namespaced pod-list probe."""
+    from kubernetes import client as k8s_client
+    from kubernetes import config as k8s_config
+
+    load_kwargs: dict[str, str] = {}
+    if context := environment_kwargs.get("context"):
+        load_kwargs["context"] = str(context)
+    if kubeconfig := environment_kwargs.get("kubeconfig"):
+        load_kwargs["config_file"] = str(kubeconfig)
+    try:
+        k8s_config.load_kube_config(**load_kwargs)
+    except k8s_config.ConfigException:
+        k8s_config.load_incluster_config()
+
+    api_client = k8s_client.ApiClient()
+    try:
+        core_api = k8s_client.CoreV1Api(api_client)
+        core_api.list_namespaced_pod(
+            namespace=str(environment_kwargs["namespace"]),
+            limit=1,
+            _request_timeout=(5, 10),
+        )
+    finally:
+        api_client.close()
+
+
+_ACK_CLUSTER_READINESS_SUBPROCESS_TIMEOUT_SECONDS = 20
+_ACK_CLUSTER_READINESS_REAP_TIMEOUT_SECONDS = 5
+_ACK_CLUSTER_READINESS_PROBE_CODE = """\
+import json
+import sys
+
+from skillevaluator.tier3.harbor.runner import _check_ack_cluster_readiness
+
+try:
+    _check_ack_cluster_readiness(json.loads(sys.stdin.read()))
+except Exception as exc:
+    sys.stderr.write((str(exc) or type(exc).__name__)[:4096])
+    raise SystemExit(1) from None
+"""
+
+
+def _terminate_ack_readiness_process(process: subprocess.Popen[str]) -> None:
+    """Kill the ACK probe and its exec-auth descendants, then reap it."""
+    if os.name == "posix":
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+    else:
+        process.kill()
+    try:
+        process.wait(timeout=_ACK_CLUSTER_READINESS_REAP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=_ACK_CLUSTER_READINESS_REAP_TIMEOUT_SECONDS)
+
+
+def _check_ack_cluster_readiness_subprocess(
+    environment_kwargs: Mapping[str, Any],
+    *,
+    subprocess_env: Mapping[str, str],
+) -> None:
+    """Run ACK's bounded pod-list probe under Harbor's exact child environment."""
+    validated = validate_environment_kwargs(dict(environment_kwargs), env_mode="ack")
+    if policy_error := _environment_kwarg_policy_error("ack", validated):
+        raise ValueError(policy_error)
+    validated = _absolute_host_path_kwargs("ack", validated)
+    payload = {name: validated[name] for name in ("namespace", "context", "kubeconfig") if name in validated}
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+    child_env = dict(subprocess_env)
+    redacted_values = secret_values_from_environment(child_env)
+    redacted_values.update(str(value) for value in payload.values() if isinstance(value, str) and value)
+    process: subprocess.Popen[str] | None = None
+    try:
+        with _harbor_launch_cwd() as launch_cwd:
+            # ``-P`` keeps the probe's working directory off ``sys.path``.
+            process = subprocess.Popen(
+                [sys.executable, "-P", "-c", _ACK_CLUSTER_READINESS_PROBE_CODE],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=str(launch_cwd),
+                env=_harbor_launch_environment(child_env),
+                start_new_session=os.name == "posix",
+            )
+            stdout, stderr = process.communicate(
+                encoded,
+                timeout=_ACK_CLUSTER_READINESS_SUBPROCESS_TIMEOUT_SECONDS,
+            )
+    except subprocess.TimeoutExpired:
+        assert process is not None
+        _terminate_ack_readiness_process(process)
+        raise RuntimeError(
+            "ACK namespaced pod-list readiness probe timed out after "
+            f"{_ACK_CLUSTER_READINESS_SUBPROCESS_TIMEOUT_SECONDS} seconds"
+        ) from None
+    except OSError as exc:
+        if process is not None and process.returncode is None:
+            _terminate_ack_readiness_process(process)
+        detail = redact_progress_detail(exc, secret_values=redacted_values) or type(exc).__name__
+        raise RuntimeError(f"ACK namespaced pod-list readiness probe could not start: {detail}") from None
+    if process.returncode == 0:
+        return
+    output = "\n".join(part for part in (stderr, stdout) if part).strip()
+    detail = redact_progress_detail(output, secret_values=redacted_values) or f"probe exited {process.returncode}"
+    raise RuntimeError(f"ACK namespaced pod-list readiness probe failed: {detail[-2000:]}")
+
+
+def _modal_custom_config_status() -> tuple[bool, str | None]:
+    raw = os.environ.get("MODAL_CONFIG_PATH")
+    if raw is None:
+        return False, None
+    if not raw.strip():
+        return False, "MODAL_CONFIG_PATH must name an existing regular file."
+    try:
+        is_file = Path(raw).expanduser().is_file()
+    except (OSError, RuntimeError):
+        is_file = False
+    if not is_file:
+        return False, "MODAL_CONFIG_PATH must name an existing regular file."
+    return True, None
+
+
+def _python_dotenv_prerequisite_error() -> str | None:
+    """Require the python-dotenv release that honors ``PYTHON_DOTENV_DISABLED``."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        installed = version("python-dotenv")
+    except PackageNotFoundError:
+        return None
+    release = re.match(r"(\d+)\.(\d+)", installed)
+    if release is None or (int(release[1]), int(release[2])) >= (1, 2):
+        return None
+    return (
+        f"python-dotenv {installed} cannot disable Harbor's .env loading; "
+        "install skillevaluator[tier3] to upgrade it to 1.2.0 or newer."
+    )
+
+
+def _custom_backend_prerequisite_errors(
+    env_mode: str,
+    backend: EnvironmentBackendSpec,
+    environment_kwargs: Mapping[str, Any] | None,
+) -> list[str]:
+    """Run a backend's own prerequisite hook, then its environment class's Harbor ``preflight``."""
+    secret_values = secret_values_from_environment(os.environ)
+    try:
+        # Import the environment module first so a missing backend SDK is reported
+        # with the backend's install hint rather than as a generic preflight failure.
+        importlib.import_module(backend.import_path.partition(":")[0])
+        if backend.prerequisites is not None:
+            from harbor.utils.import_path import import_symbol
+
+            check = import_symbol(backend.prerequisites)
+            errors = check(dict(environment_kwargs or {}))
+            if not isinstance(errors, list | tuple) or not all(isinstance(error, str) for error in errors):
+                return [f"Custom execution backend '{env_mode}' prerequisite hook must return a list of strings"]
+            if errors:
+                return [redact_progress_detail(error, secret_values=secret_values) or error for error in errors]
+        from harbor.environments.factory import EnvironmentFactory
+
+        EnvironmentFactory.run_preflight(None, import_path=backend.import_path)
+    except ImportError as exc:
+        detail = redact_progress_detail(_harbor_missing_dependency_summary(exc), secret_values=secret_values)
+        return [
+            f"Custom execution backend '{env_mode}' needs optional dependencies: {detail}. "
+            f"{_environment_extra_install_hint(env_mode)}"
+        ]
+    except SystemExit as exc:
+        detail = redact_progress_detail(exc, secret_values=secret_values) or "preflight exited without a diagnostic"
+        return [f"Custom execution backend '{env_mode}' is not ready: {detail}"]
+    except Exception as exc:
+        if isinstance(exc.__cause__, ImportError):
+            # Harbor's import_symbol wraps import failures in ValueError.
+            detail = redact_progress_detail(
+                _harbor_missing_dependency_summary(exc.__cause__), secret_values=secret_values
+            )
+            return [
+                f"Custom execution backend '{env_mode}' needs optional dependencies: {detail}. "
+                f"{_environment_extra_install_hint(env_mode)}"
+            ]
+        detail = redact_progress_detail(exc, secret_values=secret_values)
+        return [f"Custom execution backend '{env_mode}' is not ready: {detail}"]
+    return []
+
+
+def _check_prerequisites(
+    env_mode: str = DEFAULT_ENV_MODE,
+    agents: list[str] | None = None,
+    environment_kwargs: Mapping[str, Any] | None = None,
+    verify_live_cluster: bool = False,
+    subprocess_env: Mapping[str, str] | None = None,
+) -> list[str]:
+    """Check Harbor and the selected environment (built-in, backend, GKE, or local mode)."""
+    if not is_env_mode(env_mode):
+        return [
+            f"Unsupported Harbor environment '{env_mode}'. Choose one of: {', '.join(sorted(_supported_env_modes()))}"
+        ]
+    try:
+        _custom_backend(env_mode)
+    except EnvironmentBackendError as exc:
+        return [f"{exc}. {_environment_extra_install_hint(env_mode)}"]
+    if dotenv_error := _python_dotenv_prerequisite_error():
+        return [dotenv_error]
+    if env_mode != "gke" and (kwarg_errors := _environment_kwarg_prerequisite_errors(env_mode, environment_kwargs)):
+        return kwarg_errors
+    if env_mode == ENV_MODE_LOCAL:
+        from skillevaluator.tier3.harbor import local_sandbox
+
+        try:
+            local_sandbox.require_supported_platform()
+        except local_sandbox.SandboxUnavailable as exc:
+            return [str(exc)]
+    executable = _harbor_bin()
+    if executable == "harbor" and shutil.which(executable) is None:
+        return [
+            "harbor CLI not found. Reinstall with the Tier 3 extra: "
+            'uv tool install "skillevaluator[all] @ git+https://github.com/NVIDIA/SkillEvaluator.git"'
+        ]
+
+    if (backend := _custom_backend(env_mode)) is not None:
+        return _custom_backend_prerequisite_errors(env_mode, backend, environment_kwargs)
+
+    if env_mode == "gke":
+        gke_errors = list(_environment_kwarg_prerequisite_errors(env_mode, environment_kwargs))
+        if not shutil.which("gcloud"):
+            gke_errors.append(
+                "GKE requires the gcloud CLI to be installed. See https://cloud.google.com/sdk/docs/install"
+            )
+        try:
+            import kubernetes  # noqa: F401
+        except ImportError:
+            gke_errors.append(
+                "GKE requires the 'kubernetes' Python package. Install it with 'uv add kubernetes' or 'pip install \"harbor[gke]\"'."
+            )
+        if _resolve_single_kubeconfig() is None:
+            gke_errors.append(
+                "GKE requires Kubernetes credentials. Run "
+                "'gcloud container clusters get-credentials <CLUSTER> "
+                "--region <REGION>' to configure credentials, or set the "
+                "KUBECONFIG environment variable."
+            )
+        if is_gke_vertex_workload_identity_active(
+            env_mode,
+            agents or ["claude-code"],
+        ) and not is_gke_workload_identity_allowed(environment_kwargs):
+            gke_errors.append(GKE_WORKLOAD_IDENTITY_ERROR_MESSAGE)
+        if verify_live_cluster and not gke_errors:
+            try:
+                from kubernetes import client as k8s_client
+                from kubernetes import config as k8s_config
+
+                resolved_kc = _resolve_single_kubeconfig()
+                k8s_config.load_kube_config(config_file=str(resolved_kc) if resolved_kc else None)
+                api = k8s_client.CoreV1Api()
+                api.get_api_resources(_request_timeout=5.0)
+                if not is_gke_workload_identity_allowed(environment_kwargs):
+                    from skillevaluator.tier3.harbor.gke_environment import ensure_gke_metadata_network_policy
+
+                    target_namespace = (
+                        str((environment_kwargs or {}).get("namespace") or "default").strip() or "default"
+                    )
+                    bound_gcp_sa = inspect_bound_gcp_service_account(
+                        api,
+                        namespace=target_namespace,
+                        service_account="default",
+                    )
+                    if bound_gcp_sa:
+                        gke_errors.append(
+                            GKE_BOUND_SERVICE_ACCOUNT_ERROR_TEMPLATE.format(
+                                namespace=target_namespace,
+                                service_account="default",
+                                gcp_sa=bound_gcp_sa,
+                            )
+                        )
+                    api_client = getattr(api, "api_client", None)
+                    networking_cls = getattr(k8s_client, "NetworkingV1Api", None)
+                    if api_client is not None and callable(networking_cls):
+                        networking_api = networking_cls(api_client)
+                        ensure_gke_metadata_network_policy(
+                            networking_api,
+                            namespace=target_namespace,
+                        )
+            except Exception as exc:
+                gke_errors.append(f"GKE cluster probe failed: {exc}")
+        return gke_errors
+
+    if env_mode == "singularity" and shutil.which("singularity") is None:
+        return ["Harbor environment 'singularity' requires the singularity CLI on PATH."]
+    if env_mode == "islo" and not os.environ.get("ISLO_API_KEY", "").strip():
+        return ["Harbor environment 'islo' requires a non-empty ISLO_API_KEY in the host environment."]
+    if env_mode == "modal":
+        _, modal_config_error = _modal_custom_config_status()
+        if modal_config_error:
+            return [modal_config_error]
+        try:
+            modal_spec = importlib.util.find_spec("modal")
+        except (ImportError, ValueError):
+            modal_spec = None
+        if modal_spec is None:
+            return [
+                f"Harbor environment 'modal' needs optional dependencies. {_environment_extra_install_hint(env_mode)}"
+            ]
+
+    if env_mode == ENV_MODE_LOCAL:
+        # Local mode is a host sandbox, not a Harbor-native backend: verify the
+        # OS sandbox is usable and the requested agent CLIs are installed.
+        from skillevaluator.tier3.harbor import local_sandbox
+        from skillevaluator.tier3.harbor.local_runtime import ensure_local_runtimes
+
+        try:
+            sandbox = local_sandbox.detect(local_sandbox.resolve_mode(None))
+        except local_sandbox.SandboxUnavailable as exc:
+            return [str(exc)]
+        except ValueError as exc:
+            return [f"Invalid local sandbox configuration: {exc}"]
+        from skillevaluator.tier3.harbor.local_runtime import validate_local_agents
+
+        selected_agents = agents or []
+        unsupported = validate_local_agents(selected_agents)
+        if unsupported:
+            return [f"Local mode supports only claude-code, codex, opencode. Unsupported: {', '.join(unsupported)}."]
+        try:
+            strict_reads = local_sandbox.coerce_flag(None, env_var=local_sandbox.STRICT_READS_ENV)
+            return ensure_local_runtimes(selected_agents, sandbox=sandbox, strict_reads=strict_reads)
+        except ValueError as exc:
+            return [f"Invalid local runtime configuration: {exc}"]
+
+    if env_mode in HARBOR_DOCKER_ENGINE_ENV_MODES:
+        mode_label = "Kata" if env_mode == "kata" else "Docker"
+        try:
+            compose = subprocess.run(
+                ["docker", "compose", "version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            detail = redact_progress_detail(
+                exc,
+                secret_values=secret_values_from_environment(os.environ),
+            )
+            return [f"Docker Compose v2 is required for Tier 3 {mode_label} mode: {detail}"]
+        if compose.returncode != 0:
+            detail = (compose.stderr or compose.stdout).strip()
+            safe_detail = redact_progress_detail(
+                detail,
+                secret_values=secret_values_from_environment(os.environ),
+            )
+            suffix = f": {safe_detail}" if safe_detail else ""
+            return [f"Docker Compose v2 is required for Tier 3 {mode_label} mode{suffix}"]
+
+    try:
+        from harbor.environments.factory import EnvironmentFactory
+        from harbor.models.environment_type import EnvironmentType
+
+        if cwsandbox_errors := _cwsandbox_prerequisite_errors(env_mode):
+            return cwsandbox_errors
+        if backend_config_errors := _backend_config_prerequisite_errors(env_mode):
+            return backend_config_errors
+        EnvironmentFactory.run_preflight(EnvironmentType(harbor_environment_type(env_mode)))
+        if env_mode == "kata":
+            from harbor.environments.kata import DEFAULT_KATA_RUNTIME, KataEnvironment
+
+            # Harbor's preflight only requires some Kata handler; require the selected one.
+            kata_runtime = (environment_kwargs or {}).get("kata_runtime", DEFAULT_KATA_RUNTIME)
+            if kata_runtime not in KataEnvironment._registered_kata_runtimes():
+                return [f"Harbor environment 'kata' requires Docker to register the Kata runtime {kata_runtime!r}."]
+        if env_mode == "ack":
+            ack_subprocess_env = (
+                dict(subprocess_env)
+                if subprocess_env is not None
+                else _selected_host_environment(
+                    _HARBOR_BASE_ENV_VARS | _HARBOR_ENV_MODE_VARS["ack"],
+                    os.environ,
+                )
+            )
+            _check_ack_cluster_readiness_subprocess(
+                dict(environment_kwargs or {}),
+                subprocess_env=ack_subprocess_env,
+            )
+    except ImportError as exc:
+        detail = redact_progress_detail(
+            _harbor_missing_dependency_summary(exc),
+            secret_values=secret_values_from_environment(os.environ),
+        )
+        return [
+            f"Harbor environment '{env_mode}' needs optional dependencies: {detail}. "
+            f"{_environment_extra_install_hint(env_mode)}"
+        ]
+    except SystemExit as exc:
+        detail = (
+            redact_progress_detail(
+                exc,
+                secret_values=secret_values_from_environment(os.environ),
+            )
+            or "preflight exited without a diagnostic"
+        )
+        return [f"Harbor environment '{env_mode}' is not ready: {detail}"]
+    except Exception as exc:
+        detail = redact_progress_detail(
+            exc,
+            secret_values=secret_values_from_environment(os.environ),
+        )
+        return [f"Harbor environment '{env_mode}' is not ready: {detail}"]
+    return []
+
+
+def _is_operator_owned_runtime_name(name: str, *, env_mode: str = DEFAULT_ENV_MODE) -> bool:
+    normalized = name.upper()
+    if (
+        normalized in _RUNTIME_ENV_HOST_CONTROL_NAMES
+        or normalized in _env_mode_host_env_vars(env_mode)
+        or normalized in _OPERATOR_OWNED_AGENT_ENV
+        or normalized.startswith(_RUNTIME_ENV_HOST_CONTROL_PREFIXES)
+        or is_operator_owned_or_provider_secret(name)
+    ):
+        return True
+    if not is_sensitive_key(name):
+        return False
+    from skillevaluator.tier3.harbor.adapter import McpSecurityPolicy
+
+    return name.strip() not in McpSecurityPolicy.from_environ().allowed_secrets
+
+
+def _resolve_runtime_env(
+    templates: dict[str, str] | None,
+    *,
+    env_mode: str,
+) -> tuple[dict[str, str], list[str]]:
+    resolved: dict[str, str] = {}
+    errors: list[str] = []
+    for name, template in (templates or {}).items():
+        if _is_operator_owned_runtime_name(name, env_mode=env_mode):
+            errors.append(f"harbor.runtime_env.{name} controls the host process and is not allowed")
+            continue
+        template_value = str(template)
+        dollar_references = {
+            braced or plain
+            for braced, plain in re.findall(
+                r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}|\$([A-Za-z_][A-Za-z0-9_]*)\b",
+                template_value,
+            )
+        }
+        percent_references = set(re.findall(r"%([A-Za-z_][A-Za-z0-9_]*)%", template_value))
+        references = dollar_references | percent_references
+        if is_sensitive_key(name) and not references:
+            errors.append(
+                f"harbor.runtime_env.{name} must reference an environment variable rather than a literal secret"
+            )
+            continue
+        owned_references = sorted(
+            reference for reference in references if _is_operator_owned_runtime_name(reference, env_mode=env_mode)
+        )
+        if owned_references:
+            errors.append(
+                f"harbor.runtime_env.{name} references operator-owned credential(s): " + ", ".join(owned_references)
+            )
+            continue
+        value = os.path.expandvars(template_value)
+        if "$" in value:
+            errors.append(f"harbor.runtime_env.{name} references an unset environment variable")
+        else:
+            resolved[name] = value
+    return resolved, errors
+
+
+def _selected_host_environment(names: set[str] | frozenset[str], source: Mapping[str, str]) -> dict[str, str]:
+    return {name: source[name] for name in names if source.get(name)}
+
+
+def _harbor_subprocess_environment(
+    *,
+    env_mode: str,
+    provider: ProviderConfig,
+    configured_runtime_env: Mapping[str, str],
+    provider_env: Mapping[str, str],
+    agent: str | None = None,
+    agent_model: str | None = None,
+    environment_kwargs: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Build Harbor's minimal host environment without ambient secrets."""
+    host_env = os.environ
+    environment = _selected_host_environment(_HARBOR_BASE_ENV_VARS, host_env)
+    environment.update(_selected_host_environment(_env_mode_host_env_vars(env_mode), host_env))
+    for name in _env_mode_host_path_env_vars(env_mode) & environment.keys():
+        environment[name] = _absolute_host_path(environment[name])
+    if provider.provider == "bedrock":
+        environment.update(_selected_host_environment(_BEDROCK_HOST_ENV_VARS, host_env))
+    is_adc = (
+        getattr(provider, "credential_env", None) == CREDENTIAL_SOURCE_ADC
+        or provider_env.get(CREDENTIAL_SOURCE_ENV) == CREDENTIAL_SOURCE_ADC
+    )
+    if is_adc and env_mode != ENV_MODE_LOCAL:
+        environment.update(_selected_host_environment(_ADC_HOST_ENV_VARS, host_env))
+    environment.update(configured_runtime_env)
+    environment.update(provider_env)
+    if env_mode == "gke":
+        resolved_kubeconfig = _resolve_single_kubeconfig(environment.get("KUBECONFIG"))
+        if resolved_kubeconfig is not None:
+            environment["KUBECONFIG"] = str(resolved_kubeconfig)
+        if is_gke_workload_identity_allowed(environment_kwargs, environment):
+            environment[GKE_ALLOW_WORKLOAD_IDENTITY_ENV] = "1"
+    if env_mode == ENV_MODE_LOCAL:
+        from skillevaluator.tier3.harbor.local_runtime import local_subprocess_env
+
+        local_credentials = _local_agent_credentials(provider)
+        if provider.provider == "nv_build" and agent == "opencode" and (agent_model or "").startswith("nvidia/"):
+            # OpenCode's NVIDIA adapter reads OPENAI_* internally. Override an
+            # independent Codex pair for this Harbor subprocess only; each
+            # selected local agent receives its own environment below.
+            environment.pop("ANTHROPIC_API_KEY", None)
+            environment.pop("ANTHROPIC_BASE_URL", None)
+            environment.update(local_credentials)
+        elif provider.provider == "nv_build" and agent in {"codex", "claude-code"}:
+            # The trusted Harbor parent keeps NVIDIA_API_KEY for the verifier
+            # and in-process bridge. Vendor children receive only the bridge's
+            # per-trial capability token, never ambient native credentials.
+            for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"):
+                environment.pop(name, None)
+        else:
+            # Never synthesize the missing half of a configured independent
+            # OpenAI pair from NVIDIA Build. Shared preflight rejects partial
+            # Codex credentials before Harbor starts.
+            configured_openai = {
+                name for name in configured_runtime_env if name in {"OPENAI_API_KEY", "OPENAI_BASE_URL"}
+            }
+            for name, value in local_credentials.items():
+                if provider.provider == "nv_build" and configured_openai and name.startswith("OPENAI_"):
+                    continue
+                environment.setdefault(name, value)
+        environment = local_subprocess_env(runtime_agents=[agent] if agent else None, base_env=environment)
+    return environment
+
+
+def _independent_anthropic_agent_credentials(
+    *,
+    env_mode: str = "",
+    environment_kwargs: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Resolve and validate a host-owned Anthropic credential pair or Vertex AI configuration."""
+    candidate_names = (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_USE_VERTEX",
+        "ANTHROPIC_VERTEX_PROJECT_ID",
+        "CLOUD_ML_REGION",
+    )
+    credentials = {name: os.environ.get(name, "") for name in candidate_names if os.environ.get(name)}
+
+    if credentials.get("CLAUDE_CODE_USE_VERTEX") == "1":
+        from skillevaluator.tier3.harbor.runtime_preflight import (
+            _resolve_vertex_project_id,
+            _resolve_vertex_region,
+        )
+
+        credentials.pop("ANTHROPIC_API_KEY", None)
+        if "ANTHROPIC_VERTEX_PROJECT_ID" not in credentials and (project_id := _resolve_vertex_project_id()):
+            credentials["ANTHROPIC_VERTEX_PROJECT_ID"] = project_id
+
+        if "CLOUD_ML_REGION" not in credentials:
+            credentials["CLOUD_ML_REGION"] = _resolve_vertex_region()
+
+        # In GKE mode, strip host-local GOOGLE_APPLICATION_CREDENTIALS paths;
+        # pods authenticate via Kubernetes Workload Identity only when explicitly allowed.
+        if env_mode == "gke":
+            credentials.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+            if not is_gke_workload_identity_allowed(environment_kwargs):
+                return {}
+        elif g_creds := os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip():
+            credentials["GOOGLE_APPLICATION_CREDENTIALS"] = g_creds
+
+    if base_url := credentials.get("ANTHROPIC_BASE_URL"):
+        normalized_base_url = _normalize_anthropic_base_url(
+            base_url,
+            variable="ANTHROPIC_BASE_URL",
+        )
+        if normalized_base_url is None:
+            credentials.pop("ANTHROPIC_BASE_URL")
+        else:
+            credentials["ANTHROPIC_BASE_URL"] = normalized_base_url
+    return credentials
+
+
+def _gateway_anthropic_agent_credentials(
+    provider: ProviderConfig,
+    *,
+    env_mode: str = "docker",
+    environment_kwargs: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Use a shared gateway unless the operator selected a separate Claude route.
+
+    A standalone Anthropic key keeps its native endpoint, so a native key is
+    never silently sent to the shared gateway. An explicit base URL without a
+    separate key selects another API root on the operator's gateway.
+
+    On the gateway route Claude Code stops sending pre-release request fields,
+    which gateways that forward to another provider reject with HTTP 400.
+    """
+    credentials = _independent_anthropic_agent_credentials(env_mode=env_mode, environment_kwargs=environment_kwargs)
+    if credentials.get("ANTHROPIC_API_KEY", "").strip() or credentials.get("CLAUDE_CODE_USE_VERTEX", "").strip() == "1":
+        return credentials
+    base_url = credentials.get("ANTHROPIC_BASE_URL")
+    if not base_url:
+        base_url = _normalize_anthropic_base_url(provider.base_url or "", variable="SKILL_EVAL_LLM_BASE_URL")
+    if not base_url:
+        raise ProviderConfigurationError("SKILL_EVAL_LLM_BASE_URL is required for the Claude gateway route.")
+    return {
+        "ANTHROPIC_API_KEY": provider.api_key or "",
+        "ANTHROPIC_BASE_URL": base_url,
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    }
+
+
+# Opt-in standard judge policies, read again by the verifier template:
+# host variable -> (run_config.json judge key, accepted values, default first).
+_JUDGE_POLICY_ENV_VARS = {
+    "LLM_JUDGE_FALLBACK_POLICY": ("fallback_policy", ("append", "replace")),
+    "LLM_JUDGE_RETRY_POLICY": ("retry_policy", ("legacy", "strict")),
+}
+
+
+def _judge_policies(environ: Mapping[str, str]) -> tuple[dict[str, str], list[str]]:
+    """Return the set judge policies keyed for ``run_config.json``, and an error for each unknown value.
+
+    Values are case-insensitive and an empty value means unset, as in the verifier.
+    """
+    policies: dict[str, str] = {}
+    errors: list[str] = []
+    for name, (key, choices) in _JUDGE_POLICY_ENV_VARS.items():
+        value = environ.get(name, "").strip().lower()
+        if not value:
+            continue
+        if value in choices:
+            policies[key] = value
+        else:
+            errors.append(f"{name} must be {' or '.join(choices)}")
+    return policies, errors
+
+
+def _judge_model_config(
+    provider: ProviderConfig,
+    provider_env: Mapping[str, str],
+    grading_mode: str,
+) -> dict[str, str | bool]:
+    """Describe the configured standard-grading judge before any provider fallback."""
+    if grading_mode == "custom_only":
+        return {"enabled": False}
+    for name in ("LLM_JUDGE_MODEL", "SKILL_EVAL_JUDGE_MODEL"):
+        if model := provider_env.get(name):
+            source = name
+            override_applied = True
+            break
+    else:
+        model = provider.model
+        source = "SKILL_EVAL_LLM_MODEL" if os.environ.get("SKILL_EVAL_LLM_MODEL", "").strip() else "provider default"
+        override_applied = False
+    configuration = {
+        "enabled": True,
+        "provider": provider.provider,
+        "model": model,
+        "source": source,
+        "override_applied": override_applied,
+        "reasoning_effort": effective_reasoning_effort(provider.provider, model, JUDGE_REASONING_EFFORT),
+    }
+    if character_facts := provider_env.get("SKILL_EVAL_JUDGE_CHARACTER_FACTS"):
+        configuration["character_facts"] = character_facts
+    # Only a known value is recorded; the run stops before trials on any other.
+    configuration.update(_judge_policies(provider_env)[0])
+    return configuration
+
+
+def _job_judge_override(provider_env: Mapping[str, str], grading_mode: str) -> tuple[str, str] | None:
+    """Return the selected dedicated host override name and value, if enabled."""
+    if grading_mode == "custom_only":
+        return None
+    for name in ("LLM_JUDGE_MODEL", "SKILL_EVAL_JUDGE_MODEL"):
+        if value := provider_env.get(name):
+            return name, value
+    return None
+
+
+def _job_judge_verifier_env(provider_env: Mapping[str, str], grading_mode: str) -> dict[str, str]:
+    """Return placeholder-based judge overrides for Harbor's verifier job layer."""
+    if grading_mode == "custom_only":
+        return {}
+    environment = {
+        name: f"${{{name}}}"
+        for name in _VERIFIER_JUDGE_CONTROL_ENV_VARS - _VERIFIER_JUDGE_MODEL_ENV_VARS
+        if provider_env.get(name)
+    }
+    selected = _job_judge_override(provider_env, grading_mode)
+    if selected is not None:
+        source, _value = selected
+        # Harbor resolves every task-authored placeholder before verifier startup.
+        # Override both spellings from the selected host source so a stale alias
+        # cannot fail resolution or survive task/step/job environment merging.
+        environment.update(dict.fromkeys(sorted(_VERIFIER_JUDGE_MODEL_ENV_VARS), f"${{{source}}}"))
+    return environment
+
+
+def _job_judge_subprocess_env(provider_env: Mapping[str, str], grading_mode: str) -> dict[str, str]:
+    """Make both aliases resolvable while Harbor constructs verifier environments."""
+    if grading_mode == "custom_only":
+        return {}
+    environment = {
+        name: provider_env[name]
+        for name in _VERIFIER_JUDGE_CONTROL_ENV_VARS - _VERIFIER_JUDGE_MODEL_ENV_VARS
+        if provider_env.get(name)
+    }
+    selected = _job_judge_override(provider_env, grading_mode)
+    if selected is not None:
+        _source, value = selected
+        environment.update(dict.fromkeys(_VERIFIER_JUDGE_MODEL_ENV_VARS, value))
+    return environment
+
+
+def _agent_credentials(
+    *,
+    provider: ProviderConfig,
+    agent: str,
+    env_mode: str,
+    environment_kwargs: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Resolve operator-owned credentials for exactly one agent runtime."""
+    if provider.provider == "nv_build":
+        if agent in {"opencode", "hermes"}:
+            if env_mode == ENV_MODE_LOCAL:
+                return _local_agent_credentials(provider)
+            return {"NVIDIA_API_KEY": provider.api_key or ""}
+        if env_mode in HARBOR_DOCKER_ENGINE_ENV_MODES | {ENV_MODE_LOCAL} and agent in {"claude-code", "codex"}:
+            # The Docker bridge wrapper reads the evaluator credential from
+            # the Harbor parent handoff; the vendor CLI receives only a local
+            # sentinel and must not inherit NVIDIA_API_KEY in task env.
+            return {}
+        if agent == "claude-code":
+            return _independent_anthropic_agent_credentials(env_mode=env_mode, environment_kwargs=environment_kwargs)
+        if agent == "codex":
+            return {
+                name: os.environ.get(name, "") for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL") if os.environ.get(name)
+            }
+        return {}
+
+    if provider.provider == "openai-compatible" and agent == "claude-code":
+        return _gateway_anthropic_agent_credentials(provider, env_mode=env_mode, environment_kwargs=environment_kwargs)
+    if provider.provider == "openai" and agent == "claude-code":
+        return _independent_anthropic_agent_credentials(env_mode=env_mode, environment_kwargs=environment_kwargs)
+    if provider.provider == "anthropic" and agent == "codex":
+        return {
+            name: os.environ.get(name, "") for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL") if os.environ.get(name)
+        }
+
+    if provider.provider == "anthropic" and agent in {"claude-code", "opencode"}:
+        if agent == "claude-code" and os.environ.get("CLAUDE_CODE_USE_VERTEX", "").strip() == "1":
+            return _independent_anthropic_agent_credentials(env_mode=env_mode, environment_kwargs=environment_kwargs)
+        return {
+            name: value
+            for name, value in {
+                "ANTHROPIC_API_KEY": provider.api_key or "",
+                "ANTHROPIC_BASE_URL": provider.base_url or "",
+            }.items()
+            if value
+        }
+    if provider.provider in {"openai", "openai-compatible"} and agent in {"codex", "opencode"}:
+        return {
+            name: value
+            for name, value in {
+                "OPENAI_API_KEY": provider.api_key or "",
+                "OPENAI_BASE_URL": provider.base_url or "",
+            }.items()
+            if value
+        }
+    if provider.provider == "bedrock" and agent == "claude-code":
+        credentials = {
+            name: value for name, value in _provider_environment(provider).items() if name.startswith("AWS_") and value
+        }
+        credentials["CLAUDE_CODE_USE_BEDROCK"] = "1"
+        return credentials
+    return {}
+
+
+def _agent_provider_config(
+    *,
+    evaluator_provider: ProviderConfig,
+    agent: str,
+    model: str,
+    credentials: Mapping[str, str],
+    env_mode: str,
+) -> ProviderConfig:
+    """Describe the API provider the selected agent will actually call."""
+    if agent == "claude-code" and credentials.get("CLAUDE_CODE_USE_VERTEX") == "1":
+        resolved_model = model.removeprefix("anthropic/")
+        return ProviderConfig(
+            provider="anthropic",
+            model=resolved_model,
+            api_key=None,
+            base_url=credentials.get("ANTHROPIC_BASE_URL"),
+            litellm_model=f"anthropic/{resolved_model}",
+            region=credentials.get("CLOUD_ML_REGION"),
+            credential_env="CLAUDE_CODE_USE_VERTEX",
+        )
+    if evaluator_provider.provider in {"openai", "openai-compatible"} and agent == "claude-code":
+        resolved_model = model.removeprefix("anthropic/")
+        return ProviderConfig(
+            provider="anthropic",
+            model=resolved_model,
+            api_key=credentials.get("ANTHROPIC_API_KEY"),
+            base_url=credentials.get("ANTHROPIC_BASE_URL"),
+            litellm_model=f"anthropic/{resolved_model}",
+        )
+    if evaluator_provider.provider == "anthropic" and agent == "codex":
+        resolved_model = model.removeprefix("openai/")
+        return ProviderConfig(
+            provider="openai-compatible",
+            model=resolved_model,
+            api_key=credentials.get("OPENAI_API_KEY"),
+            base_url=credentials.get("OPENAI_BASE_URL"),
+            litellm_model=f"openai/{resolved_model}",
+        )
+    if (
+        evaluator_provider.provider == "nv_build"
+        and agent == "claude-code"
+        and env_mode not in HARBOR_DOCKER_ENGINE_ENV_MODES | {ENV_MODE_LOCAL}
+    ):
+        resolved_model = model.removeprefix("anthropic/")
+        return ProviderConfig(
+            provider="anthropic",
+            model=resolved_model,
+            api_key=credentials.get("ANTHROPIC_API_KEY"),
+            base_url=credentials.get("ANTHROPIC_BASE_URL"),
+            litellm_model=f"anthropic/{resolved_model}",
+        )
+    if (
+        evaluator_provider.provider == "nv_build"
+        and agent == "codex"
+        and env_mode not in HARBOR_DOCKER_ENGINE_ENV_MODES | {ENV_MODE_LOCAL}
+    ):
+        resolved_model = model.removeprefix("openai/")
+        return ProviderConfig(
+            provider="openai-compatible",
+            model=resolved_model,
+            api_key=credentials.get("OPENAI_API_KEY"),
+            base_url=credentials.get("OPENAI_BASE_URL"),
+            litellm_model=f"openai/{resolved_model}",
+        )
+    if agent == "opencode":
+        runtime_namespaces = {
+            "anthropic": "anthropic/",
+            "nv_build": "nvidia/",
+            "openai": "openai/",
+            "openai-compatible": "openai/",
+        }
+        resolved_model = model.removeprefix(runtime_namespaces.get(evaluator_provider.provider, ""))
+    else:
+        resolved_model = model
+    default_prefix = "anthropic" if evaluator_provider.provider == "anthropic" else evaluator_provider.provider
+    litellm_prefix = getattr(evaluator_provider, "litellm_model", f"{default_prefix}/{resolved_model}").partition("/")[
+        0
+    ]
+    return ProviderConfig(
+        provider=evaluator_provider.provider,
+        model=resolved_model,
+        api_key=evaluator_provider.api_key,
+        base_url=evaluator_provider.base_url,
+        litellm_model=f"{litellm_prefix}/{resolved_model}",
+        region=getattr(evaluator_provider, "region", None),
+    )
+
+
+def _resolve_agent_runtime_plan(
+    *,
+    provider: ProviderConfig,
+    agents: list[str],
+    models: Mapping[str, str],
+    configured_runtime_env: Mapping[str, str],
+    env_mode: str,
+    model_sources: Mapping[str, str] | None = None,
+    environment_kwargs: Mapping[str, str] | None = None,
+) -> dict[str, AgentRuntimePlan]:
+    """Resolve the single credential plan used by staging and execution.
+
+    Skill-owned configuration may add non-credential runtime values, but agent
+    and provider credentials always come from the operator's selected provider
+    or host environment. This prevents a skill from replacing a credential or
+    routing a trusted key to an attacker-controlled endpoint.
+    """
+    collisions = sorted(_OPERATOR_OWNED_AGENT_ENV.intersection(configured_runtime_env))
+    if collisions:
+        names = ", ".join(collisions)
+        raise ValueError(f"harbor.runtime_env contains operator-owned credential name(s): {names}")
+
+    # Dedicated judge aliases are job-scoped. Standard grading adds the
+    # selected alias at launch time, while custom-only grading must not retain
+    # it in the reusable Harbor parent environment.
+    provider_env = {
+        name: value
+        for name, value in _provider_environment(provider).items()
+        if name not in _VERIFIER_JUDGE_CONTROL_ENV_VARS
+    }
+    effective_provider = provider
+    if provider.provider in {"openai", "openai-compatible"}:
+        refreshed_key = provider_env.get("OPENAI_API_KEY")
+        refreshed_expiry = _normalize_expiry_epoch(provider_env.get(CREDENTIAL_EXPIRY_ENV))
+        if (refreshed_key and refreshed_key != provider.api_key) or refreshed_expiry != getattr(
+            provider, "credential_expiry", None
+        ):
+            effective_provider = replace(
+                provider,
+                api_key=refreshed_key or provider.api_key,
+                credential_expiry=refreshed_expiry,
+            )
+    elif provider.provider == "anthropic":
+        refreshed_key = provider_env.get("ANTHROPIC_API_KEY")
+        if refreshed_key and refreshed_key != provider.api_key:
+            effective_provider = replace(provider, api_key=refreshed_key)
+
+    plans: dict[str, AgentRuntimePlan] = {}
+    for agent in agents:
+        credentials = _agent_credentials(
+            provider=effective_provider,
+            agent=agent,
+            env_mode=env_mode,
+            environment_kwargs=environment_kwargs,
+        )
+        validation_env = {**configured_runtime_env, **credentials}
+        credential_errors = _validate_agent_provider_credentials(
+            effective_provider,
+            [agent],
+            validation_env,
+            dict(model_sources or {}),
+            env_mode=env_mode,
+            agent_models={agent: models[agent]},
+            environment_kwargs=environment_kwargs,
+        )
+        if credential_errors:
+            raise ValueError(credential_errors[0])
+
+        subprocess_env = _harbor_subprocess_environment(
+            env_mode=env_mode,
+            provider=effective_provider,
+            configured_runtime_env=configured_runtime_env,
+            provider_env=provider_env,
+            agent=agent,
+            agent_model=models[agent],
+            environment_kwargs=environment_kwargs,
+        )
+        subprocess_env.update(credentials)
+        staged = {name: f"${{{name}}}" for name in (*configured_runtime_env, *credentials)}
+        plans[agent] = AgentRuntimePlan(
+            agent=agent,
+            model=models[agent],
+            provider=_agent_provider_config(
+                evaluator_provider=effective_provider,
+                agent=agent,
+                model=models[agent],
+                credentials=credentials,
+                env_mode=env_mode,
+            ),
+            staged_env=MappingProxyType(staged),
+            subprocess_env=MappingProxyType(subprocess_env),
+        )
+    return plans
+
+
+def _is_skill_dir(path: Path) -> bool:
+    return path.is_dir() and (path / "SKILL.md").is_file()
+
+
+def _workspace_skills(skill_path: Path, values: list[str | Path]) -> list[Path]:
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    for raw in values:
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = skill_path.parent / candidate
+        candidate = candidate.resolve()
+        options = (
+            [candidate]
+            if _is_skill_dir(candidate)
+            else sorted(path for path in candidate.iterdir() if _is_skill_dir(path))
+            if candidate.is_dir()
+            else []
+        )
+        if not options:
+            raise ValueError(f"Included skill path is not a skill or skill directory: {raw}")
+        for option in options:
+            if option != skill_path and option not in seen:
+                resolved.append(option)
+                seen.add(option)
+    return resolved
+
+
+def _workspace_skill_name(path: Path) -> str:
+    """Reserve the effective skill name without requiring an embedding description."""
+    import yaml
+
+    from skillevaluator.constants import CONTENT_DEDUP_MAX_FILE_BYTES
+    from skillevaluator.validators.frontmatter_parser import FRONTMATTER_PATTERN
+
+    content = _read_regular_evals_file(
+        path / "SKILL.md",
+        label="Workspace skill manifest",
+        max_bytes=CONTENT_DEDUP_MAX_FILE_BYTES,
+        allowed_root=path,
+    ).decode("utf-8-sig")
+    match = FRONTMATTER_PATTERN.match(content)
+    if match is not None:
+        try:
+            metadata = yaml.safe_load(match.group(1))
+        except yaml.YAMLError:
+            metadata = None
+        name = metadata.get("name") if isinstance(metadata, dict) else None
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return path.name
+
+
+def _decoy_workspace_skills(
+    skill_path: Path,
+    workspace_config: Mapping[str, Any],
+    workspace_mode: str,
+    include_skills: list[str | Path] | None = None,
+    reference_skills_dir: Path | None = None,
+) -> tuple[list[Path], list[Path], dict[str, Any] | None]:
+    """Resolve one frozen selection without changing manual workspace policy."""
+    from skillevaluator.tier3.decoys import load_decoy_manifest
+
+    raw_manifest = workspace_config.get("decoy_manifest")
+    include_values = [*workspace_config.get("include", []), *(include_skills or [])]
+    if (include_values or raw_manifest is not None) and workspace_mode != "group":
+        field = "skill_workspace.decoy_manifest" if raw_manifest is not None else "include_skills"
+        raise ValueError(f"{field} requires skill_workspace.mode=group")
+    manual_skills = _workspace_skills(skill_path.resolve(), include_values)
+    if raw_manifest is None:
+        return manual_skills, [], None
+    manifest_path = Path(raw_manifest).expanduser()
+    if not manifest_path.is_absolute():
+        manifest_path = skill_path.parent / manifest_path
+    selected, manifest = load_decoy_manifest(skill_path, manifest_path)
+
+    def name_key(value: str) -> str:
+        return unicodedata.normalize("NFC", value).casefold()
+
+    reserved = [skill_path, *manual_skills]
+    if reference_skills_dir is not None and reference_skills_dir.is_dir():
+        reserved.extend(path for path in reference_skills_dir.iterdir() if _is_skill_dir(path))
+    directory_names = {name_key(path.name) for path in reserved}
+    skill_names = {name_key(_workspace_skill_name(path)) for path in reserved}
+    for path, record in zip(selected, manifest["selected"], strict=True):
+        if name_key(path.name) in directory_names or name_key(record["skill_name"]) in skill_names:
+            raise ValueError(f"Selected decoy '{path.name}' collides with another workspace skill name")
+        directory_names.add(name_key(path.name))
+        skill_names.add(name_key(record["skill_name"]))
+    return manual_skills, selected, manifest
+
+
+@contextmanager
+def _private_decoy_workspace_snapshot(selected: list[Path], manifest: Mapping[str, Any]) -> Iterator[list[Path]]:
+    """Keep the same verified source bytes available to every paired task."""
+    from skillevaluator.tier3.decoy_identity import decoy_source_copy_ignore, decoy_source_digest
+
+    with tempfile.TemporaryDirectory(prefix="skillevaluator-decoys-snapshot-") as root_text:
+        root = Path(root_text)
+        snapshots: list[Path] = []
+        for source, record in zip(selected, manifest["selected"], strict=True):
+            expected = record["source_digest"]
+            if decoy_source_digest(source) != expected:
+                raise ValueError(f"Selected decoy '{source.name}' changed before snapshot creation")
+
+            snapshot = root / source.name
+            copytree_secure(source, snapshot, allowed_root=source, ignore=decoy_source_copy_ignore(source))
+            if decoy_source_digest(snapshot) != expected or decoy_source_digest(source) != expected:
+                raise ValueError(f"Selected decoy '{source.name}' changed while its snapshot was created")
+            snapshots.append(snapshot)
+        yield snapshots
+
+
+def _limit_staged_cases(
+    task_selectors: list[str],
+    case_id_by_task_selector: Mapping[str, str],
+    staged_task_paths: Iterable[Path],
+    *,
+    max_cases: int,
+) -> dict[str, Any]:
+    """Remove staged cases after the first ``max_cases`` and describe the selection.
+
+    Harbor discovers local dataset tasks from their directories, so pruning the
+    unselected task directories from every agent's with-skill and baseline
+    datasets limits what runs. This happens before the dataset snapshot and the
+    collector's expected cases are derived, so both describe exactly the cases
+    that ran. The staged ``dataset.toml`` is not read by ``harbor run`` and is
+    left as staged.
+    """
+    selected = task_selectors[:max_cases]
+    skipped = set(task_selectors[max_cases:])
+    for task_path in staged_task_paths:
+        if task_path.name not in skipped:
+            continue
+        if task_path.is_dir() and not task_path.is_symlink():
+            shutil.rmtree(task_path)
+        else:
+            task_path.unlink(missing_ok=True)
+    return {
+        "policy": "first_n",
+        "limit": max_cases,
+        "total": len(task_selectors),
+        "selected": len(selected),
+        "skipped": len(task_selectors) - len(selected),
+        "selected_ids": [case_id_by_task_selector[selector] for selector in selected],
+    }
+
+
+def _task_timeout_plan(task_roots: list[Path], timeout_multiplier: float) -> float | None:
+    """Return the largest staged agent timeout after applying Harbor scaling."""
+    timeouts: list[float] = []
+    for root in task_roots:
+        for task_file in root.glob("*/task.toml"):
+            try:
+                data = tomllib.loads(task_file.read_text(encoding="utf-8"))
+            except (OSError, tomllib.TOMLDecodeError):
+                continue
+            for timeout_field, value in _explicit_harbor_timeout_values(data):
+                scaled = _scaled_harbor_timeout(
+                    value,
+                    timeout_multiplier,
+                    task_file=task_file,
+                    field=timeout_field,
+                )
+                if timeout_field.endswith("agent.timeout_sec") and scaled > 0:
+                    timeouts.append(scaled)
+    return round(max(timeouts), 3) if timeouts else None
+
+
+def _explicit_harbor_timeout_values(
+    value: object,
+) -> Iterator[tuple[str, object]]:
+    """Yield explicit task bases scaled by Harbor's global multiplier."""
+    if not isinstance(value, dict):
+        return
+
+    for section_name, field_name in (
+        ("agent", "timeout_sec"),
+        ("verifier", "timeout_sec"),
+        ("environment", "build_timeout_sec"),
+    ):
+        section = value.get(section_name)
+        if isinstance(section, dict) and field_name in section:
+            yield f"{section_name}.{field_name}", section[field_name]
+
+    steps = value.get("steps")
+    if not isinstance(steps, list):
+        return
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            continue
+        for section_name in ("agent", "verifier"):
+            section = step.get(section_name)
+            if isinstance(section, dict) and "timeout_sec" in section:
+                yield f"steps.{index}.{section_name}.timeout_sec", section["timeout_sec"]
+
+
+def _scaled_harbor_timeout(
+    value: object,
+    timeout_multiplier: float,
+    *,
+    task_file: Path,
+    field: str,
+) -> float:
+    """Scale one staged timeout without allowing Harbor to receive infinity."""
+    try:
+        base = float(value)
+        scaled = base * timeout_multiplier
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError(f"{task_file}: {field} produces a non-finite Harbor timeout") from None
+    if not math.isfinite(base) or not math.isfinite(scaled):
+        raise ValueError(f"{task_file}: {field} produces a non-finite Harbor timeout")
+    return scaled
+
+
+def _model_for_agent(
+    agent: str,
+    *,
+    cli_model: str | None,
+    config_agents: dict[str, Any],
+    provider: ProviderConfig,
+) -> tuple[str, str]:
+    if cli_model:
+        selected, source = cli_model, "CLI"
+    else:
+        configured = config_agents.get(agent, {}) if isinstance(config_agents, dict) else {}
+        if isinstance(configured, dict) and configured.get("model"):
+            selected, source = str(configured["model"]), "evals/config.yml"
+        elif provider.provider == "openai-compatible" and agent in GATEWAY_AGENT_DEFAULT_MODELS:
+            selected, source = GATEWAY_AGENT_DEFAULT_MODELS[agent], "openai-compatible agent default"
+            if agent == "claude-code":
+                credentials = _independent_anthropic_agent_credentials()
+                if credentials.get("ANTHROPIC_API_KEY", "").strip() and not credentials.get("ANTHROPIC_BASE_URL"):
+                    selected, source = CHAT_DEFAULT_ANTHROPIC, "native Anthropic agent default"
+        elif (
+            agent == "opencode"
+            and provider.provider == "openai"
+            and provider.model == CHAT_DEFAULT_OPENAI
+            and not os.environ.get("SKILL_EVAL_LLM_MODEL", "").strip()
+        ):
+            # The OpenAI chat default needs the Responses API for tool calls;
+            # an explicit SKILL_EVAL_LLM_MODEL still reaches OpenCode.
+            selected, source = OPENCODE_OPENAI_DEFAULT_MODEL, "native OpenAI agent default"
+        else:
+            selected, source = provider.model, "public provider default"
+    if (
+        provider.provider == "nv_build"
+        and source == "public provider default"
+        and (agent in {"codex", "claude-code"} or provider.model == CHAT_DEFAULT_NVIDIA)
+    ):
+        # Share the NVIDIA chat default across agent execution and judging.
+        # Provider-model, --model, --agent-model, and evals/config.yml overrides
+        # stay exact for native OpenCode; bridge defaults remain compatibility-pinned.
+        selected = _NVIDIA_BUILD_AGENT_DEFAULT_MODEL
+    if agent == "hermes" and source == "public provider default" and provider.provider == "nv_build":
+        selected = "nvidia/nemotron-3.5-super-vl-120b-a12b"
+    if agent == "opencode":
+        namespace = {
+            "anthropic": "anthropic",
+            "nv_build": "nvidia",
+            "openai": "openai",
+            "openai-compatible": "openai",
+        }.get(provider.provider)
+        if namespace and source not in {"CLI", "evals/config.yml"}:
+            selected = f"{namespace}/{selected}"
+    return selected, source
+
+
+def _agent_import_path(provider: ProviderConfig, agent: str, env_mode: str) -> str | None:
+    """Select the agent wrapper the provider and the execution backend both require."""
+    required = _provider_agent_import_path(provider, agent, env_mode)
+    backend = None if env_mode in HARBOR_ENV_MODES else _custom_backend(env_mode)
+    if backend is None or (selected := backend.agent_import_paths.get(agent)) is None:
+        return required
+    if required is None or selected == required:
+        return selected
+    # The provider needs its wrapper's routing; a backend wrapper may adapt setup
+    # only by extending that wrapper, never by silently replacing it.
+    from harbor.utils.import_path import import_symbol
+
+    try:
+        compatible = issubclass(import_symbol(selected), import_symbol(required))
+    except (ImportError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Custom execution backend '{env_mode}' agent wrapper {selected} could not be checked: {exc}"
+        ) from None
+    if not compatible:
+        raise ValueError(
+            f"Custom execution backend '{env_mode}' runs {agent} with {selected}, but the {provider.provider} "
+            f"provider requires {required}; the backend wrapper must subclass it"
+        )
+    return selected
+
+
+def _provider_agent_import_path(provider: ProviderConfig, agent: str, env_mode: str) -> str | None:
+    """Select only the provider-specific wrappers required for this environment."""
+    if agent == "hermes" and provider.provider == "nv_build" and env_mode == "docker":
+        return DOCKER_AGENT_IMPORT_PATHS["hermes"]
+    if provider.provider == "openai-compatible" and agent == "claude-code":
+        if env_mode == ENV_MODE_LOCAL:
+            return "skillevaluator.tier3.harbor.local_agents:SkillEvaluatorLocalGatewayClaudeCode"
+        return _GATEWAY_CLAUDE_IMPORT_PATH
+    if provider.provider == "openai-compatible" and agent == "codex" and env_mode != ENV_MODE_LOCAL:
+        return _GATEWAY_CODEX_IMPORT_PATH
+    if provider.provider == "openai-compatible" and agent == "opencode" and env_mode in HARBOR_DOCKER_ENGINE_ENV_MODES:
+        return "skillevaluator.tier3.harbor.local_agents:SkillEvaluatorGatewayOpenCode"
+    return _nvidia_build_agent_import_path(provider, agent, env_mode)
+
+
+def _nvidia_build_agent_import_path(provider: ProviderConfig, agent: str, env_mode: str) -> str | None:
+    """Return the environment-specific NVIDIA Build compatibility wrapper."""
+    if provider.provider != "nv_build":
+        return None
+    from skillevaluator.tier3.harbor.local_agents import (
+        NVIDIA_BUILD_AGENT_IMPORT_PATHS,
+        NVIDIA_BUILD_LOCAL_AGENT_IMPORT_PATHS,
+    )
+
+    if env_mode in HARBOR_DOCKER_ENGINE_ENV_MODES:
+        return NVIDIA_BUILD_AGENT_IMPORT_PATHS.get(agent)
+    if env_mode == ENV_MODE_LOCAL:
+        return NVIDIA_BUILD_LOCAL_AGENT_IMPORT_PATHS.get(agent)
+    return None
+
+
+def _signal_harbor_process_group(process: subprocess.Popen[bytes], value: signal.Signals) -> None:
+    try:
+        os.killpg(process.pid, value)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        # macOS can report EPERM instead of ESRCH after the group leader exits.
+        # Suppress only when the original PID is independently gone.
+        if process.poll() is not None:
+            try:
+                os.getpgid(process.pid)
+            except ProcessLookupError:
+                return
+        raise
+
+
+def _windows_system_directory() -> Path:
+    """Return the Windows system directory without consulting ambient environment."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_system_directory = kernel32.GetSystemDirectoryW
+    get_system_directory.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+    get_system_directory.restype = wintypes.UINT
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = get_system_directory(buffer, len(buffer))
+    if length == 0:
+        raise ctypes.WinError(ctypes.get_last_error())
+    if length >= len(buffer):
+        raise OSError("Windows system directory path exceeded the supported length")
+    system_directory = Path(buffer.value)
+    if not system_directory.is_absolute():
+        raise OSError("Windows system directory was not absolute")
+    return system_directory
+
+
+def _verified_windows_taskkill_path() -> Path:
+    """Resolve a regular, non-reparse taskkill executable inside System32."""
+    system_directory = _windows_system_directory()
+    if not system_directory.is_absolute():
+        raise OSError("Windows system directory was not absolute")
+    candidate = system_directory / "taskkill.exe"
+    try:
+        system_metadata = system_directory.lstat()
+        candidate_metadata = candidate.lstat()
+        resolved_system_directory = system_directory.resolve(strict=True)
+        resolved_candidate = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise OSError("Windows taskkill executable could not be verified") from exc
+
+    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+    def is_reparse_point(metadata: os.stat_result) -> bool:
+        return bool(getattr(metadata, "st_file_attributes", 0) & reparse_attribute)
+
+    if (
+        not stat.S_ISDIR(system_metadata.st_mode)
+        or stat.S_ISLNK(system_metadata.st_mode)
+        or is_reparse_point(system_metadata)
+    ):
+        raise OSError("Windows system directory could not be verified")
+    if (
+        not stat.S_ISREG(candidate_metadata.st_mode)
+        or stat.S_ISLNK(candidate_metadata.st_mode)
+        or is_reparse_point(candidate_metadata)
+    ):
+        raise OSError("Windows taskkill executable could not be verified")
+    if resolved_candidate.parent != resolved_system_directory:
+        raise OSError("Windows taskkill executable escaped the system directory")
+    return resolved_candidate
+
+
+def _wait_for_harbor_leader(
+    process: subprocess.Popen[bytes],
+    timeout_seconds: float,
+    *,
+    end_grace: threading.Event | None,
+) -> None:
+    """Wait up to ``timeout_seconds`` for Harbor to exit, or until ``end_grace`` is set."""
+    deadline = time.monotonic() + timeout_seconds
+    while (remaining := deadline - time.monotonic()) > 0:
+        if end_grace is not None and end_grace.is_set():
+            return
+        try:
+            process.wait(timeout=min(remaining, _HARBOR_RUN_CANCEL_POLL_SECONDS))
+        except subprocess.TimeoutExpired:
+            continue
+        return
+
+
+def _wait_for_windows_taskkill(
+    taskkill: subprocess.Popen[bytes],
+    timeout_seconds: float,
+    *,
+    end_grace: threading.Event | None,
+) -> None:
+    """Wait up to ``timeout_seconds`` for ``taskkill`` to exit, or until ``end_grace`` is set.
+
+    The wait is cut into short slices so a set ``end_grace`` (a second Ctrl+C) is
+    noticed within ``_HARBOR_RUN_CANCEL_POLL_SECONDS`` instead of after the whole
+    budget. A ``taskkill`` that is still running when the budget runs out, or
+    when ``end_grace`` is set, raises :class:`subprocess.TimeoutExpired` so the
+    caller stops it and fails closed rather than treating the tree as stopped.
+    """
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    while True:
+        slice_seconds = min(max(deadline - time.monotonic(), 0.0), _HARBOR_RUN_CANCEL_POLL_SECONDS)
+        try:
+            taskkill.wait(timeout=slice_seconds)
+        except subprocess.TimeoutExpired as exc:
+            now = time.monotonic()
+            if now >= deadline or (end_grace is not None and end_grace.is_set()):
+                raise subprocess.TimeoutExpired(exc.cmd, now - started) from None
+            continue
+        return
+
+
+def _terminate_harbor_process_tree(
+    process: subprocess.Popen[bytes],
+    *,
+    grace_seconds: float = _HARBOR_RUN_TERMINATE_SECONDS,
+    end_grace: threading.Event | None = None,
+) -> None:
+    """Terminate the POSIX process group or Windows task tree and reap Harbor.
+
+    On POSIX the group receives SIGTERM, then SIGKILL once the leader exits or
+    ``grace_seconds`` pass, whichever is first; a set ``end_grace`` skips the
+    rest of the grace period. Windows has no SIGTERM that Harbor handles, so
+    its task tree is always stopped with ``taskkill /T /F`` and ``grace_seconds``
+    does not apply. ``taskkill`` gets up to ``_HARBOR_WINDOWS_TREE_KILL_SECONDS``;
+    a set ``end_grace`` stops that wait early, kills ``taskkill`` and fails
+    closed, because the tree was then not confirmed stopped.
+    """
+    if os.name == "posix":
+        # POSIX process groups do not own a descendant that deliberately calls
+        # setsid(2). The host-side Harbor CLI/configuration is therefore a
+        # trusted boundary; untrusted task execution belongs in an isolated
+        # backend rather than SkillEvaluator's experimental local mode.
+        _signal_harbor_process_group(process, signal.SIGTERM)
+        _wait_for_harbor_leader(process, grace_seconds, end_grace=end_grace)
+        # Always signal the original group after the grace period. The leader
+        # may already have exited while a descendant retained the output pipe.
+        _signal_harbor_process_group(process, signal.SIGKILL)
+        try:
+            process.wait(timeout=_HARBOR_RUN_REAP_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Harbor parent process could not be reaped") from exc
+        return
+
+    taskkill_error: BaseException | None = None
+    taskkill: subprocess.Popen[bytes] | None = None
+    try:
+        taskkill = subprocess.Popen(
+            [str(_verified_windows_taskkill_path()), "/PID", str(process.pid), "/T", "/F"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _wait_for_windows_taskkill(taskkill, _HARBOR_WINDOWS_TREE_KILL_SECONDS, end_grace=end_grace)
+        if taskkill.returncode != 0:
+            taskkill_error = RuntimeError("Windows Harbor process-tree cleanup failed")
+    except subprocess.TimeoutExpired as exc:
+        taskkill_error = exc
+        if taskkill is not None and taskkill.poll() is None:
+            taskkill.kill()
+            try:
+                taskkill.wait(timeout=_HARBOR_RUN_REAP_SECONDS)
+            except subprocess.TimeoutExpired as reap_error:
+                taskkill_error = reap_error
+    except OSError as exc:
+        taskkill_error = exc
+    if process.poll() is None:
+        process.kill()
+    try:
+        process.wait(timeout=_HARBOR_RUN_REAP_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Harbor parent process could not be reaped") from exc
+    if taskkill_error is not None:
+        raise RuntimeError("Harbor process-tree cleanup could not be confirmed") from taskkill_error
+
+
+def _run_bounded_harbor_process(
+    command: list[str],
+    *,
+    env: Mapping[str, str],
+    cwd: Path,
+    stdin_text: str | None,
+    timeout_seconds: float | None,
+    max_output_bytes: int,
+    diagnostic_tail_chars: int,
+    secret_values: set[str],
+    cancellation: _HarborRunCancellation | None = None,
+) -> _BoundedHarborProcessResult:
+    """Run Harbor with bounded merged output and optional cleanup deadline.
+
+    A requested ``cancellation`` prevents the launch, or stops a running
+    process tree, and then raises :class:`_HarborRunCancelledError`. A running
+    job gets SIGTERM and up to ``_HARBOR_RUN_CANCEL_GRACE_SECONDS`` to stop its
+    environments before the group is killed, unless the cancellation is forced.
+    """
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        raise ValueError("Harbor run timeout must be positive")
+    if max_output_bytes <= 0:
+        raise ValueError("Harbor output byte limit must be positive")
+    if diagnostic_tail_chars <= 0:
+        raise ValueError("Harbor diagnostic tail limit must be positive")
+    if cancellation is not None:
+        cancellation.raise_if_requested()
+
+    creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=str(cwd),
+        env=_harbor_launch_environment(env),
+        start_new_session=os.name == "posix",
+        creationflags=creation_flags,
+    )
+    if process.stdout is None:
+        _terminate_harbor_process_tree(process)
+        raise RuntimeError("Harbor output pipe invariant violated")
+
+    reader_done = threading.Event()
+    output_exceeded = threading.Event()
+    reader_error: list[BaseException] = []
+    stdin_error: list[BaseException] = []
+    output_tail = ""
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+
+    def append_tail(text: str) -> None:
+        nonlocal output_tail
+        if text:
+            output_tail = (output_tail + text)[-diagnostic_tail_chars:]
+
+    def collect_output() -> None:
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        redactor = StreamingLogRedactor(value for value in secret_values if len(value) >= 4)
+        output_budget = CommandOutputByteBudget(max_output_bytes)
+        reached_eof = False
+        try:
+            output_descriptor = process.stdout.fileno()
+            while True:
+                chunk = os.read(output_descriptor, _HARBOR_RUN_OUTPUT_READ_BYTES)
+                if not chunk:
+                    reached_eof = True
+                    break
+                remaining = output_budget.limit_bytes - output_budget.consumed_bytes
+                accepted = chunk[: max(remaining, 0)]
+                if accepted:
+                    output_budget.consume(accepted)
+                    append_tail(redactor.feed(decoder.decode(accepted)))
+                if len(chunk) > remaining:
+                    output_exceeded.set()
+                    break
+        except BaseException as exc:
+            reader_error.append(exc)
+        finally:
+            if reached_eof:
+                try:
+                    append_tail(redactor.feed(decoder.decode(b"", final=True)))
+                    append_tail(redactor.finish())
+                except BaseException as exc:
+                    reader_error.append(exc)
+            with suppress(OSError):
+                process.stdout.close()
+            reader_done.set()
+
+    def deliver_stdin() -> None:
+        try:
+            if stdin_text is None:
+                return
+            if process.stdin is None:
+                raise RuntimeError("Harbor stdin pipe invariant violated")
+            try:
+                process.stdin.write(stdin_text.encode("utf-8"))
+                process.stdin.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                process.stdin.close()
+        except BaseException as exc:
+            stdin_error.append(exc)
+
+    reader = threading.Thread(
+        target=collect_output,
+        name="skillevaluator-harbor-output",
+        daemon=True,
+    )
+    stdin_writer = threading.Thread(
+        target=deliver_stdin,
+        name="skillevaluator-harbor-stdin",
+        daemon=True,
+    )
+    reader_started = False
+    stdin_writer_started = False
+    try:
+        reader.start()
+        reader_started = True
+        stdin_writer.start()
+        stdin_writer_started = True
+        timed_out = False
+        while True:
+            if output_exceeded.is_set() or reader_error or stdin_error:
+                break
+            if reader_done.is_set() and process.poll() is not None:
+                break
+            if cancellation is not None and cancellation.requested.is_set():
+                # The BaseException handler below stops the process tree.
+                raise _HarborRunCancelledError("Tier 3 evaluation was interrupted; Harbor job stopped")
+            if deadline is None:
+                reader_done.wait(_HARBOR_RUN_POLL_SECONDS)
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            reader_done.wait(min(_HARBOR_RUN_POLL_SECONDS, remaining))
+
+        if timed_out or output_exceeded.is_set() or reader_error or stdin_error:
+            _terminate_harbor_process_tree(process)
+        else:
+            process.wait()
+        reader.join(timeout=_HARBOR_RUN_REAP_SECONDS)
+        stdin_writer.join(timeout=_HARBOR_RUN_REAP_SECONDS)
+        if reader.is_alive():
+            raise RuntimeError("Harbor output reader could not be reaped")
+        if stdin_writer.is_alive():
+            raise RuntimeError("Harbor stdin writer could not be reaped")
+        if reader_error:
+            raise RuntimeError("Harbor output collection failed") from reader_error[0]
+        if stdin_error:
+            raise RuntimeError("Harbor stdin delivery failed") from stdin_error[0]
+        if timed_out:
+            assert timeout_seconds is not None
+            detail = f"Harbor run timed out after {timeout_seconds:g} seconds"
+            safe_tail = redact_progress_detail(output_tail, secret_values=secret_values)
+            if safe_tail:
+                detail += f". Last output: {safe_tail[-2000:]}"
+            raise _HarborRunTimeoutError(_redact_harbor_diagnostic(detail, secret_values=secret_values))
+        return _BoundedHarborProcessResult(
+            returncode=int(process.returncode or 0),
+            output_tail=output_tail,
+            output_exceeded=output_exceeded.is_set(),
+        )
+    except BaseException as primary_error:
+        cleanup_error: BaseException | None = None
+        if process.poll() is None or not reader_done.is_set():
+            try:
+                if cancellation is not None and isinstance(primary_error, _HarborRunCancelledError):
+                    # Let Harbor's SIGTERM handling stop its trial environments
+                    # instead of leaving containers or agent processes behind.
+                    _terminate_harbor_process_tree(
+                        process,
+                        grace_seconds=_HARBOR_RUN_CANCEL_GRACE_SECONDS,
+                        end_grace=cancellation.forced,
+                    )
+                else:
+                    _terminate_harbor_process_tree(process)
+            except BaseException as exc:
+                cleanup_error = exc
+        if not reader_started:
+            with suppress(OSError):
+                process.stdout.close()
+        if not stdin_writer_started and process.stdin is not None:
+            with suppress(OSError):
+                process.stdin.close()
+        if reader_started:
+            reader.join(timeout=_HARBOR_RUN_REAP_SECONDS)
+        if stdin_writer_started:
+            stdin_writer.join(timeout=_HARBOR_RUN_REAP_SECONDS)
+        if cleanup_error is not None:
+            primary_error.add_note(f"Harbor process-tree cleanup also failed: {type(cleanup_error).__name__}")
+            raise primary_error from cleanup_error
+        raise
+
+
+def _run_harbor(
+    *,
+    dataset: Path,
+    agent: str,
+    job_name: str,
+    env_mode: str,
+    model: str,
+    jobs_dir: Path,
+    run_env: dict[str, str],
+    n_attempts: int,
+    n_concurrent: int,
+    timeout_multiplier: float,
+    override_cpus: int | None,
+    override_memory_mb: int | None,
+    override_storage_mb: int | None,
+    agent_import_path: str | None = None,
+    verifier_env: Mapping[str, str] | None = None,
+    environment_kwargs: Mapping[str, Any] | None = None,
+    expected_trials: int | None = None,
+    expected_total_trials: int | None = None,
+    include_task_names: list[str] | None = None,
+    cancellation: _HarborRunCancellation | None = None,
+) -> tuple[bool, str]:
+    if cancellation is not None:
+        # Check before the credential refresh as well as at launch, so a queued
+        # condition or attempt makes no token request after an interrupt.
+        cancellation.raise_if_requested()
+    base_url = (
+        (verifier_env or {}).get("OPENAI_BASE_URL")
+        or run_env.get("OPENAI_BASE_URL")
+        or (verifier_env or {}).get("SKILL_EVAL_LLM_BASE_URL")
+        or run_env.get("SKILL_EVAL_LLM_BASE_URL")
+    )
+    run_env_copy = dict(run_env)
+    try:
+        fresh_token = refresh_host_vertex_adc_environment(
+            run_env_copy,
+            base_url_override=base_url,
+            fail_on_expired=True,
+            token_getter=_get_google_access_token,
+        )
+    except RuntimeError as exc:
+        return False, str(exc)
+    if fresh_token:
+        run_env = run_env_copy
+        if verifier_env is not None and "OPENAI_API_KEY" in verifier_env:
+            verifier_env = dict(verifier_env)
+            verifier_env["OPENAI_API_KEY"] = "${OPENAI_API_KEY}"
+
+    adc_timeout: float | None = None
+    is_adc = run_env.get(CREDENTIAL_SOURCE_ENV) == CREDENTIAL_SOURCE_ADC
+    if is_adc and _is_vertex_openapi_endpoint(base_url) and env_mode != "gke":
+        active_token = run_env.get("OPENAI_API_KEY")
+        expiry_epoch = get_adc_token_expiry(active_token) or _normalize_expiry_epoch(run_env.get(CREDENTIAL_EXPIRY_ENV))
+        raw_timeout = os.environ.get(VERTEX_ADC_JOB_TIMEOUT_ENV, "").strip()
+        try:
+            adc_timeout = compute_adc_job_timeout(
+                expiry_epoch=expiry_epoch,
+                configured_timeout_sec=raw_timeout or None,
+            )
+        except ValueError as exc:
+            return False, str(exc)
+
+    # Preserve the historical exact-value protection for every selected child
+    # value, and additionally protect detached credential URI/proxy userinfo
+    # (including percent-decoded and schemeless proxy components).
+    secret_values = {value for value in run_env.values() if len(value) >= MIN_EXACT_SECRET_CHARS}
+    secret_values.update(secret_values_from_environment(run_env))
+    command = build_harbor_run_command(
+        dataset_path=dataset,
+        agent=agent,
+        job_name=job_name,
+        env_mode=env_mode,
+        n_attempts=n_attempts,
+        n_concurrent=n_concurrent,
+        model=model,
+        jobs_dir=jobs_dir,
+        timeout_multiplier=timeout_multiplier,
+        include_task_names=include_task_names,
+        override_cpus=override_cpus,
+        override_memory_mb=override_memory_mb,
+        override_storage_mb=override_storage_mb,
+        agent_import_path=agent_import_path,
+        verifier_env=verifier_env,
+        environment_kwargs=environment_kwargs,
+    )
+    try:
+        handoff = _nvidia_build_key_handoff(run_env, env_mode=env_mode)
+        # Harbor owns its phase deadlines, and native tasks may intentionally
+        # leave the agent unbounded. Keep bounded streaming and process-tree
+        # cleanup without imposing an outer orchestration deadline except when
+        # non-GKE jobs rely on short-lived Google ADC bearer tokens.
+        with _harbor_launch_cwd() as launch_cwd:
+            result = _run_bounded_harbor_process(
+                command,
+                env=handoff.subprocess_env,
+                cwd=launch_cwd,
+                stdin_text=handoff.stdin_text,
+                timeout_seconds=adc_timeout,
+                max_output_bytes=_HARBOR_RUN_OUTPUT_MAX_BYTES,
+                diagnostic_tail_chars=_HARBOR_RUN_DIAGNOSTIC_TAIL_CHARS,
+                secret_values=secret_values,
+                cancellation=cancellation,
+            )
+    except _HarborRunTimeoutError as exc:
+        if adc_timeout is not None:
+            return False, f"Harbor job exceeded Google ADC token lifetime ({adc_timeout:g}s) in {env_mode} mode"
+        return False, _redact_harbor_diagnostic(exc, secret_values=secret_values)
+    except (OSError, RuntimeError, UnicodeError) as exc:
+        detail = _redact_harbor_diagnostic(exc, secret_values=secret_values)
+        if not detail:
+            detail = _redact_harbor_diagnostic(type(exc).__name__, secret_values=secret_values)
+        return False, detail
+    if result.output_exceeded:
+        safe_tail = redact_progress_detail(result.output_tail, secret_values=secret_values)
+        detail = f"harbor run output exceeded the {_HARBOR_RUN_OUTPUT_MAX_BYTES}-byte safety limit"
+        if safe_tail:
+            detail += f". Last output: {safe_tail[-2000:]}"
+        return False, _redact_harbor_diagnostic(detail, secret_values=secret_values)
+    if result.returncode == 0:
+        validation_ok, validation_detail = _validate_harbor_job_result(
+            jobs_dir,
+            job_name,
+            expected_trials=expected_trials,
+            expected_total_trials=expected_total_trials,
+        )
+        if validation_ok:
+            return True, validation_detail
+        return False, _redact_harbor_diagnostic(
+            validation_detail,
+            secret_values=secret_values,
+        )
+    safe_output = redact_progress_detail(result.output_tail, secret_values=secret_values)
+    detail = safe_output[-2000:] or f"harbor run exited {result.returncode}"
+    return False, _redact_harbor_diagnostic(detail, secret_values=secret_values)
+
+
+def _validate_harbor_job_result(
+    jobs_dir: Path,
+    job_name: str,
+    *,
+    expected_trials: int | None = None,
+    expected_total_trials: int | None = None,
+) -> tuple[bool, str]:
+    """Require Harbor's persisted trial state to be complete and error-free."""
+    return validate_harbor_job_result(
+        jobs_dir / job_name / "result.json",
+        expected_trials=expected_trials,
+        expected_total_trials=expected_total_trials,
+    )
+
+
+def _job_passed(job_dir: Path, pass_threshold: float) -> bool:
+    """Use collector-authoritative logical-attempt semantics for early stop."""
+    return harbor_job_passed(job_dir, pass_threshold)
+
+
+def _attempt_job_stats(
+    job_dir: Path,
+) -> tuple[int, int, int, dict[str, tuple[int, int, dict[str, dict[str, list[str]]]]]] | None:
+    """Read one per-attempt Harbor job result for merging; ``None`` when unreadable."""
+    try:
+        result = json.loads((job_dir / "result.json").read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(result, dict):
+        return None
+    total = result.get("n_total_trials")
+    stats = result.get("stats")
+    if not isinstance(total, int) or isinstance(total, bool) or not isinstance(stats, dict):
+        return None
+    if any(key in stats for key in ("n_completed_trials", "n_errored_trials")):
+        completed = stats.get("n_completed_trials")
+        errored = stats.get("n_errored_trials")
+    else:
+        completed = stats.get("n_trials")
+        errored = stats.get("n_errors")
+    if not all(isinstance(value, int) and not isinstance(value, bool) for value in (completed, errored)):
+        return None
+
+    evals_out: dict[str, tuple[int, int, dict[str, dict[str, list[str]]]]] = {}
+    evals = stats.get("evals")
+    if isinstance(evals, dict):
+        for eval_name, eval_stats in evals.items():
+            if not isinstance(eval_stats, dict):
+                continue
+            n_trials = eval_stats.get("n_trials")
+            n_errors = eval_stats.get("n_errors")
+            reward_stats = eval_stats.get("reward_stats")
+            per_metric: dict[str, dict[str, list[str]]] = {}
+            if isinstance(reward_stats, dict):
+                for metric, buckets in reward_stats.items():
+                    if not isinstance(buckets, dict):
+                        continue
+                    per_metric[str(metric)] = {
+                        str(bucket): [str(name) for name in names]
+                        for bucket, names in buckets.items()
+                        if isinstance(names, list)
+                    }
+            evals_out[str(eval_name)] = (
+                n_trials if isinstance(n_trials, int) and not isinstance(n_trials, bool) else 0,
+                n_errors if isinstance(n_errors, int) and not isinstance(n_errors, bool) else 0,
+                per_metric,
+            )
+    return total, completed, errored, evals_out
+
+
+def _job_path_is_link_or_reparse(path: Path, metadata: os.stat_result) -> bool:
+    """Return whether an attempt-job root is a symlink, junction, or reparse point."""
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if stat.S_ISLNK(metadata.st_mode) or bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag):
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if not callable(is_junction):
+        return False
+    try:
+        return bool(is_junction())
+    except (OSError, RuntimeError):
+        return True
+
+
+def _job_root_fingerprint(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+# ``copytree_secure`` stages as ``.{name}.staging-{16 hex}`` in the same
+# directory. Keep the published name below NAME_MAX with room for that suffix.
+_AGGREGATE_TRIAL_NAME_MAX_BYTES = 224
+
+
+def _utc_aware_datetime(value: datetime) -> datetime:
+    """Normalize Harbor timestamps before ordering mixed local/UTC results.
+
+    Harbor 0.22 job summaries can contain naive host-local timestamps while
+    their child trial results use explicit UTC offsets.  ``astimezone`` treats
+    a naive value as host-local time, matching the process that wrote the job
+    summary, and gives the aggregate one comparable UTC representation.
+    """
+    return value.astimezone(UTC)
+
+
+def _utf8_prefix(value: str, max_bytes: int) -> str:
+    """Return a UTF-8-safe prefix bounded by encoded byte length."""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _aggregate_trial_name(
+    job_name: str,
+    child_name: str,
+    *,
+    source_index: int,
+    used_names: set[str],
+) -> str:
+    """Build a deterministic, attempt-readable, filesystem-safe trial name."""
+    raw_name = f"{job_name}__{child_name}"
+    if len(raw_name.encode("utf-8")) > _AGGREGATE_TRIAL_NAME_MAX_BYTES:
+        digest = hashlib.sha256(f"{source_index}\0{raw_name}".encode()).hexdigest()[:16]
+        # stop_on_pass owns the final ``-attemptNNN`` job-name component.
+        # Derive the carried label only from that anchored structure so an
+        # attempt-like task selector or child trial name cannot impersonate it.
+        attempt_match = re.fullmatch(r".+-attempt(0*[1-9][0-9]*)", job_name, flags=re.IGNORECASE)
+        attempt_marker = (
+            f"{TRUNCATED_AGGREGATE_ATTEMPT_PREFIX}{attempt_match.group(1)}" if attempt_match else "__attempt"
+        )
+        suffix = f"{attempt_marker}__{digest}"
+        name = _utf8_prefix(raw_name, _AGGREGATE_TRIAL_NAME_MAX_BYTES - len(suffix.encode())) + suffix
+    else:
+        name = raw_name
+
+    candidate = name
+    collision_index = 2
+    while candidate in used_names:
+        suffix = f"-{collision_index}"
+        candidate = _utf8_prefix(name, _AGGREGATE_TRIAL_NAME_MAX_BYTES - len(suffix.encode())) + suffix
+        collision_index += 1
+    used_names.add(candidate)
+    return candidate
+
+
+# Local-mode Codex runtime dirs left under a trial's agent log dir. They hold
+# the Codex credential, so attempt merges omit them instead of publishing them.
+_LOCAL_CODEX_PRIVATE_AGENT_DIRS = frozenset({LOCAL_CODEX_HOME_DIRNAME, LOCAL_CODEX_SECRETS_DIRNAME})
+
+
+def _read_json_mapping_no_follow(path: Path) -> dict[str, Any] | None:
+    """Read a regular, unlinked JSON object file, or return ``None``."""
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            return None
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None
+            payload = json.loads(handle.read().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _trial_codex_private_dirs_ignore(job_path: Path) -> IgnoreCallback:
+    """Return a secure-copy ignore callback that drops local Codex runtime dirs.
+
+    Harbor's Codex agent links ``codex-home/auth.json`` to the credential in
+    ``codex-secrets`` and removes both only in a best-effort cleanup, so a
+    timed-out or cancelled trial can leave them behind. The exclusion is limited
+    to trial agent dirs: ``<trial>/agent``, and ``<trial>/steps/<step>/agent``
+    where Harbor's multi-step trials move it after each step. ``<step>`` is one
+    path component, or a step name the trial's ``result.json`` (or the attempt
+    root's matching ``trial_results`` entry) declares, which may span several
+    components. Every other path still passes through the secure copier's link
+    checks.
+    """
+    from skillevaluator.tier3.harbor.runtime_preflight import _agent_artifact_dirs
+
+    # copytree_secure reports directories under its own lexical source root.
+    job_root = _absolute_lexical(job_path)
+    root_trial_results: dict[str, Mapping[str, Any]] | None = None
+    declared_step_agent_dirs: dict[str, frozenset[tuple[str, ...]]] = {}
+
+    def trial_result(trial_name: str) -> Mapping[str, Any] | None:
+        nonlocal root_trial_results
+        payload = _read_json_mapping_no_follow(job_root / trial_name / "result.json")
+        if payload is not None:
+            return payload
+        # The merge falls back to the attempt root's entry for an unreadable
+        # trial result, so the declared step names come from the same place.
+        if root_trial_results is None:
+            root = _read_json_mapping_no_follow(job_root / "result.json") or {}
+            candidates = root.get("trial_results")
+            root_trial_results = {
+                candidate["trial_name"]: candidate
+                for candidate in (candidates if isinstance(candidates, list) else [])
+                if isinstance(candidate, dict) and isinstance(candidate.get("trial_name"), str)
+            }
+        return root_trial_results.get(trial_name)
+
+    def step_agent_dirs(trial_name: str) -> frozenset[tuple[str, ...]]:
+        if trial_name not in declared_step_agent_dirs:
+            payload = trial_result(trial_name) or {}
+            # Only the step results name step dirs; reuse the preflight's
+            # step-name validation so both read the same layout.
+            dirs = _agent_artifact_dirs(Path(), {"step_results": payload.get("step_results")})
+            declared_step_agent_dirs[trial_name] = frozenset(path.parts for path in dirs)
+        return declared_step_agent_dirs[trial_name]
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        try:
+            parts = Path(directory).relative_to(job_root).parts
+        except ValueError:
+            return set()
+        if len(parts) < 2 or parts[-1] != "agent" or not _LOCAL_CODEX_PRIVATE_AGENT_DIRS.intersection(names):
+            return set()
+        trial_relative = parts[1:]
+        is_trial_agent_dir = (
+            trial_relative == ("agent",)
+            or (len(trial_relative) == 3 and trial_relative[0] == "steps")
+            or (trial_relative[0] == "steps" and trial_relative in step_agent_dirs(parts[0]))
+        )
+        return _LOCAL_CODEX_PRIVATE_AGENT_DIRS.intersection(names) if is_trial_agent_dir else set()
+
+    return ignore
+
+
+def _merge_attempt_jobs(job_dirs: list[Path], aggregate_dir: Path) -> None:
+    """Merge per-attempt Harbor jobs into the job directory shape collection expects.
+
+    Trial directories are copied under attempt-qualified names and the
+    per-attempt Harbor ``result.json`` statistics are combined so the merged
+    job still satisfies :func:`validate_harbor_job_result`. Leftover local
+    Codex credential dirs in trial agent dirs are omitted from the merge.
+    """
+    from harbor.models.job.result import JobResult, JobStats
+    from harbor.models.trial.config import TrialConfig
+    from harbor.models.trial.result import TrialResult
+
+    aggregate_path = Path(os.path.abspath(aggregate_dir))  # noqa: PTH100 -- compare lexical publication roots
+    source_paths: list[tuple[str, Path, Path, tuple[int, int, int, int, int, int]]] = []
+    for job_dir in job_dirs:
+        job_path = Path(os.path.abspath(job_dir))  # noqa: PTH100 -- reject overlap before temp creation
+        if not os.path.lexists(job_path):
+            continue
+        try:
+            metadata = job_path.lstat()
+        except OSError as exc:
+            raise ValueError(f"cannot inspect attempt Harbor job root: {job_path}") from exc
+        if _job_path_is_link_or_reparse(job_path, metadata) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"attempt Harbor job root must be a non-linked directory: {job_path}")
+        try:
+            job_resolved = job_path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"cannot resolve attempt Harbor job root: {job_path}") from exc
+        aggregate_resolved = aggregate_path.resolve(strict=False)
+        if (
+            aggregate_resolved == job_resolved
+            or aggregate_resolved.is_relative_to(job_resolved)
+            or job_resolved.is_relative_to(aggregate_resolved)
+        ):
+            raise ValueError("aggregate Harbor job directory must not overlap an attempt job directory")
+        source_paths.append((job_path.name, job_path, job_resolved, _job_root_fingerprint(metadata)))
+
+    aggregate_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=".harbor-merge-",
+        dir=aggregate_path.parent,
+    ) as private_root_raw:
+        private_root = Path(private_root_raw)
+        snapshot_root = private_root / "attempt-jobs"
+        snapshot_root.mkdir()
+        staged_aggregate = private_root / "aggregate"
+        staged_aggregate.mkdir()
+
+        snapshots: list[tuple[str, Path]] = []
+        for index, (job_name, job_path, job_resolved, expected_fingerprint) in enumerate(source_paths):
+            snapshot = snapshot_root / f"{index:04d}"
+            try:
+                before = job_path.lstat()
+            except OSError as exc:
+                raise ValueError(f"attempt Harbor job root changed before snapshot: {job_path}") from exc
+            if _job_path_is_link_or_reparse(job_path, before) or _job_root_fingerprint(before) != expected_fingerprint:
+                raise ValueError(f"attempt Harbor job root changed before snapshot: {job_path}")
+            copytree_secure(
+                job_path,
+                snapshot,
+                allowed_root=job_resolved,
+                ignore=_trial_codex_private_dirs_ignore(job_path),
+            )
+            try:
+                after = job_path.lstat()
+            except OSError as exc:
+                raise ValueError(f"attempt Harbor job root changed during snapshot: {job_path}") from exc
+            if _job_path_is_link_or_reparse(job_path, after) or _job_root_fingerprint(after) != expected_fingerprint:
+                raise ValueError(f"attempt Harbor job root changed during snapshot: {job_path}")
+            snapshots.append((job_name, snapshot))
+
+        aggregate_job_id = uuid4()
+        total_trials = 0
+        aggregate_retries = 0
+        merged_trial_results: list[TrialResult] = []
+        source_started_at: list[datetime] = []
+        source_updated_at: list[datetime] = []
+        used_trial_names: set[str] = set()
+        for source_index, (job_name, job_dir) in enumerate(snapshots):
+            try:
+                source_job_result = json.loads((job_dir / "result.json").read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                source_job_result = None
+            if isinstance(source_job_result, dict):
+                try:
+                    source_job_model = JobResult.model_validate(source_job_result)
+                except Exception:
+                    source_job_model = None
+                if source_job_model is not None:
+                    source_started_at.append(_utc_aware_datetime(source_job_model.started_at))
+                    source_updated_at.append(
+                        _utc_aware_datetime(
+                            source_job_model.updated_at or source_job_model.finished_at or source_job_model.started_at
+                        )
+                    )
+            root_trial_results: dict[str, dict[str, Any]] = {}
+            if isinstance(source_job_result, dict) and isinstance(source_job_result.get("trial_results"), list):
+                for candidate in source_job_result["trial_results"]:
+                    if isinstance(candidate, dict) and isinstance(candidate.get("trial_name"), str):
+                        root_trial_results[candidate["trial_name"]] = candidate
+            if isinstance(source_job_result, dict) and isinstance(source_job_result.get("stats"), dict):
+                source_retries = source_job_result["stats"].get("n_retries")
+                if isinstance(source_retries, int) and not isinstance(source_retries, bool) and source_retries >= 0:
+                    aggregate_retries += source_retries
+
+            job_trial_results: list[TrialResult] = []
+            job_trial_slots = 0
+            for child in sorted(job_dir.iterdir()):
+                if not child.is_dir():
+                    continue
+                dest = staged_aggregate / _aggregate_trial_name(
+                    job_name,
+                    child.name,
+                    source_index=source_index,
+                    used_names=used_trial_names,
+                )
+                copytree_secure(child, dest, allowed_root=job_dir)
+
+                result_path = child / "result.json"
+                config_path = child / "config.json"
+                if not result_path.exists() and not config_path.exists():
+                    continue
+                job_trial_slots += 1
+                root_trial_payload = root_trial_results.get(child.name)
+                if not result_path.exists() and root_trial_payload is None:
+                    try:
+                        source_trial_config = TrialConfig.model_validate_json(config_path.read_text(encoding="utf-8"))
+                    except Exception as exc:
+                        raise ValueError(f"attempt Harbor trial config is invalid: {child}") from exc
+                    rewritten_config = source_trial_config.model_dump(mode="json")
+                    rewritten_config.update(
+                        {
+                            "trial_name": dest.name,
+                            "trials_dir": str(aggregate_path),
+                            "job_id": str(aggregate_job_id),
+                        }
+                    )
+                    try:
+                        merged_trial_config = TrialConfig.model_validate(rewritten_config)
+                    except Exception as exc:
+                        raise ValueError(f"aggregate Harbor trial config is invalid: {dest}") from exc
+                    (dest / "config.json").write_text(
+                        merged_trial_config.model_dump_json(indent=2),
+                        encoding="utf-8",
+                    )
+                    continue
+                try:
+                    trial_payload = json.loads(result_path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    trial_payload = root_trial_payload
+                if not isinstance(trial_payload, dict):
+                    raise ValueError(f"attempt Harbor trial result is unreadable: {child}")
+                if trial_payload.get("trial_name") != child.name:
+                    raise ValueError(f"attempt Harbor trial result name does not match its directory: {child}")
+                try:
+                    source_trial_result = TrialResult.model_validate(trial_payload)
+                except Exception as exc:
+                    raise ValueError(f"attempt Harbor trial result is invalid: {child}") from exc
+
+                rewritten = source_trial_result.model_dump(mode="json")
+                rewritten["trial_name"] = dest.name
+                rewritten["trial_uri"] = (aggregate_path / dest.name).as_uri()
+                rewritten_config = rewritten.get("config")
+                if not isinstance(rewritten_config, dict):
+                    raise ValueError(f"attempt Harbor trial config is invalid: {child}")
+                rewritten_config.update(
+                    {
+                        "trial_name": dest.name,
+                        "trials_dir": str(aggregate_path),
+                        "job_id": str(aggregate_job_id),
+                    }
+                )
+                try:
+                    merged_trial_result = TrialResult.model_validate(rewritten)
+                except Exception as exc:
+                    raise ValueError(f"aggregate Harbor trial result is invalid: {dest}") from exc
+                (dest / "result.json").write_text(
+                    merged_trial_result.model_dump_json(indent=2),
+                    encoding="utf-8",
+                )
+                (dest / "config.json").write_text(
+                    merged_trial_result.config.model_dump_json(indent=2),
+                    encoding="utf-8",
+                )
+                job_trial_results.append(merged_trial_result)
+                merged_trial_results.append(merged_trial_result)
+
+            stats = _attempt_job_stats(job_dir)
+            if stats is None:
+                total_trials += job_trial_slots
+                continue
+            job_total, job_completed, _job_errored, _job_evals = stats
+            total_trials += max(job_total, job_trial_slots)
+            if job_completed > len(job_trial_results):
+                raise ValueError(
+                    f"attempt Harbor job completed {job_completed} trials but retained "
+                    f"{len(job_trial_results)} valid trial results: {job_dir}"
+                )
+
+        aggregate_config: dict[str, Any] | None = None
+        for _job_name, job_dir in snapshots:
+            try:
+                candidate_config = json.loads((job_dir / "config.json").read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            if isinstance(candidate_config, dict):
+                aggregate_config = candidate_config
+                break
+        if aggregate_config is None:
+            # The aggregate is a retained viewer surface, not a replayable
+            # Harbor invocation. Keep its fallback config valid and explicit
+            # rather than inventing an oracle agent or dataset.
+            aggregate_config = {"agents": [], "datasets": [], "tasks": []}
+        aggregate_config.update(
+            {
+                "job_name": aggregate_path.name,
+                "jobs_dir": str(aggregate_path.parent),
+                "n_attempts": 1,
+            }
+        )
+        (staged_aggregate / "config.json").write_text(
+            json.dumps(aggregate_config, indent=2),
+            encoding="utf-8",
+        )
+
+        trial_finished_at = [
+            _utc_aware_datetime(result.finished_at) for result in merged_trial_results if result.finished_at is not None
+        ]
+        aggregate_updated_at = max([*trial_finished_at, *source_updated_at], default=datetime.now(UTC))
+        aggregate_started_at = min(
+            [
+                *(
+                    _utc_aware_datetime(result.started_at)
+                    for result in merged_trial_results
+                    if result.started_at is not None
+                ),
+                *source_started_at,
+            ],
+            default=aggregate_updated_at,
+        )
+        aggregate_total_trials = max(total_trials, len(merged_trial_results))
+        aggregate_stats = JobStats.from_trial_results(
+            merged_trial_results,
+            n_total_trials=aggregate_total_trials,
+            n_retries=aggregate_retries,
+        )
+        aggregate_finished_at = (
+            max(trial_finished_at, default=aggregate_updated_at)
+            if aggregate_stats.n_completed_trials >= aggregate_total_trials
+            else None
+        )
+        aggregate_result = JobResult(
+            id=aggregate_job_id,
+            started_at=aggregate_started_at,
+            updated_at=aggregate_updated_at,
+            finished_at=aggregate_finished_at,
+            n_total_trials=aggregate_total_trials,
+            stats=aggregate_stats,
+            trial_results=merged_trial_results,
+        )
+        (staged_aggregate / "result.json").write_text(
+            aggregate_result.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+        copytree_secure(
+            staged_aggregate,
+            aggregate_path,
+            replace_existing=aggregate_path.exists(),
+            allowed_root=private_root,
+        )
+
+
+def _counts_as_judge_call(attempt: object) -> bool:
+    """Return whether a ``judge_attempts.json`` entry counts toward ``--max-judge-calls``.
+
+    A ``salvage`` entry rebuilds an earlier reply, so it is not a call. A
+    ``ragas`` entry with a prompt saves one HTTP request RAGAS made internally,
+    including transport retries; the ``ragas`` entry without a prompt, which
+    holds RAGAS's score or failure, is the one counted call.
+    """
+    if not isinstance(attempt, dict):
+        return False
+    method = attempt.get("method")
+    if method == "salvage":
+        return False
+    return not (method == "ragas" and "prompt_sha256" in attempt)
+
+
+def _budget_usage(job_dir: Path) -> dict[str, Any]:
+    """Read attempt usage from Harbor's retained trajectory and judge artifacts."""
+    usage: dict[str, Any] = {}
+    for trajectory_path in job_dir.glob("**/trajectory.json"):
+        try:
+            payload = json.loads(trajectory_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        final_metrics = payload.get("final_metrics", {}) if isinstance(payload, dict) else {}
+        if isinstance(final_metrics, dict):
+            prompt = final_metrics.get("total_prompt_tokens")
+            completion = final_metrics.get("total_completion_tokens")
+            cached = final_metrics.get("total_cached_tokens")
+            cost = final_metrics.get("total_cost_usd")
+            if isinstance(prompt, int) and isinstance(completion, int):
+                usage["input_tokens"] = usage.get("input_tokens", 0) + prompt
+                usage["output_tokens"] = usage.get("output_tokens", 0) + completion
+                if isinstance(cached, int) and not isinstance(cached, bool):
+                    usage["cached_input_tokens"] = usage.get("cached_input_tokens", 0) + cached
+            if isinstance(cost, int | float) and not isinstance(cost, bool):
+                usage["cost_usd"] = usage.get("cost_usd", 0.0) + float(cost)
+    judge_calls = 0
+    saw_judge_artifact = False
+    for artifact_path in job_dir.glob("**/judge_attempts.json"):
+        saw_judge_artifact = True
+        try:
+            payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        attempts = payload.get("attempts") if isinstance(payload, dict) else payload
+        if isinstance(attempts, list):
+            judge_calls += sum(1 for attempt in attempts if _counts_as_judge_call(attempt))
+    if saw_judge_artifact:
+        usage["judge_calls"] = judge_calls
+    return usage
+
+
+def _resolve_harbor_price_file(
+    price_file: Path | None, harbor_config: Mapping[str, Any], source_skill_dir: Path
+) -> Path | None:
+    if price_file is not None:
+        return Path(price_file).expanduser().resolve()
+    configured = harbor_config.get("price_file")
+    if not configured:
+        return None
+    path = Path(str(configured)).expanduser()
+    return (path if path.is_absolute() else source_skill_dir / path).resolve()
+
+
+def _run_budgeted_variants(
+    *,
+    skill_name: str,
+    agent: str,
+    jobs: list[tuple[str, Path, str | None]],
+    task_names: list[str],
+    env_mode: str,
+    model: str,
+    jobs_dir: Path,
+    run_env: dict[str, str],
+    n_attempts: int,
+    pass_threshold: float,
+    stop_on_pass: bool,
+    timeout_multiplier: float,
+    override_cpus: int | None,
+    override_memory_mb: int | None,
+    override_storage_mb: int | None,
+    budget: Any,
+    n_concurrent: int,
+    verifier_env: Mapping[str, str] | None = None,
+    environment_kwargs: Mapping[str, Any] | None = None,
+    cancellation: _HarborRunCancellation | None = None,
+) -> dict[str, list[str]]:
+    errors: dict[str, dict[tuple[int, int], str]] = {variant: {} for variant, _, _ in jobs}
+    attempt_job_dirs: dict[str, dict[tuple[int, int], Path]] = {variant: {} for variant, _, _ in jobs}
+    result_lock = threading.Lock()
+
+    def run_unit(task_index: int, task_name: str, attempt: int) -> bool:
+        if cancellation is not None:
+            cancellation.raise_if_requested()
+        admissions = [
+            {"agent": agent, "arm": variant, "case_id": task_name, "attempt": attempt} for variant, _, _ in jobs
+        ]
+        with ExitStack() as reservations:
+            if not budget.admit_many(admissions):
+                return False
+            for admission in admissions:
+                reservations.callback(budget.release, admission)
+            return run_admitted(task_index, task_name, attempt, admissions)
+
+    def run_admitted(task_index: int, task_name: str, attempt: int, admissions: list[dict[str, Any]]) -> bool:
+        passed = True
+        for admission, (variant, dataset, job_import_path) in zip(admissions, jobs, strict=True):
+            if cancellation is not None:
+                cancellation.raise_if_requested()
+            job_name = f"{skill_name}-{agent}-{variant}-{task_name}-attempt{attempt:03d}"
+            ok, detail = _run_harbor(
+                dataset=dataset,
+                agent=agent,
+                job_name=job_name,
+                env_mode=env_mode,
+                model=model,
+                jobs_dir=jobs_dir,
+                run_env=run_env,
+                n_attempts=1,
+                n_concurrent=1,
+                timeout_multiplier=timeout_multiplier,
+                override_cpus=override_cpus,
+                override_memory_mb=override_memory_mb,
+                override_storage_mb=override_storage_mb,
+                agent_import_path=job_import_path,
+                verifier_env=verifier_env,
+                environment_kwargs=environment_kwargs,
+                expected_trials=1,
+                include_task_names=[task_name],
+                cancellation=cancellation,
+            )
+            job_dir = jobs_dir / job_name
+            budget.record_usage(_budget_usage(job_dir), model=model, attempt=admission)
+            with result_lock:
+                attempt_job_dirs[variant][(task_index, attempt)] = job_dir
+                if ok:
+                    for key, error in list(errors[variant].items()):
+                        failed_dir = attempt_job_dirs[variant].get(key)
+                        if (
+                            key[0] == task_index
+                            and error.endswith(": Harbor job did not complete successfully: 1 errored")
+                            and failed_dir is not None
+                            and harbor_timeout_job_recovered(failed_dir, job_dir)
+                        ):
+                            errors[variant].pop(key)
+                else:
+                    errors[variant][(task_index, attempt)] = (
+                        f"{agent} {variant}-skill Harbor run failed: {task_name} attempt {attempt}: {detail}"
+                    )
+            passed = passed and ok and _job_passed(job_dir, pass_threshold)
+        return passed
+
+    def run_case(task_index: int, task_name: str) -> None:
+        for attempt in range(1, n_attempts + 1):
+            if run_unit(task_index, task_name, attempt) and stop_on_pass:
+                break
+
+    worker_count = max(1, min(n_concurrent, len(task_names) or 1))
+    with ExitStack() as callbacks:
+        if cancellation is not None:
+            cancellation.requested.add_callback(budget.cancel)
+            callbacks.callback(cancellation.requested.remove_callback, budget.cancel)
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            if stop_on_pass:
+                futures = [executor.submit(run_case, index, task_name) for index, task_name in enumerate(task_names)]
+            else:
+                futures = [
+                    executor.submit(run_unit, index, task_name, attempt)
+                    for index, task_name in enumerate(task_names)
+                    for attempt in range(1, n_attempts + 1)
+                ]
+            for future in as_completed(futures):
+                future.result()
+    for variant, _, _ in jobs:
+        if not attempt_job_dirs[variant]:
+            continue
+        _merge_attempt_jobs(
+            [attempt_job_dirs[variant][key] for key in sorted(attempt_job_dirs[variant])],
+            jobs_dir / f"{skill_name}-{agent}-{variant}",
+        )
+    return {variant: [errors[variant][key] for key in sorted(errors[variant])] for variant, _, _ in jobs}
+
+
+def _run_budgeted_variant(
+    *,
+    skill_name: str,
+    agent: str,
+    variant: str,
+    dataset: Path,
+    task_names: list[str],
+    env_mode: str,
+    model: str,
+    jobs_dir: Path,
+    run_env: dict[str, str],
+    n_attempts: int,
+    pass_threshold: float,
+    stop_on_pass: bool,
+    timeout_multiplier: float,
+    override_cpus: int | None,
+    override_memory_mb: int | None,
+    override_storage_mb: int | None,
+    budget: Any,
+    n_concurrent: int = 1,
+    agent_import_path: str | None = None,
+    verifier_env: Mapping[str, str] | None = None,
+    environment_kwargs: Mapping[str, Any] | None = None,
+    cancellation: _HarborRunCancellation | None = None,
+) -> list[str]:
+    errors = _run_budgeted_variants(
+        skill_name=skill_name,
+        agent=agent,
+        jobs=[(variant, dataset, agent_import_path)],
+        task_names=task_names,
+        env_mode=env_mode,
+        model=model,
+        jobs_dir=jobs_dir,
+        run_env=run_env,
+        n_attempts=n_attempts,
+        pass_threshold=pass_threshold,
+        stop_on_pass=stop_on_pass,
+        timeout_multiplier=timeout_multiplier,
+        override_cpus=override_cpus,
+        override_memory_mb=override_memory_mb,
+        override_storage_mb=override_storage_mb,
+        budget=budget,
+        n_concurrent=n_concurrent,
+        verifier_env=verifier_env,
+        environment_kwargs=environment_kwargs,
+        cancellation=cancellation,
+    )
+    return errors[variant]
+
+
+def _run_stop_on_pass_variant(
+    *,
+    skill_name: str,
+    agent: str,
+    variant: str,
+    dataset: Path,
+    task_names: list[str],
+    env_mode: str,
+    model: str,
+    jobs_dir: Path,
+    run_env: dict[str, str],
+    n_attempts: int,
+    pass_threshold: float,
+    timeout_multiplier: float,
+    override_cpus: int | None,
+    override_memory_mb: int | None,
+    override_storage_mb: int | None,
+    agent_import_path: str | None = None,
+    verifier_env: Mapping[str, str] | None = None,
+    environment_kwargs: Mapping[str, Any] | None = None,
+    n_concurrent: int = 1,
+    cancellation: _HarborRunCancellation | None = None,
+) -> list[str]:
+    """Run up to ``n_concurrent`` cases at once, stopping each case's attempts on first pass.
+
+    A case launches its next attempt only after the previous one scored, so
+    attempts of one case stay sequential. Attempt jobs are merged in dataset
+    order rather than completion order, keeping the aggregate deterministic.
+    """
+    stop_launching = threading.Event()
+
+    def _run_case(task_name: str) -> tuple[list[str], list[Path]]:
+        case_errors: list[tuple[Path, str]] = []
+        case_job_dirs: list[Path] = []
+        for attempt in range(1, n_attempts + 1):
+            if stop_launching.is_set():
+                break
+            job_name = f"{skill_name}-{agent}-{variant}-{task_name}-attempt{attempt:03d}"
+            ok, detail = _run_harbor(
+                dataset=dataset,
+                agent=agent,
+                job_name=job_name,
+                env_mode=env_mode,
+                model=model,
+                jobs_dir=jobs_dir,
+                run_env=run_env,
+                n_attempts=1,
+                n_concurrent=1,
+                timeout_multiplier=timeout_multiplier,
+                override_cpus=override_cpus,
+                override_memory_mb=override_memory_mb,
+                override_storage_mb=override_storage_mb,
+                agent_import_path=agent_import_path,
+                verifier_env=verifier_env,
+                environment_kwargs=environment_kwargs,
+                expected_trials=1,
+                include_task_names=[task_name],
+                cancellation=cancellation,
+            )
+            job_dir = jobs_dir / job_name
+            case_job_dirs.append(job_dir)
+            if not ok:
+                case_errors.append(
+                    (job_dir, f"{agent} {variant}-skill Harbor run failed: {task_name} attempt {attempt}: {detail}")
+                )
+                continue
+            # A recovered timeout matches only an earlier attempt of the same
+            # task, so filtering this case's own errors is enough.
+            case_errors = [
+                (failed_dir, detail)
+                for failed_dir, detail in case_errors
+                if not detail.endswith(": Harbor job did not complete successfully: 1 errored")
+                or not failed_dir.is_dir()
+                or not harbor_timeout_job_recovered(failed_dir, job_dir)
+            ]
+            if _job_passed(job_dir, pass_threshold):
+                break
+        return [detail for _, detail in case_errors], case_job_dirs
+
+    def _run_case_or_stop(task_name: str) -> tuple[list[str], list[Path]]:
+        try:
+            return _run_case(task_name)
+        except BaseException:
+            # As in a serial loop, an unexpected failure stops later launches.
+            stop_launching.set()
+            raise
+
+    errors: list[str] = []
+    attempt_job_dirs: list[Path] = []
+    if task_names:
+        with ThreadPoolExecutor(max_workers=min(n_concurrent, len(task_names))) as executor:
+            futures = [executor.submit(_run_case_or_stop, task_name) for task_name in task_names]
+            try:
+                # Surface an unexpected case failure without waiting on earlier cases.
+                for future in as_completed(futures):
+                    future.result()
+            except BaseException:
+                # Queued cases never start; running cases finish only their current attempt.
+                stop_launching.set()
+                for future in futures:
+                    future.cancel()
+                raise
+        for future in futures:
+            case_errors, case_job_dirs = future.result()
+            errors.extend(case_errors)
+            attempt_job_dirs.extend(case_job_dirs)
+    _merge_attempt_jobs(attempt_job_dirs, jobs_dir / f"{skill_name}-{agent}-{variant}")
+    return errors
+
+
+def _private_runtime_hooks() -> Any:
+    """The private plugin runtime hooks of this run, or ``None`` for an ordinary run."""
+    from skillevaluator.tier3.plugin_execution import active_runtime
+
+    return active_runtime()
+
+
+def _native_plugin_agent_import_paths() -> frozenset[str]:
+    """The private native plugin-loading wrappers, which build on the agents allowed on every backend."""
+    from skillevaluator.tier3.loose_parts import LOOSE_PARTS_AGENT_IMPORT_PATHS
+    from skillevaluator.tier3.plugin_native import NATIVE_AGENT_IMPORT_PATHS, PRIVATE_AGENT_IMPORT_PATHS
+
+    # Host-only wrappers remain outside the container backend allowlist.
+    return frozenset(
+        value
+        for paths in (NATIVE_AGENT_IMPORT_PATHS, PRIVATE_AGENT_IMPORT_PATHS, LOOSE_PARTS_AGENT_IMPORT_PATHS)
+        for (_, base), value in paths.items()
+        if not (base or "").startswith("skillevaluator.tier3.harbor.local_agents:SkillEvaluatorLocal")
+    )
+
+
+def _private_agent_paths(
+    agents: list[str], base_paths: Mapping[str, str], env_mode: str
+) -> dict[str, tuple[str | None, str | None]]:
+    """Resolve both arms on the calling thread, before launching worker pools."""
+    hooks = _private_runtime_hooks()
+    paths = {}
+    for agent in agents:
+        base = base_paths.get(agent)
+        if hooks is not None:
+            if base is None and env_mode == ENV_MODE_LOCAL:
+                from skillevaluator.tier3.harbor import LOCAL_AGENT_IMPORT_PATHS
+
+                base = LOCAL_AGENT_IMPORT_PATHS.get(agent)
+            elif base is None and env_mode in HARBOR_DOCKER_ENGINE_ENV_MODES | {"gke"}:
+                defaults = (
+                    DOCKER_AGENT_IMPORT_PATHS
+                    if env_mode in HARBOR_DOCKER_ENGINE_ENV_MODES
+                    else CONTAINER_AGENT_IMPORT_PATHS
+                )
+                base = defaults.get(agent)
+            with_path = hooks.with_agent_import_path(agent, base)
+            classify = getattr(hooks, "baseline_agent_import_path", None)
+            baseline_path = classify(agent, base) if classify is not None else base
+            paths[agent] = (baseline_path, with_path)
+        else:
+            paths[agent] = (base, None)
+    return paths
+
+
+def _run_agent_pair(
+    *,
+    skill_name: str,
+    agent: str,
+    model: str,
+    env_mode: str,
+    with_skill: Path | None,
+    baseline: Path | None,
+    jobs_dir: Path,
+    run_env: dict[str, str],
+    n_attempts: int,
+    n_concurrent: int,
+    timeout_multiplier: float,
+    override_cpus: int | None,
+    override_memory_mb: int | None,
+    override_storage_mb: int | None,
+    expected_trials: int,
+    agent_import_path: str | None = None,
+    stop_on_pass: bool = False,
+    pass_threshold: float = 0.50,
+    task_names: list[str] | None = None,
+    verifier_env: Mapping[str, str] | None = None,
+    environment_kwargs: Mapping[str, Any] | None = None,
+    with_agent_import_path: str | None = None,
+    cancellation: _HarborRunCancellation | None = None,
+    additional_arms: Sequence[tuple[str, Path, str | None]] = (),
+    additional_arm_errors: dict[str, str] | None = None,
+    budget_controller: Any = None,
+) -> list[str]:
+    """Run ordinary and privately requested arms under one per-agent trial budget."""
+    jobs = [] if with_skill is None else [("with", with_skill, with_agent_import_path or agent_import_path)]
+    if baseline is not None:
+        jobs.append(("without", baseline, agent_import_path))
+    extra_variants = {variant for variant, _, _ in additional_arms}
+    if len(extra_variants) != len(additional_arms) or extra_variants - {"sumofparts", "looseparts"}:
+        raise ValueError("Invalid or duplicate private comparison variant")
+    jobs.extend(additional_arms)
+    if not jobs:
+        return [f"{agent} has no staged Harbor dataset to run"]
+
+    def record_failure(variant: str, failures: list[str]) -> list[str]:
+        if variant not in extra_variants:
+            return failures
+        if failures and additional_arm_errors is not None:
+            additional_arm_errors[variant] = _bounded_execution_error("; ".join(failures))
+        return []
+
+    if budget_controller is not None:
+        budget_errors: list[str] = []
+        failures_by_variant = _run_budgeted_variants(
+            skill_name=skill_name,
+            agent=agent,
+            jobs=jobs,
+            task_names=list(task_names or []),
+            env_mode=env_mode,
+            model=model,
+            jobs_dir=jobs_dir,
+            run_env=run_env,
+            n_attempts=n_attempts,
+            pass_threshold=pass_threshold,
+            stop_on_pass=stop_on_pass,
+            timeout_multiplier=timeout_multiplier,
+            override_cpus=override_cpus,
+            override_memory_mb=override_memory_mb,
+            override_storage_mb=override_storage_mb,
+            budget=budget_controller,
+            n_concurrent=n_concurrent,
+            verifier_env=verifier_env,
+            environment_kwargs=environment_kwargs,
+            cancellation=cancellation,
+        )
+        for variant, failures in failures_by_variant.items():
+            budget_errors.extend(record_failure(variant, failures))
+        return budget_errors
+
+    if stop_on_pass:
+        # A case's later attempt is launched only after its previous one
+        # scored. Up to n_concurrent cases run at once, and the conditions run
+        # one after another, so each gets the full per-agent budget.
+        sequential_errors: list[str] = []
+        for variant, dataset, job_import_path in jobs:
+            try:
+                failures = _run_stop_on_pass_variant(
+                    skill_name=skill_name,
+                    agent=agent,
+                    variant=variant,
+                    dataset=dataset,
+                    task_names=list(task_names or []),
+                    env_mode=env_mode,
+                    model=model,
+                    jobs_dir=jobs_dir,
+                    run_env=run_env,
+                    n_attempts=n_attempts,
+                    pass_threshold=pass_threshold,
+                    timeout_multiplier=timeout_multiplier,
+                    override_cpus=override_cpus,
+                    override_memory_mb=override_memory_mb,
+                    override_storage_mb=override_storage_mb,
+                    agent_import_path=job_import_path,
+                    verifier_env=verifier_env,
+                    environment_kwargs=environment_kwargs,
+                    n_concurrent=n_concurrent,
+                    cancellation=cancellation,
+                )
+            except Exception as exc:
+                if variant not in extra_variants:
+                    raise
+                failures = [f"{type(exc).__name__}: {exc}"]
+            sequential_errors.extend(record_failure(variant, failures))
+        return sequential_errors
+    # The advertised concurrency is one per-agent trial budget. Split it
+    # across concurrently running conditions instead of multiplying it by two.
+    worker_count = min(len(jobs), n_concurrent)
+    if worker_count == len(jobs):
+        concurrency_per_job, extra_slots = divmod(n_concurrent, len(jobs))
+        job_concurrency = [concurrency_per_job + (1 if index < extra_slots else 0) for index in range(len(jobs))]
+    else:
+        job_concurrency = [1] * len(jobs)
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(
+                _run_harbor,
+                dataset=dataset,
+                agent=agent,
+                job_name=f"{skill_name}-{agent}-{variant}",
+                env_mode=env_mode,
+                model=model,
+                jobs_dir=jobs_dir,
+                run_env=run_env,
+                n_attempts=n_attempts,
+                n_concurrent=condition_concurrency,
+                timeout_multiplier=timeout_multiplier,
+                override_cpus=override_cpus,
+                override_memory_mb=override_memory_mb,
+                override_storage_mb=override_storage_mb,
+                agent_import_path=job_import_path,
+                verifier_env=verifier_env,
+                environment_kwargs=environment_kwargs,
+                expected_trials=expected_trials,
+                cancellation=cancellation,
+            ): variant
+            for (variant, dataset, job_import_path), condition_concurrency in zip(jobs, job_concurrency, strict=True)
+        }
+        for future in as_completed(futures):
+            variant = futures[future]
+            try:
+                ok, detail = future.result()
+            except Exception as exc:
+                if variant not in extra_variants:
+                    raise
+                ok, detail = False, f"{type(exc).__name__}: {exc}"
+            if not ok:
+                errors.extend(
+                    record_failure(
+                        variant,
+                        [
+                            detail
+                            if variant in extra_variants
+                            else f"{agent} {variant}-skill Harbor run failed: {detail}"
+                        ],
+                    )
+                )
+    return errors
+
+
+class _RunProgressLifecycle:
+    """Track orchestrator stages and guarantee one terminal run event."""
+
+    def __init__(
+        self,
+        reporter: ProgressReporter,
+        *,
+        inherited_active_stages: tuple[str, ...] = (),
+    ) -> None:
+        self._reporter = reporter
+        self._active_stages = dict.fromkeys(inherited_active_stages)
+        self._run_finished = False
+        self._output_dir: str | None = None
+        self._result_path: str | None = None
+        self._report_path: str | None = None
+
+    @property
+    def is_active(self) -> bool:
+        return self._reporter.is_active
+
+    @property
+    def output_dir(self) -> str | None:
+        return self._output_dir
+
+    def start(self, plan: Tier3RunPlan) -> None:
+        self._remember_artifacts(
+            output_dir=plan.output_dir,
+            result_path=plan.result_path,
+            report_path=plan.report_path,
+        )
+        self._reporter.start(plan)
+
+    def set_secret_values(self, values: list[str] | tuple[str, ...] | set[str]) -> None:
+        self._reporter.set_secret_values(values)
+
+    def emit(self, event: ProgressEvent) -> None:
+        self._remember_artifacts(
+            output_dir=event.output_dir,
+            result_path=event.result_path,
+            report_path=event.report_path,
+        )
+        if event.stage == "run-finished":
+            if self._run_finished:
+                return
+            self._run_finished = True
+        elif event.state == "running":
+            self._active_stages[event.stage] = None
+        else:
+            self._active_stages.pop(event.stage, None)
+        self._reporter.emit(event)
+
+    def heartbeat(self) -> None:
+        self._reporter.heartbeat()
+
+    def close(self) -> None:
+        self._reporter.close()
+
+    def fail_unfinished(self, *, interrupted: bool = False) -> None:
+        """Fail every open stage and finish the run without masking its error.
+
+        ``interrupted`` reports Ctrl+C or cancellation rather than an unexpected failure.
+        """
+        stage_detail = "interrupted before completion" if interrupted else "unexpected failure interrupted this stage"
+        for stage in tuple(self._active_stages):
+            self.emit(
+                ProgressEvent(
+                    stage=stage,
+                    state="failed",
+                    detail=stage_detail,
+                )
+            )
+        self.emit(
+            ProgressEvent(
+                stage="run-finished",
+                state="failed",
+                detail="Tier 3 evaluation interrupted" if interrupted else "Tier 3 evaluation failed unexpectedly",
+                output_dir=self._output_dir,
+                result_path=self._existing_file(self._result_path),
+                report_path=self._existing_file(self._report_path),
+            )
+        )
+
+    def finish_result(self, result: Mapping[str, Any]) -> None:
+        """Emit the terminal event for expected early-return failures too."""
+        if self._run_finished:
+            return
+        raw_errors = result.get("error") or result.get("execution_errors") or []
+        if isinstance(raw_errors, str):
+            errors = [raw_errors]
+        elif isinstance(raw_errors, list):
+            errors = [str(error) for error in raw_errors if str(error).strip()]
+        else:
+            errors = [str(raw_errors)] if raw_errors else []
+        warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
+        from skillevaluator.tier3.harbor.run_budget import budget_fully_denied
+
+        status = result.get("execution_status")
+        budget_denied = status == "skipped" and budget_fully_denied(result.get("budget"))
+        failed = bool(errors) or (status not in {None, "succeeded"} and not budget_denied)
+        state = "failed" if failed else "degraded" if warnings else "complete"
+        detail = errors[0] if errors else str(warnings[0]) if warnings else "Tier 3 evaluation finished"
+        for stage in tuple(self._active_stages):
+            self.emit(ProgressEvent(stage=stage, state="failed" if failed else "complete", detail=detail))
+        self.emit(
+            ProgressEvent(
+                stage="run-finished",
+                state=state,
+                detail=detail,
+                output_dir=str(result.get("run_dir") or self._output_dir or "") or None,
+                result_path=self._existing_file(str(result.get("result_path") or self._result_path or "") or None),
+                report_path=self._existing_file(str(result.get("report_path") or self._report_path or "") or None),
+            )
+        )
+
+    def _remember_artifacts(
+        self,
+        *,
+        output_dir: str | None,
+        result_path: str | None,
+        report_path: str | None,
+    ) -> None:
+        self._output_dir = output_dir or self._output_dir
+        self._result_path = result_path or self._result_path
+        self._report_path = report_path or self._report_path
+
+    @staticmethod
+    def _existing_file(path: str | None) -> str | None:
+        return path if path is not None and Path(path).is_file() else None
+
+
+def _run_harbor_eval_impl(
+    skill_path: Path,
+    agents: list[str],
+    *,
+    skip_baseline: bool = False,
+    skip_with_skill: bool = False,
+    reuse_baseline: str | None = None,
+    compare_to: str | None = None,
+    n_attempts: int | None = None,
+    max_agent_tokens: int | None = None,
+    max_judge_calls: int | None = None,
+    max_attempts_total: int | None = None,
+    max_cost_usd: float | None = None,
+    price_file: Path | None = None,
+    pass_threshold: float | None = None,
+    stop_on_pass: bool | None = None,
+    n_concurrent: int | None = None,
+    max_agents: int | None = None,
+    max_cases: int | None = None,
+    model: str | None = None,
+    agent_models: dict[str, str | list[str]] | None = None,
+    custom_dockerfile_mode: str | None = None,
+    skill_workspace_mode: str | None = None,
+    include_skills: list[str | Path] | None = None,
+    copy_repo: bool = False,
+    grading_mode: str | None = None,
+    reference_skills_dir: Path | None = None,
+    output_dir: Path | None = None,
+    keep_harbor_jobs: bool = False,
+    agent_runtime_preflight: bool | None = None,
+    tolerate_baseline_timeouts: bool | None = None,
+    env_mode: str = DEFAULT_ENV_MODE,
+    env_mode_source: str = "CLI",
+    environment_kwargs: Mapping[str, Any] | None = None,
+    timeout_multiplier: float | None = None,
+    override_cpus: int | None = None,
+    override_memory_mb: int | None = None,
+    override_storage_mb: int | None = None,
+    evaluated_source: dict[str, str] | None = None,
+    progress_reporter: ProgressReporter | None = None,
+    repo_context_exclude_paths: Sequence[Path] = (),
+    _evaluator_skill_path: Path | None = None,
+    _snapshot_publication_target: dict[str, str] | None = None,
+    _decoy_workspace_paths: list[Path] | None = None,
+    _decoy_workspace_source_paths: list[Path] | None = None,
+    _decoy_manifest: dict[str, Any] | None = None,
+    _monotonic_start: float | None = None,
+) -> dict[str, Any]:
+    """Run a public Harbor evaluation with and without the target skill."""
+    forwarded = dict(locals()) if _evaluator_skill_path is None else None
+    started_at = _monotonic_start if _monotonic_start is not None else time.monotonic()
+    reporter = safe_progress_reporter(progress_reporter or NullProgressReporter())
+    if not is_env_mode(env_mode):
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail="unsupported environment"))
+        return {"error": [f"env_mode must be one of: {', '.join(sorted(_supported_env_modes()))}"]}
+    if not agents:
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail="no agents selected"))
+        return {"error": ["At least one Harbor agent is required."]}
+    if skip_baseline and skip_with_skill:
+        detail = "skip_baseline and skip_with_skill are mutually exclusive (no arm would run)"
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail=detail))
+        return {"error": [detail]}
+    if reuse_baseline and (skip_baseline or skip_with_skill):
+        detail = "--reuse-baseline is mutually exclusive with --skip-baseline and --skip-with-skill"
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail=detail))
+        return {"error": [detail]}
+    if compare_to and skip_with_skill:
+        detail = "--compare-to is mutually exclusive with --skip-with-skill"
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail=detail))
+        return {"error": [detail]}
+    if env_mode == ENV_MODE_LOCAL:
+        from skillevaluator.tier3.harbor import local_sandbox
+
+        try:
+            local_sandbox.require_supported_platform()
+        except local_sandbox.SandboxUnavailable as exc:
+            reporter.emit(ProgressEvent(stage="configuration", state="failed", detail=str(exc)))
+            return {"error": [str(exc)]}
+
+    if _evaluator_skill_path is None:
+        assert forwarded is not None
+        forwarded.pop("skill_path")
+        forwarded.pop("agents")
+        with ExitStack() as snapshot_stack:
+            try:
+                snapshot_publication_target = publication_target_from_path(skill_path)
+                evaluator_skill_path = snapshot_stack.enter_context(private_evaluator_skill_snapshot(skill_path))
+                snapshot_config, _ = load_evals_config(evaluator_skill_path)
+                snapshot_workspace = snapshot_config.get("skill_workspace", {})
+                if "decoy_manifest" in snapshot_workspace:
+                    manual, selected, manifest = _decoy_workspace_skills(
+                        skill_path,
+                        snapshot_workspace,
+                        skill_workspace_mode or snapshot_workspace.get("mode", "isolated"),
+                        include_skills,
+                        reference_skills_dir,
+                    )
+                    assert manifest is not None
+                    source_paths = [*manual, *selected]
+                    results_root = Path(output_dir) if output_dir is not None else skill_path / "evals" / "results"
+                    validate_output_provenance_key_location(
+                        skill_path,
+                        results_root,
+                        reference_skills_dir=reference_skills_dir,
+                        workspace_skill_paths=source_paths,
+                    )
+                    validate_results_root_location(
+                        skill_path,
+                        results_root,
+                        reference_skills_dir=reference_skills_dir,
+                        workspace_skill_paths=source_paths,
+                    )
+                    frozen = snapshot_stack.enter_context(_private_decoy_workspace_snapshot(selected, manifest))
+                    forwarded["_decoy_workspace_paths"] = [*manual, *frozen]
+                    forwarded["_decoy_workspace_source_paths"] = source_paths
+                    forwarded["_decoy_manifest"] = manifest
+                if publication_target_from_path(skill_path) != snapshot_publication_target:
+                    raise ValueError("Publication source changed while its private evaluator snapshot was created")
+            except (OSError, ValueError) as exc:
+                reporter.emit(ProgressEvent(stage="configuration", state="failed", detail=str(exc)))
+                return {"error": [str(exc)]}
+            forwarded["_evaluator_skill_path"] = evaluator_skill_path
+            forwarded["_snapshot_publication_target"] = snapshot_publication_target
+            forwarded["_monotonic_start"] = started_at
+            return _run_harbor_eval_impl(skill_path, agents, **forwarded)
+
+    evaluator_skill_path = _evaluator_skill_path
+
+    try:
+        provider = resolve_llm_provider()
+        config, config_path = load_evals_config(evaluator_skill_path)
+    except (ProviderConfigurationError, EvalsConfigError) as exc:
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail=str(exc)))
+        return {"error": [str(exc)]}
+
+    harbor_config = config.get("harbor", {})
+    workspace_config = config.get("skill_workspace", {})
+    grading_config = config.get("grading", {})
+    n_attempts = n_attempts if n_attempts is not None else harbor_config.get("n_attempts", 1)
+    pass_threshold = pass_threshold if pass_threshold is not None else harbor_config.get("pass_threshold", 0.5)
+    stop_on_pass = stop_on_pass if stop_on_pass is not None else harbor_config.get("stop_on_pass", False)
+    n_concurrent = n_concurrent if n_concurrent is not None else harbor_config.get("n_concurrent", 4)
+    max_agents = max_agents if max_agents is not None else harbor_config.get("max_agents", len(agents))
+    max_cases = max_cases if max_cases is not None else harbor_config.get("max_cases")
+    max_agent_tokens = max_agent_tokens if max_agent_tokens is not None else harbor_config.get("max_agent_tokens")
+    max_judge_calls = max_judge_calls if max_judge_calls is not None else harbor_config.get("max_judge_calls")
+    max_attempts_total = (
+        max_attempts_total if max_attempts_total is not None else harbor_config.get("max_attempts_total")
+    )
+    max_cost_usd = max_cost_usd if max_cost_usd is not None else harbor_config.get("max_cost_usd")
+    price_file = _resolve_harbor_price_file(price_file, harbor_config, evaluator_skill_path)
+    timeout_multiplier = (
+        timeout_multiplier if timeout_multiplier is not None else harbor_config.get("timeout_multiplier", 1.0)
+    )
+    agent_runtime_preflight = (
+        agent_runtime_preflight
+        if agent_runtime_preflight is not None
+        else harbor_config.get("agent_runtime_preflight", False)
+    )
+    tolerate_baseline_timeouts = bool(
+        tolerate_baseline_timeouts
+        if tolerate_baseline_timeouts is not None
+        else harbor_config.get("tolerate_baseline_timeouts", False)
+    )
+    grading_mode = grading_mode or grading_config.get("mode", "default")
+    workspace_mode = skill_workspace_mode or workspace_config.get("mode", "isolated")
+    dockerfile_mode = custom_dockerfile_mode or harbor_config.get("custom_dockerfile_mode", "rebase")
+    # The public engine ships self-contained per-task Dockerfiles by default;
+    # ``reuse``/``rebuild`` opt into the shared pre-built eval base image.
+    base_image_mode = harbor_config.get("base_image_mode", "disabled")
+    task_source = harbor_config.get("task_source", "auto")
+    resolved_raw_environment_kwargs = _resolve_environment_kwargs(
+        env_mode,
+        cli_kwargs=environment_kwargs,
+        environ=os.environ,
+    )
+    try:
+        effective_environment_kwargs = validate_environment_kwargs(
+            dict(resolved_raw_environment_kwargs),
+            env_mode=env_mode,
+        )
+    except (RecursionError, TypeError, ValueError) as exc:
+        detail = f"Invalid --environment-kwarg: {exc}"
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail=detail))
+        return {"error": [detail]}
+    environment_kwarg_sources = dict.fromkeys(effective_environment_kwargs, "CLI")
+
+    if not isinstance(n_attempts, int) or n_attempts < 1:
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail="invalid attempt count"))
+        return {"error": ["n_attempts must be >= 1"]}
+    if stop_on_pass and n_attempts == 1:
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail="invalid attempt policy"))
+        return {"error": ["stop_on_pass requires n_attempts > 1"]}
+    if not isinstance(n_concurrent, int) or n_concurrent < 1:
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail="invalid concurrency"))
+        return {"error": ["n_concurrent must be >= 1"]}
+    if not isinstance(max_agents, int) or max_agents < 1:
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail="invalid agent concurrency"))
+        return {"error": ["max_agents must be >= 1"]}
+    if max_cases is not None and (isinstance(max_cases, bool) or not isinstance(max_cases, int) or max_cases < 1):
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail="invalid case limit"))
+        return {"error": ["max_cases must be >= 1"]}
+    try:
+        timeout_multiplier = _validated_timeout_multiplier(timeout_multiplier)
+    except ValueError as exc:
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail="invalid timeout multiplier"))
+        return {"error": [str(exc)]}
+    try:
+        pass_threshold = _validated_pass_threshold(pass_threshold)
+    except ValueError as exc:
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail="invalid pass threshold"))
+        return {"error": [str(exc)]}
+    if grading_mode not in {"default", "default_plus_custom", "custom_only"}:
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail="invalid grading mode"))
+        return {"error": ["grading.mode must be default, default_plus_custom, or custom_only"]}
+    # The standard judges would all fail on an unknown policy, after the agent
+    # trials had spent their budget; custom_only runs never forward the policies.
+    judge_policy_errors = _judge_policies(os.environ)[1] if grading_mode != "custom_only" else []
+    if judge_policy_errors:
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail="invalid judge policy"))
+        return {"error": judge_policy_errors}
+    if workspace_mode not in {"isolated", "group"}:
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail="invalid workspace mode"))
+        return {"error": ["skill_workspace.mode must be isolated or group"]}
+    if "decoy_manifest" in workspace_config and workspace_mode != "group":
+        detail = "skill_workspace.decoy_manifest requires skill_workspace.mode=group"
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail=detail))
+        return {"error": [detail]}
+    if not skip_baseline and harbor_config.get("pre_agent_setup"):
+        if skip_with_skill:
+            # --skip-baseline cannot be combined with --skip-with-skill, so it
+            # is not offered as a way out of a baseline-only run.
+            detail = (
+                "harbor.pre_agent_setup/setup_commands cannot run in a baseline-only run (--skip-with-skill); "
+                "the baseline arm must stay isolated from skill-owned setup commands"
+            )
+        else:
+            detail = (
+                "harbor.pre_agent_setup/setup_commands cannot run in a paired evaluation; "
+                "use --skip-baseline for a with-skill-only run"
+            )
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail=detail))
+        return {"error": [detail]}
+
+    reporter.emit(ProgressEvent(stage="configuration", state="ready", detail="evaluation config validated"))
+    reporter.emit(ProgressEvent(stage="model-resolution", state="running"))
+
+    agent_models_config = harbor_config.get("agents", {})
+    agent_models = agent_models or {}
+    model_resolution: dict[str, dict[str, str]] = {}
+    for agent in agents:
+        override = agent_models.get(agent)
+        if isinstance(override, list):
+            override = override[0] if override else None
+        selected, source = _model_for_agent(
+            agent,
+            cli_model=str(override or model or "") or None,
+            config_agents=agent_models_config,
+            provider=provider,
+        )
+        model_resolution[agent] = {"agent": agent, "model": selected, "source": source}
+
+    provider_env = _provider_environment(provider)
+    configured_runtime_env, runtime_errors = _resolve_runtime_env(
+        harbor_config.get("runtime_env"),
+        env_mode=env_mode,
+    )
+    reporter.set_secret_values(secret_values_from_environment(provider_env) | set(configured_runtime_env.values()))
+    reporter.emit(ProgressEvent(stage="model-resolution", state="complete", detail="agent models resolved"))
+    reporter.start(
+        Tier3RunPlan(
+            skill_name=skill_path.name,
+            environment=env_mode,
+            agents=tuple(agents),
+            agent_models=tuple((agent, model_resolution[agent]["model"]) for agent in agents),
+            provider=provider.provider,
+            attempts=n_attempts,
+            baseline=not skip_baseline,
+            with_skill=not skip_with_skill,
+            concurrency=n_concurrent,
+            max_agents=max_agents,
+            timeout_multiplier=float(timeout_multiplier),
+        )
+    )
+
+    prerequisite_subprocess_env: dict[str, str] | None = None
+    if env_mode == "ack" and agents:
+        preflight_agent = agents[0]
+        runtime_provider_env = {
+            name: value for name, value in provider_env.items() if name not in _VERIFIER_JUDGE_CONTROL_ENV_VARS
+        }
+        prerequisite_subprocess_env = _harbor_subprocess_environment(
+            env_mode=env_mode,
+            provider=provider,
+            configured_runtime_env=configured_runtime_env,
+            provider_env=runtime_provider_env,
+            agent=preflight_agent,
+            agent_model=model_resolution[preflight_agent]["model"],
+        )
+        prerequisite_subprocess_env.update(
+            _agent_credentials(
+                provider=provider,
+                agent=preflight_agent,
+                env_mode=env_mode,
+            )
+        )
+        prerequisite_subprocess_env.update(_job_judge_subprocess_env(provider_env, grading_mode))
+
+    reporter.emit(ProgressEvent(stage="environment-preflight", state="running", detail=env_mode))
+    prereq_errors = _check_prerequisites(
+        env_mode=env_mode,
+        agents=agents,
+        environment_kwargs=effective_environment_kwargs,
+        subprocess_env=prerequisite_subprocess_env,
+    )
+    if prereq_errors:
+        reporter.emit(ProgressEvent(stage="environment-preflight", state="failed", detail="; ".join(prereq_errors)))
+        return {"error": prereq_errors}
+    reporter.emit(ProgressEvent(stage="environment-preflight", state="complete", detail=env_mode))
+
+    # Resolve the effective source before constructing credential-probe targets.
+    # Native Harbor tasks can select the standard-grader judge model at task or
+    # step scope, so the provider fallback is not necessarily the runtime model.
+    evals_exists = find_evals_file(evaluator_skill_path) is not None
+    native_exists = (evaluator_skill_path / "evals" / "harbor").exists()
+    if task_source == "auto":
+        task_source = "evals_json" if evals_exists else "native_harbor" if native_exists else ""
+    if task_source == "evals_json" and not evals_exists:
+        reporter.emit(ProgressEvent(stage="with-skill-tasks", state="failed", detail="evaluation dataset missing"))
+        return {"error": [_MISSING_EVALS_DATASET_ERROR]}
+    if task_source == "native_harbor" and not native_exists:
+        reporter.emit(ProgressEvent(stage="with-skill-tasks", state="failed", detail="native Harbor tasks missing"))
+        return {"error": ["No native Harbor task source found at evals/harbor."]}
+    if task_source not in {"evals_json", "native_harbor"}:
+        reporter.emit(ProgressEvent(stage="with-skill-tasks", state="failed", detail="invalid task source"))
+        return {"error": ["harbor.task_source must be auto, evals_json, or native_harbor"]}
+    dataset_provenance = _dataset_generation_provenance(evaluator_skill_path) if task_source == "evals_json" else None
+
+    reporter.emit(ProgressEvent(stage="credential-validation", state="running"))
+    if runtime_errors:
+        reporter.emit(ProgressEvent(stage="credential-validation", state="failed", detail="; ".join(runtime_errors)))
+        return {"error": runtime_errors}
+    try:
+        runtime_plans = _resolve_agent_runtime_plan(
+            provider=provider,
+            agents=agents,
+            models={agent: details["model"] for agent, details in model_resolution.items()},
+            configured_runtime_env=configured_runtime_env,
+            env_mode=env_mode,
+            model_sources={agent: details["source"] for agent, details in model_resolution.items()},
+            environment_kwargs=effective_environment_kwargs,
+        )
+    except ValueError as exc:
+        reporter.emit(ProgressEvent(stage="credential-validation", state="failed", detail=str(exc)))
+        return {"error": [str(exc)]}
+    try:
+        agent_import_paths = {
+            agent: import_path
+            for agent in agents
+            if (import_path := _agent_import_path(provider, agent, env_mode)) is not None
+        }
+    except (EnvironmentBackendError, ValueError) as exc:
+        reporter.emit(ProgressEvent(stage="credential-validation", state="failed", detail=str(exc)))
+        return {"error": [str(exc)]}
+    runtime_secret_values = set().union(
+        *(secret_values_from_environment(plan.subprocess_env) for plan in runtime_plans.values())
+    )
+
+    # Probe each exact agent route before reserving output space, building images,
+    # or staging tasks. The runtime-preflight module imports runner helpers, so
+    # this import must remain lazy to avoid a module cycle.
+    from skillevaluator.tier3.harbor.runtime_preflight import (
+        CredentialProbeDisposition,
+        credential_probe_disposition,
+        is_unverified_gke_vertex_auth_probe,
+        probe_model,
+    )
+
+    probe_targets: dict[
+        tuple[str, str, str | None, str | None, str | None],
+        tuple[ProviderConfig, list[str]],
+    ] = {}
+    probe_degraded: list[str] = []
+    credential_validation_targets: list[dict[str, Any]] = []
+    judge_config = _judge_model_config(provider, provider_env, grading_mode)
+
+    def add_probe_target(label: str, selected_provider: ProviderConfig) -> None:
+        route_key = (
+            selected_provider.provider,
+            selected_provider.model,
+            selected_provider.api_key,
+            selected_provider.base_url,
+            selected_provider.region,
+        )
+        target = probe_targets.get(route_key)
+        if target is None:
+            probe_targets[route_key] = (selected_provider, [label])
+        else:
+            target[1].append(label)
+
+    for agent in agents:
+        add_probe_target(agent, runtime_plans[agent].provider)
+
+    if grading_mode != "custom_only":
+        if task_source == "native_harbor" and not bool(judge_config["override_applied"]):
+            detail = (
+                "native Harbor resolves the effective judge model at runtime; "
+                "task or step verifier env may supersede the configured fallback"
+            )
+            probe_degraded.append(f"standard grader: {detail}")
+            judge_config["catalog_verification"] = "inconclusive"
+            judge_config["effective_model_source"] = "native_harbor_runtime"
+            credential_validation_targets.append(
+                {
+                    "labels": ["standard grader"],
+                    "provider": provider.provider,
+                    "model": None,
+                    "fallback_model": provider.model,
+                    "status": "inconclusive",
+                    "detail": detail,
+                }
+            )
+        else:
+            judge_model = str(judge_config["model"])
+            litellm_model = str(getattr(provider, "litellm_model", f"{provider.provider}/{provider.model}"))
+            litellm_prefix = litellm_model.partition("/")[0] or provider.provider
+            add_probe_target(
+                "standard grader",
+                ProviderConfig(
+                    provider=provider.provider,
+                    model=judge_model,
+                    api_key=provider.api_key,
+                    base_url=provider.base_url,
+                    litellm_model=f"{litellm_prefix}/{judge_model}",
+                    region=getattr(provider, "region", None),
+                    credential_env=getattr(provider, "credential_env", None),
+                    base_url_env=getattr(provider, "base_url_env", None),
+                ),
+            )
+
+    runtime_secret_values.update(
+        selected_provider.api_key for selected_provider, _labels in probe_targets.values() if selected_provider.api_key
+    )
+    reporter.set_secret_values(runtime_secret_values)
+
+    with ThreadPoolExecutor(max_workers=min(len(probe_targets), 4)) as probe_pool:
+        probe_futures = {
+            route_key: probe_pool.submit(probe_model, selected_provider)
+            for route_key, (selected_provider, _labels) in probe_targets.items()
+        }
+
+    probe_errors: list[str] = []
+    for route_key, (selected_provider, selected_labels) in probe_targets.items():
+        label = ", ".join(selected_labels)
+        try:
+            probe = probe_futures[route_key].result()
+        except Exception as exc:
+            safe_detail = f"model catalog probe failed: {type(exc).__name__}"
+            probe_degraded.append(f"{label}: {safe_detail}")
+            credential_validation_targets.append(
+                {
+                    "labels": list(selected_labels),
+                    "provider": selected_provider.provider,
+                    "model": selected_provider.model,
+                    "status": "degraded",
+                    "detail": safe_detail,
+                }
+            )
+            if "standard grader" in selected_labels:
+                judge_config["catalog_verification"] = "degraded"
+            continue
+
+        safe_detail = redact_progress_detail(probe.detail, secret_values=runtime_secret_values)
+        disposition = credential_probe_disposition(selected_provider, probe, env_mode=env_mode)
+        if probe.ok and disposition == CredentialProbeDisposition.DEGRADED:
+            safe_detail = "model catalog access does not verify runtime credentials for this endpoint"
+        elif disposition == CredentialProbeDisposition.DEGRADED and is_unverified_gke_vertex_auth_probe(
+            selected_provider, probe, env_mode=env_mode
+        ):
+            safe_detail = GKE_HOST_UNVERIFIED_VERTEX_AUTH_DETAIL
+        credential_validation_targets.append(
+            {
+                "labels": list(selected_labels),
+                "provider": selected_provider.provider,
+                "model": selected_provider.model,
+                "status": disposition.value,
+                "detail": safe_detail,
+            }
+        )
+        if "standard grader" in selected_labels:
+            judge_config["catalog_verification"] = disposition.value
+        if disposition == CredentialProbeDisposition.FATAL:
+            probe_errors.append(f"{label} provider verification failed: {safe_detail}")
+        elif disposition == CredentialProbeDisposition.DEGRADED:
+            probe_degraded.append(f"{label}: {safe_detail}")
+
+    if probe_errors:
+        reporter.emit(
+            ProgressEvent(
+                stage="credential-validation",
+                state="failed",
+                detail="; ".join(probe_errors),
+            )
+        )
+        return {"error": probe_errors}
+    if probe_degraded:
+        reporter.emit(
+            ProgressEvent(
+                stage="credential-validation",
+                state="degraded",
+                detail=(
+                    "credential configuration resolved; live catalog verification inconclusive: "
+                    f"{'; '.join(probe_degraded)}; continuing to evaluation"
+                ),
+            )
+        )
+    else:
+        reporter.emit(
+            ProgressEvent(
+                stage="credential-validation",
+                state="complete",
+                detail="credentials and selected models verified",
+            )
+        )
+    effective_resources = harbor_config.get("resources", {})
+    effective_resources = dict(effective_resources) if isinstance(effective_resources, Mapping) else {}
+    for resource, override in (
+        ("cpus", override_cpus),
+        ("memory_mb", override_memory_mb),
+        ("storage_mb", override_storage_mb),
+    ):
+        if override is not None:
+            effective_resources[resource] = override
+    environment_kwargs_digest = hashlib.sha256(
+        json.dumps(effective_environment_kwargs, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    runtime_env_digest = hashlib.sha256(
+        json.dumps(configured_runtime_env, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    run_config = {
+        "config_file": str(config_path.relative_to(evaluator_skill_path)) if config_path else "none",
+        "harbor": {
+            "environment": {"value": env_mode, "source": env_mode_source},
+            "environment_kwargs": {
+                "keys": sorted(effective_environment_kwargs),
+                "sources": environment_kwarg_sources,
+                "values_sha256": environment_kwargs_digest,
+            },
+            "n_attempts": n_attempts,
+            "stop_on_pass": bool(stop_on_pass),
+            "n_concurrent": n_concurrent,
+            "timeout_multiplier": timeout_multiplier,
+            "base_image_mode": base_image_mode,
+            "resources": {
+                "cpus": effective_resources.get("cpus"),
+                "memory_mb": effective_resources.get("memory_mb"),
+                "storage_mb": effective_resources.get("storage_mb"),
+            },
+            "agent_workdir": harbor_config.get("agent_workdir"),
+            "custom_dockerfile_mode": dockerfile_mode,
+            "runtime_env": {"keys": sorted(configured_runtime_env), "values_sha256": runtime_env_digest},
+            "jobs_retained": keep_harbor_jobs,
+        },
+        "provider": {"name": provider.provider, "model": provider.model},
+        "judge": judge_config,
+        "credential_validation": {
+            "status": "degraded" if probe_degraded else "verified",
+            "targets": credential_validation_targets,
+        },
+        "task_source": task_source,
+        "grading": {"mode": grading_mode},
+        "skill_workspace": {"mode": workspace_mode},
+        "copy_repo": copy_repo,
+        "repo_context_exclude_paths": [str(path) for path in repo_context_exclude_paths],
+        "agents": model_resolution,
+        # Persisted so a card rendered later from this run directory records the
+        # source tree that was evaluated, not the evaluator build that ran it.
+        "evaluated_source": normalized_evaluated_source(evaluated_source),
+    }
+    if tolerate_baseline_timeouts:
+        run_config["harbor"]["tolerate_baseline_timeouts"] = True
+    if max_cases is not None:
+        run_config["harbor"]["max_cases"] = max_cases
+    verifier_env = {**configured_runtime_env, **provider_env}
+    staged_verifier_env = {
+        name: f"${{{name}}}"
+        for name in verifier_env
+        if name not in _VERIFIER_JUDGE_MODEL_ENV_VARS
+        and not (grading_mode == "custom_only" and name in _VERIFIER_JUDGE_CONTROL_ENV_VARS)
+    }
+    job_judge_verifier_env = _job_judge_verifier_env(provider_env, grading_mode)
+    job_judge_subprocess_env = _job_judge_subprocess_env(provider_env, grading_mode)
+
+    if _decoy_manifest is not None:
+        run_config["skill_workspace"] = {
+            "mode": workspace_mode,
+            "decoy_manifest": _decoy_manifest,
+        }
+    include_values = [*workspace_config.get("include", []), *(include_skills or [])]
+    if include_values and workspace_mode != "group":
+        reporter.emit(ProgressEvent(stage="with-skill-tasks", state="failed", detail="invalid included skills"))
+        return {"error": ["include_skills requires skill_workspace.mode=group"]}
+    try:
+        workspace_skills = (
+            _decoy_workspace_paths
+            if _decoy_workspace_paths is not None
+            else _workspace_skills(skill_path.resolve(), include_values if workspace_mode == "group" else [])
+        )
+    except ValueError as exc:
+        reporter.emit(ProgressEvent(stage="with-skill-tasks", state="failed", detail=str(exc)))
+        return {"error": [str(exc)]}
+
+    root = Path(output_dir) if output_dir is not None else skill_path / "evals" / "results"
+    effective_repo_context_exclude_paths = (root, *(Path(path) for path in repo_context_exclude_paths))
+    try:
+        validate_output_provenance_key_location(
+            skill_path,
+            root,
+            reference_skills_dir=reference_skills_dir,
+            workspace_skill_paths=_decoy_workspace_source_paths or workspace_skills,
+        )
+        validate_results_root_location(
+            skill_path,
+            root,
+            reference_skills_dir=reference_skills_dir,
+            workspace_skill_paths=_decoy_workspace_source_paths or workspace_skills,
+        )
+    except ValueError as exc:
+        reporter.emit(ProgressEvent(stage="with-skill-tasks", state="failed", detail=str(exc)))
+        return {"error": [str(exc)]}
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    try:
+        run_dir = _reserve_run_dir(root, timestamp)
+    except (OSError, RuntimeError, ValueError) as exc:
+        reporter.emit(ProgressEvent(stage="with-skill-tasks", state="failed", detail=str(exc)))
+        return {"error": [str(exc)]}
+    run_id = run_dir.name
+    publication_target = _snapshot_publication_target
+    jobs_dir = run_dir / "_harbor-jobs"
+    tasks_dir = run_dir / "_harbor-tasks"
+    result_path = run_dir / "result.json"
+    report_path: Path | None = None
+    publication_target_conflict: dict[str, Any] | None = None
+
+    def _run_owned_publication_fields() -> dict[str, Any]:
+        """Return the boundary identity, or a fail-closed mutation marker."""
+        nonlocal publication_target_conflict
+        if publication_target_conflict is not None:
+            conflict: dict[str, Any] = {
+                "run_start": (
+                    dict(publication_target_conflict["run_start"])
+                    if isinstance(publication_target_conflict["run_start"], dict)
+                    else None
+                ),
+                "run_end": (
+                    dict(publication_target_conflict["run_end"])
+                    if isinstance(publication_target_conflict["run_end"], dict)
+                    else None
+                ),
+            }
+            reason_code = publication_target_conflict.get("reason_code")
+            if isinstance(reason_code, str):
+                conflict["reason_code"] = reason_code
+            return {"publication_target": None, "publication_target_conflict": conflict}
+        run_end_target = publication_target_from_path(skill_path)
+        if run_end_target == publication_target:
+            return {
+                "publication_target": dict(publication_target) if publication_target is not None else None,
+            }
+        publication_target_conflict = {
+            "run_start": dict(publication_target) if publication_target is not None else None,
+            "run_end": dict(run_end_target) if run_end_target is not None else None,
+        }
+        return {
+            "publication_target": None,
+            "publication_target_conflict": dict(publication_target_conflict),
+        }
+
+    def _emit_run_finished(state: str, detail: str, *, include_artifacts: bool = True) -> None:
+        reporter.emit(
+            ProgressEvent(
+                stage="run-finished",
+                state=state,
+                detail=detail,
+                output_dir=str(run_dir) if include_artifacts else None,
+                result_path=str(result_path) if include_artifacts and result_path.is_file() else None,
+                report_path=(
+                    str(report_path)
+                    if include_artifacts and report_path is not None and report_path.is_file()
+                    else None
+                ),
+            )
+        )
+
+    def _persist_pre_execution_failure(errors: list[str]) -> dict[str, Any]:
+        """Retain redacted probe provenance for failures after run reservation."""
+        published_errors, error_total = _published_execution_errors(errors)
+        failed_result: dict[str, Any] = {
+            "skill_name": skill_path.name,
+            "execution_status": "failed",
+            "execution_errors": published_errors,
+            "execution_error_details_total": error_total,
+            "execution_error_details_shown": len(published_errors),
+            "execution_error_details_truncated": len(published_errors) < error_total,
+            # Keep the legacy list-shaped failure alias without serializing the
+            # complete diagnostic sample a second time.
+            "error": published_errors[:1],
+            "run_id": run_id,
+            **_run_owned_publication_fields(),
+            "run_dir": str(run_dir),
+            "harbor_jobs_dir": str(jobs_dir),
+            "harbor_jobs_retained": jobs_dir.is_dir(),
+            "duration_seconds": round(time.monotonic() - started_at, 3),
+            "result_path": str(result_path),
+            "agents": {},
+            "run_config": run_config,
+        }
+        write_output_file_atomically(
+            run_dir / "run_config.json",
+            json.dumps(run_config, indent=2).encode("utf-8"),
+        )
+        _write_final_result(result_path, failed_result)
+        return failed_result
+
+    try:
+        private_agent_paths = _private_agent_paths(agents, agent_import_paths, env_mode)
+    except ValueError as exc:
+        reporter.emit(ProgressEvent(stage="with-skill-tasks", state="failed", detail=str(exc)))
+        failed_result = _persist_pre_execution_failure([str(exc)])
+        _emit_run_finished("failed", "private agent route is not supported")
+        return failed_result
+
+    reservation_identity: tuple[int, int] | None = None
+    try:
+        reservation_metadata = run_dir.lstat()
+        reservation_identity = reservation_metadata.st_dev, reservation_metadata.st_ino
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        reporter.emit(ProgressEvent(stage="with-skill-tasks", state="failed", detail=str(exc)))
+        if reservation_identity is not None:
+            remove_generated_output_root_if_owned(run_dir, expected_identity=reservation_identity)
+        _emit_run_finished("failed", "Harbor jobs directory could not be created", include_artifacts=False)
+        return {"error": [str(exc)]}
+
+    emitter = stage_native_harbor_tasks if task_source == "native_harbor" else generate_harbor_tasks
+    resource_config = harbor_config.get("resources", {})
+    use_base_image = env_mode in HARBOR_DOCKER_ENGINE_ENV_MODES and base_image_mode != "disabled"
+    base_image = ""
+    if use_base_image:
+        reporter.emit(
+            ProgressEvent(
+                stage="docker-images",
+                state="running",
+                detail=f"preparing shared eval base image ({base_image_mode})",
+            )
+        )
+        base_image = build_eval_base_image(
+            skill_path.resolve(),
+            reference_skills_dir,
+            workspace_skill_paths=workspace_skills,
+            evaluator_skill_path=evaluator_skill_path,
+            excluded_roots=effective_repo_context_exclude_paths,
+            force_rebuild=base_image_mode == "rebuild",
+        )
+        if base_image:
+            reporter.emit(
+                ProgressEvent(stage="docker-images", state="complete", detail=f"eval base image ready: {base_image}")
+            )
+        else:
+            reporter.emit(
+                ProgressEvent(
+                    stage="docker-images",
+                    state="degraded",
+                    detail="base image build failed; falling back to per-task Dockerfiles",
+                )
+            )
+    private_hooks = _private_runtime_hooks()
+    comparison_plan = getattr(private_hooks, "comparison_plan", None)
+    if comparison_plan is not None:
+        comparison_plan.configure_agent_routes({agent: paths[0] for agent, paths in private_agent_paths.items()})
+    additional_arms: dict[str, tuple[tuple[str, Path, str | None], ...]] = {}
+    emitted_tasks: dict[str, dict[str, Sequence[Path]]] = {}
+    shared_task_inputs = {
+        "reference_skills_dir": reference_skills_dir,
+        "workspace_mode": workspace_mode,
+        "grading_mode": grading_mode,
+        "base_image": base_image,
+        "custom_dockerfile_mode": dockerfile_mode,
+        "copy_repo": copy_repo,
+        "repo_context_exclude_paths": effective_repo_context_exclude_paths,
+        "verifier_env": staged_verifier_env,
+        "pre_agent_setup": harbor_config.get("pre_agent_setup", []),
+        "task_resources": resource_config,
+        "agent_workdir": harbor_config.get("agent_workdir"),
+        "evaluator_skill_path": evaluator_skill_path,
+    }
+    agent_task_dirs: dict[str, tuple[Path | None, Path | None]] = {}
+    # The first staged arm per agent: with-skill tasks, or the baseline tasks
+    # of a baseline-only run. Timeout planning and the runtime preflight use it.
+    primary_task_dirs: dict[str, Path] = {}
+    staged_task_paths: list[Path] = []
+    expected_task_selectors: list[str] | None = None
+    expected_case_id_by_task_selector: dict[str, str] | None = None
+    staging_failure_stage = "baseline-tasks" if skip_with_skill else "with-skill-tasks"
+    if skip_with_skill:
+        reporter.emit(ProgressEvent(stage="with-skill-tasks", state="skipped", detail="with-skill arm disabled"))
+    reporter.emit(
+        ProgressEvent(
+            stage=staging_failure_stage,
+            state="running",
+            output_dir=str(run_dir),
+            result_path=str(result_path),
+        )
+    )
+    try:
+        is_dual_arm = not skip_baseline and not skip_with_skill
+        with_arm_suffix = "-with-skill" if is_dual_arm else ""
+        without_arm_suffix = "-without-skill" if is_dual_arm else ""
+        for agent in agents:
+            with_dir = None if skip_with_skill else tasks_dir / agent / "with"
+            without_dir = None if skip_baseline else tasks_dir / agent / "without"
+            agent_task_dirs[agent] = (with_dir, without_dir)
+            emitted_tasks[agent] = {}
+            if with_dir is None:
+                continue
+            primary_task_dirs[agent] = with_dir
+            task_paths = emitter(
+                skill_path,
+                with_dir,
+                with_skill=True,
+                workspace_skill_paths=workspace_skills,
+                runtime_env=dict(runtime_plans[agent].staged_env),
+                arm_suffix=with_arm_suffix,
+                **shared_task_inputs,
+            )
+            staged_task_paths.extend(task_paths)
+            if staged_environment_error := _staged_task_environment_error(env_mode, task_paths):
+                raise ValueError(staged_environment_error)
+            task_selectors = validate_case_ids(task.name for task in task_paths)
+            logical_case_ids = validate_case_ids(_native_entry_id(task) for task in task_paths)
+            case_id_by_task_selector = dict(zip(task_selectors, logical_case_ids, strict=True))
+            if expected_task_selectors is None:
+                expected_task_selectors = task_selectors
+                expected_case_id_by_task_selector = case_id_by_task_selector
+            elif (
+                task_selectors != expected_task_selectors
+                or case_id_by_task_selector != expected_case_id_by_task_selector
+            ):
+                raise ValueError(f"Generated task identities differ for agent {agent}")
+            if (private_hooks := _private_runtime_hooks()) is not None:
+                private_hooks.stage_with_arm(agent, task_paths)
+            emitted_tasks[agent]["with_skill"] = tuple(task_paths)
+        if not skip_with_skill:
+            reporter.emit(ProgressEvent(stage="with-skill-tasks", state="ready", detail="task inputs staged"))
+        if not skip_baseline:
+            if not skip_with_skill:
+                reporter.emit(ProgressEvent(stage="baseline-tasks", state="running"))
+            staging_failure_stage = "baseline-tasks"
+            baseline_alias_validation = _prevalidate_baseline_skill_candidates(
+                skill_path,
+                reference_skills_dir,
+                workspace_skills,
+                excluded_roots=effective_repo_context_exclude_paths,
+            )
+        else:
+            baseline_alias_validation = None
+        for agent in agents:
+            without_dir = agent_task_dirs[agent][1]
+            if without_dir is not None:
+                primary_task_dirs.setdefault(agent, without_dir)
+                baseline_task_paths = emitter(
+                    skill_path,
+                    without_dir,
+                    with_skill=False,
+                    workspace_skill_paths=workspace_skills,
+                    runtime_env=dict(runtime_plans[agent].staged_env),
+                    arm_suffix=without_arm_suffix,
+                    _baseline_alias_validation=baseline_alias_validation,
+                    **shared_task_inputs,
+                )
+                emitted_tasks[agent]["without_skill"] = tuple(baseline_task_paths)
+                baseline_task_selectors = validate_case_ids(task.name for task in baseline_task_paths)
+                baseline_logical_case_ids = validate_case_ids(_native_entry_id(task) for task in baseline_task_paths)
+                baseline_case_id_by_task_selector = dict(
+                    zip(baseline_task_selectors, baseline_logical_case_ids, strict=True)
+                )
+                staged_task_paths.extend(baseline_task_paths)
+                if staged_environment_error := _staged_task_environment_error(env_mode, baseline_task_paths):
+                    raise ValueError(staged_environment_error)
+                if expected_task_selectors is None:
+                    # A baseline-only run stages no with-skill tasks, so the
+                    # baseline arm defines the task identities.
+                    expected_task_selectors = baseline_task_selectors
+                    expected_case_id_by_task_selector = baseline_case_id_by_task_selector
+                elif (
+                    baseline_task_selectors != expected_task_selectors
+                    or baseline_case_id_by_task_selector != expected_case_id_by_task_selector
+                ):
+                    raise ValueError(f"Baseline task identities differ for agent {agent}")
+        if comparison_plan is not None:
+            for agent in agents:
+
+                def emit_control(variant: str, members: Sequence[Path], *, _agent: str = agent) -> Sequence[Path]:
+                    target = tasks_dir / _agent / variant
+                    proof = _prevalidate_baseline_skill_candidates(
+                        skill_path,
+                        reference_skills_dir,
+                        list(members),
+                        excluded_roots=effective_repo_context_exclude_paths,
+                    )
+                    paths = emitter(
+                        skill_path,
+                        target,
+                        with_skill=False,
+                        workspace_skill_paths=list(members),
+                        runtime_env=dict(runtime_plans[_agent].staged_env),
+                        arm_suffix="-without-skill",
+                        _baseline_alias_validation=proof,
+                        **shared_task_inputs,
+                    )
+                    selectors = validate_case_ids(path.name for path in paths)
+                    identities = dict(
+                        zip(selectors, validate_case_ids(_native_entry_id(path) for path in paths), strict=True)
+                    )
+                    if selectors != expected_task_selectors or identities != expected_case_id_by_task_selector:
+                        raise ValueError(f"Private comparison task identities differ for {_agent}/{variant}")
+                    if error := _staged_task_environment_error(env_mode, paths):
+                        raise ValueError(error)
+                    staged_task_paths.extend(paths)
+                    return paths
+
+                additional_arms[agent] = comparison_plan.stage_additional(
+                    agent,
+                    emit_control,
+                    emitted_tasks[agent],
+                    private_agent_paths[agent][0],
+                )
+        if not skip_baseline:
+            reporter.emit(ProgressEvent(stage="baseline-tasks", state="ready", detail="baseline inputs staged"))
+        else:
+            reporter.emit(ProgressEvent(stage="baseline-tasks", state="skipped", detail="baseline disabled"))
+    except (OSError, ValueError) as exc:
+        reporter.emit(ProgressEvent(stage=staging_failure_stage, state="failed", detail=str(exc)))
+        return _persist_pre_execution_failure([str(exc)])
+
+    if max_cases is not None:
+        all_task_selectors = expected_task_selectors or []
+        all_case_ids = expected_case_id_by_task_selector or {}
+        try:
+            case_selection = _limit_staged_cases(
+                all_task_selectors,
+                all_case_ids,
+                staged_task_paths,
+                max_cases=max_cases,
+            )
+        except OSError as exc:
+            reporter.emit(ProgressEvent(stage="case-selection", state="failed", detail=str(exc)))
+            return _persist_pre_execution_failure([str(exc)])
+        expected_task_selectors = all_task_selectors[:max_cases]
+        expected_case_id_by_task_selector = {selector: all_case_ids[selector] for selector in expected_task_selectors}
+        staged_task_paths = [path for path in staged_task_paths if path.name in expected_case_id_by_task_selector]
+        run_config["case_selection"] = case_selection
+        reporter.emit(
+            ProgressEvent(
+                stage="case-selection",
+                state="complete",
+                detail=(
+                    f"running the first {case_selection['selected']} of {case_selection['total']} cases "
+                    f"(max_cases={max_cases})"
+                ),
+            )
+        )
+
+    if not _runtime_context_is_bound_to_publication_target(
+        skill_path,
+        staged_task_paths,
+        reference_skills_dir=reference_skills_dir,
+        workspace_skill_paths=_decoy_workspace_source_paths or workspace_skills,
+    ):
+        publication_target_conflict = {
+            "run_start": dict(publication_target) if publication_target is not None else None,
+            "run_end": None,
+            "reason_code": "runtime_context_outside_publication_target",
+        }
+
+    task_selectors = expected_task_selectors or []
+    case_id_by_task_selector = expected_case_id_by_task_selector or {}
+    case_ids = [case_id_by_task_selector[selector] for selector in task_selectors]
+    baseline_task_dirs = {agent: tuple(emitted_tasks[agent].get("without_skill", ())) for agent in agents}
+    try:
+        identity_digest = identity_dataset_digest(next(iter(baseline_task_dirs.values()), ()))
+        task_tree_digest = baseline_task_tree_digest(baseline_task_dirs)
+    except (OSError, UnicodeError, ValueError) as exc:
+        return _persist_pre_execution_failure([f"could not record baseline task identity: {exc}"])
+    run_config["baseline_task_tree_digest"] = task_tree_digest
+    try:
+        dataset_truth = _persist_dataset_truth(run_dir, fallback_task_ids=case_ids)
+    except DatasetSnapshotContractError as exc:
+        return _persist_pre_execution_failure([str(exc)])
+    expected_trials = len(task_selectors) * n_attempts
+    identity = comparison_identity(
+        run_config,
+        {
+            "dataset_digest": dataset_truth["dataset_digest"],
+            "identity_dataset_digest": identity_digest,
+            "baseline_task_tree_digest": task_tree_digest,
+            "expected_case_ids": case_ids,
+            "evaluator_version": dataset_truth["evaluator_version"],
+            "publication_target": publication_target,
+            "attempt_policy": {
+                "max_attempts": n_attempts,
+                "pass_threshold": float(pass_threshold),
+                "stop_on_pass": bool(stop_on_pass),
+            },
+            "score_policy": None,
+        },
+    )
+    baseline = {"mode": "skipped" if skip_baseline else "fresh"}
+    prior_version = None
+    if compare_to:
+        try:
+            prior_version = select_prior_version(run_dir.parent, compare_to, identity, current_run_dir=run_dir)
+        except ValueError as exc:
+            return _persist_pre_execution_failure([str(exc)])
+    reused_baseline_dir = None
+    if reuse_baseline:
+        try:
+            baseline = select_baseline(run_dir.parent, reuse_baseline, agents, identity)
+        except ValueError as exc:
+            return _persist_pre_execution_failure([str(exc)])
+        if baseline["mode"] == "reused":
+            reused_baseline_dir = Path(baseline["source_run_dir"])
+            skip_baseline = True
+    run_config["baseline"] = baseline
+    if reuse_baseline:
+        reporter.emit(ProgressEvent(stage="baseline", state="complete", detail=baseline_description(baseline)))
+    from skillevaluator.tier3.harbor.run_budget import (
+        BudgetConfigurationError,
+        BudgetController,
+        PriceBook,
+        planned_attempts,
+    )
+
+    if max_cost_usd is not None and price_file is None:
+        return _persist_pre_execution_failure(["--max-cost-usd requires --price-file"])
+    try:
+        price_book = PriceBook.load(price_file) if price_file is not None else None
+        if price_book is not None:
+            for agent in agents:
+                price_book.price_for(model_resolution[agent]["model"])
+        base_arms = 2 - int(skip_baseline) - int(skip_with_skill)
+        planned_arm_count = sum(base_arms + len(additional_arms.get(agent, ())) for agent in agents)
+        budget = BudgetController(
+            max_agent_tokens=max_agent_tokens,
+            max_judge_calls=max_judge_calls,
+            max_attempts_total=max_attempts_total,
+            max_cost_usd=max_cost_usd,
+            price_book=price_book,
+            planned=planned_attempts(
+                len(case_ids),
+                n_attempts,
+                1,
+                arms=planned_arm_count,
+                stop_on_pass=bool(stop_on_pass),
+            ),
+        )
+    except BudgetConfigurationError as exc:
+        return _persist_pre_execution_failure([str(exc)])
+    active_budget = (
+        budget
+        if any(limit is not None for limit in (max_agent_tokens, max_judge_calls, max_attempts_total, max_cost_usd))
+        else None
+    )
+    multiply_sign = "\u00d7"
+    reporter.emit(
+        ProgressEvent(
+            stage="configuration",
+            state="complete",
+            detail=(
+                f"Planned: {budget.planned} attempts "
+                f"({len(case_ids)} cases {multiply_sign} {n_attempts} attempts {multiply_sign} "
+                f"{planned_arm_count} agent arms total)"
+            ),
+        )
+    )
+    run_config["budget"] = budget.metadata()
+    variants = 2 - int(skip_baseline) - int(skip_with_skill)
+    matrix_trials = expected_trials * sum(variants + len(additional_arms.get(agent, ())) for agent in agents)
+    try:
+        if comparison_plan is not None:
+            comparison_plan.bind_execution(
+                case_ids, n_attempts=n_attempts, stop_on_pass=bool(stop_on_pass), pass_threshold=float(pass_threshold)
+            )
+            jobs = {
+                agent: {
+                    **({"with_skill": jobs_dir / f"{skill_path.name}-{agent}-with"} if not skip_with_skill else {}),
+                    **({"without_skill": jobs_dir / f"{skill_path.name}-{agent}-without"} if not skip_baseline else {}),
+                    **{
+                        {"sumofparts": "sum_of_parts", "looseparts": "loose_parts"}[variant]: jobs_dir
+                        / f"{skill_path.name}-{agent}-{variant}"
+                        for variant, _, _ in additional_arms.get(agent, ())
+                    },
+                }
+                for agent in agents
+            }
+            private_hooks.configure_run(case_id_by_task_selector=case_id_by_task_selector, arm_jobs=jobs)
+            run_config["private_comparisons"] = comparison_plan.run_config()
+    except (OSError, ValueError) as exc:
+        return _persist_pre_execution_failure([str(exc)])
+    preflight_trials = len(agents) if agent_runtime_preflight else 0
+    try:
+        task_timeout_seconds = _task_timeout_plan(
+            list(primary_task_dirs.values()),
+            float(timeout_multiplier),
+        )
+    except ValueError as exc:
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail="invalid staged timeout"))
+        return _persist_pre_execution_failure([str(exc)])
+    reporter.start(
+        Tier3RunPlan(
+            skill_name=skill_path.name,
+            environment=env_mode,
+            agents=tuple(agents),
+            agent_models=tuple((agent, model_resolution[agent]["model"]) for agent in agents),
+            provider=provider.provider,
+            task_count=len(task_selectors),
+            case_count=len(case_ids),
+            attempts=n_attempts,
+            baseline=not skip_baseline,
+            with_skill=not skip_with_skill,
+            concurrency=n_concurrent,
+            max_agents=max_agents,
+            timeout_multiplier=float(timeout_multiplier),
+            matrix_trials=matrix_trials,
+            preflight_trials=preflight_trials,
+            total_containers=matrix_trials + preflight_trials,
+            task_timeout_seconds=task_timeout_seconds,
+            output_dir=str(run_dir),
+            result_path=str(result_path),
+        )
+    )
+    if env_mode == ENV_MODE_LOCAL:
+        reporter.emit(ProgressEvent(stage="docker-images", state="skipped", detail="local environment selected"))
+    elif not use_base_image:
+        # The shared base image branch already emitted its terminal stage event.
+        reporter.emit(
+            ProgressEvent(
+                stage="docker-images",
+                state="delegated",
+                detail="image preparation delegated to Harbor during task execution",
+            )
+        )
+    if agent_runtime_preflight:
+        from skillevaluator.tier3.harbor.runtime_preflight import run_agent_runtime_preflight
+
+        reporter.emit(ProgressEvent(stage="agent-runtime-preflight", state="running"))
+        preflight_errors: list[str] = []
+        for agent in agents:
+            preflight = run_agent_runtime_preflight(
+                dataset=primary_task_dirs[agent],
+                agent=agent,
+                model=model_resolution[agent]["model"],
+                env_mode=env_mode,
+                jobs_dir=jobs_dir,
+                run_env={**runtime_plans[agent].subprocess_env, **job_judge_subprocess_env},
+                timeout_multiplier=float(timeout_multiplier),
+                override_cpus=override_cpus,
+                override_memory_mb=override_memory_mb,
+                override_storage_mb=override_storage_mb,
+                agent_import_path=agent_import_paths.get(agent),
+                environment_kwargs=effective_environment_kwargs,
+            )
+            if not preflight.ok:
+                preflight_errors.append(f"{agent} runtime preflight failed: {preflight.detail}")
+        if preflight_errors:
+            detail = "; ".join(preflight_errors)
+            reporter.emit(ProgressEvent(stage="agent-runtime-preflight", state="failed", detail=detail))
+            failed_result = _persist_pre_execution_failure(preflight_errors)
+            _emit_run_finished("failed", "agent runtime preflight failed")
+            return failed_result
+        reporter.emit(
+            ProgressEvent(
+                stage="agent-runtime-preflight",
+                state="complete",
+                detail=f"{len(agents)} agent runtime(s) started successfully",
+            )
+        )
+    else:
+        reporter.emit(
+            ProgressEvent(
+                stage="agent-runtime-preflight",
+                state="skipped",
+                detail=("disabled by default; enable with --agent-runtime-preflight or harbor.agent_runtime_preflight"),
+            )
+        )
+    errors: list[str] = []
+    started_agents: SimpleQueue[str] = SimpleQueue()
+    # Ctrl+C reaches only this thread; workers observe it through this object.
+    cancellation = _HarborRunCancellation()
+
+    def _execute_agent(agent: str) -> list[str]:
+        started_agents.put(agent)
+        return _run_agent_pair(
+            skill_name=skill_path.name,
+            agent=agent,
+            model=model_resolution[agent]["model"],
+            env_mode=env_mode,
+            with_skill=agent_task_dirs[agent][0],
+            baseline=None if reused_baseline_dir is not None else agent_task_dirs[agent][1],
+            jobs_dir=jobs_dir,
+            run_env={**runtime_plans[agent].subprocess_env, **job_judge_subprocess_env},
+            n_attempts=n_attempts,
+            n_concurrent=n_concurrent,
+            timeout_multiplier=float(timeout_multiplier),
+            override_cpus=override_cpus,
+            override_memory_mb=override_memory_mb,
+            override_storage_mb=override_storage_mb,
+            agent_import_path=private_agent_paths[agent][0],
+            with_agent_import_path=private_agent_paths[agent][1],
+            expected_trials=expected_trials,
+            stop_on_pass=bool(stop_on_pass),
+            pass_threshold=float(pass_threshold),
+            task_names=task_selectors,
+            budget_controller=active_budget,
+            verifier_env=job_judge_verifier_env,
+            environment_kwargs=effective_environment_kwargs,
+            cancellation=cancellation,
+            **(
+                {
+                    "additional_arms": additional_arms[agent],
+                    "additional_arm_errors": comparison_plan.launch_errors[agent],
+                }
+                if additional_arms.get(agent)
+                else {}
+            ),
+        )
+
+    active_agents: set[str] = set()
+    unexpected_worker_error: Exception | None = None
+
+    def _emit_started_agents() -> None:
+        while True:
+            try:
+                agent = started_agents.get_nowait()
+            except Empty:
+                return
+            active_agents.add(agent)
+            if skip_with_skill:
+                variants = "baseline only"
+            else:
+                variants = "with-skill" if skip_baseline else "with-skill + baseline"
+            reporter.emit(ProgressEvent(stage=f"agent:{agent}", state="running", detail=variants))
+
+    futures: dict[Future[list[str]], str] = {}
+
+    def _join_interrupted_agents() -> None:
+        """Wait while running agents stop their Harbor jobs after an interrupt.
+
+        A second Ctrl+C ends the cleanup grace period; a third one propagates.
+        """
+        stopping_reported = False
+        while True:
+            try:
+                running = [future for future in futures if not future.done()]
+                if not running:
+                    return
+                if not stopping_reported:
+                    stopping_reported = True
+                    for agent in sorted(futures[future] for future in running):
+                        reporter.emit(
+                            ProgressEvent(
+                                stage=f"agent:{agent}",
+                                state="running",
+                                detail=_HARBOR_RUN_STOPPING_DETAIL,
+                            )
+                        )
+                wait(running, timeout=_HARBOR_RUN_CANCEL_POLL_SECONDS)
+            except KeyboardInterrupt:
+                if cancellation.forced.is_set():
+                    raise
+                cancellation.forced.set()
+
+    with ThreadPoolExecutor(max_workers=min(max_agents, len(agents))) as executor:
+        try:
+            futures = {executor.submit(_execute_agent, agent): agent for agent in agents}
+            pending = set(futures)
+            while pending:
+                _emit_started_agents()
+                done, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+                _emit_started_agents()
+                for future in done:
+                    agent = futures[future]
+                    active_agents.discard(agent)
+                    try:
+                        agent_errors = future.result()
+                    except Exception as exc:
+                        reporter.emit(
+                            ProgressEvent(
+                                stage=f"agent:{agent}",
+                                state="failed",
+                                detail="agent worker failed unexpectedly",
+                            )
+                        )
+                        unexpected_worker_error = unexpected_worker_error or exc
+                        continue
+                    errors.extend(agent_errors)
+                    if agent_errors:
+                        reporter.emit(
+                            ProgressEvent(
+                                stage=f"agent:{agent}",
+                                state="failed",
+                                detail="one or more Harbor jobs failed; inspect retained artifacts",
+                            )
+                        )
+                    else:
+                        reporter.emit(ProgressEvent(stage=f"agent:{agent}", state="complete"))
+        except BaseException:
+            # Without this, the executor exit would wait for every running
+            # Harbor job to finish and would still start queued agents. Cancel
+            # the queue first so a worker that stops never picks up another agent.
+            executor.shutdown(wait=False, cancel_futures=True)
+            cancellation.requested.set()
+            _join_interrupted_agents()
+            raise
+
+    if unexpected_worker_error is not None:
+        for agent in sorted(active_agents):
+            reporter.emit(ProgressEvent(stage=f"agent:{agent}", state="failed", detail="agent execution interrupted"))
+        _emit_run_finished("failed", "agent execution failed")
+        raise unexpected_worker_error
+
+    reporter.emit(ProgressEvent(stage="collection", state="running"))
+    try:
+        results = collect_harbor_results(
+            skill_name=skill_path.name,
+            agents=agents,
+            output_dir=run_dir,
+            jobs_dir=jobs_dir,
+            skip_baseline=skip_baseline and reused_baseline_dir is None,
+            skip_with_skill=skip_with_skill,
+            reused_baseline_dir=reused_baseline_dir,
+            n_attempts=n_attempts,
+            pass_threshold=float(pass_threshold),
+            stop_on_pass=bool(stop_on_pass),
+            expected_cases=len(case_ids),
+            expected_case_ids=case_ids,
+            case_id_by_task_selector=case_id_by_task_selector,
+            # Early-stopped cases legitimately use fewer trials than the
+            # n_attempts maximum; per-case coverage is validated instead.
+            expected_trials=None if stop_on_pass else expected_trials,
+            env_mode=env_mode,
+            agent_models=model_resolution,
+            launch_errors=errors,
+            grading_mode=grading_mode,
+            tolerate_baseline_timeouts=tolerate_baseline_timeouts,
+            budget_not_run=active_budget.not_run if active_budget is not None else [],
+        )
+    except Exception:
+        reporter.emit(ProgressEvent(stage="collection", state="failed", detail="result collection failed"))
+        _emit_run_finished("failed", "result collection failed")
+        raise
+    reporter.emit(ProgressEvent(stage="collection", state="complete", detail="Harbor results collected"))
+    run_config["budget"] = budget.metadata()
+    identity["score_policy"] = results.get("score_policy", identity["score_policy"])
+    results.update(
+        {
+            "baseline": baseline,
+            "comparison_identity": identity,
+            "expected_case_ids": case_ids,
+            "skill_name": skill_path.name,
+            "run_id": run_id,
+            **_run_owned_publication_fields(),
+            "run_dir": str(run_dir),
+            "result_path": str(result_path),
+            "harbor_jobs_dir": str(jobs_dir),
+            "harbor_jobs_retained": keep_harbor_jobs,
+            "evaluated_at": datetime.now(UTC).isoformat(),
+            "evaluator_version": dataset_truth["evaluator_version"],
+            "dataset_snapshot": dataset_snapshot_manifest(dataset_truth),
+            "dataset_snapshot_path": str(run_dir / "dataset_snapshot.json"),
+            "dataset_summary": dataset_truth["dataset_summary"],
+            "dataset_digest": dataset_truth["dataset_digest"],
+            "dataset_digest_algorithm": dataset_truth["dataset_digest_algorithm"],
+            "identity_dataset_digest": identity_digest,
+            "baseline_task_tree_digest": task_tree_digest,
+            "budget": run_config["budget"],
+            "dataset_provenance": dataset_provenance,
+            "run_config": run_config,
+            "partial": bool(budget.not_run),
+        }
+    )
+    from skillevaluator.evaluation.tier3_report import (
+        _agent_score_policy,
+        _build_agent,
+        _evaluation_mode,
+    )
+    from skillevaluator.evaluation.tier3_report import (
+        _pick_best_agent as _pick_canonical_best_agent,
+    )
+    from skillevaluator.tier3.dataset_sufficiency import MIN_NEGATIVE_CASES, assess_dataset_sufficiency
+    from skillevaluator.tier3.harbor.report import _pick_best_agent
+    from skillevaluator.tier3.harbor.report_data import metrics_for_condition
+
+    summary = dataset_truth["dataset_summary"]
+    agent_results = results.get("agents")
+    if isinstance(agent_results, dict):
+        negative_cases = int(summary.get("negative_tasks") or 0)
+        if int(summary.get("unclassified_tasks") or 0) > 0 and negative_cases < MIN_NEGATIVE_CASES:
+            negative_cases = None
+        for agent_result in agent_results.values():
+            pass_at_k = agent_result.get("pass_at_k") if isinstance(agent_result.get("pass_at_k"), dict) else {}
+            with_pass = pass_at_k.get("with_skill") if isinstance(pass_at_k.get("with_skill"), dict) else {}
+            lift = pass_at_k.get("lift") if isinstance(pass_at_k.get("lift"), dict) else {}
+            paired = lift.get("paired_comparison") if isinstance(lift.get("paired_comparison"), dict) else {}
+            agent_result["dataset_sufficiency"] = assess_dataset_sufficiency(
+                distinct_cases=int(summary.get("total_tasks") or 0),
+                negative_cases=negative_cases,
+                pass_rate_interval=with_pass.get("rate_interval"),
+                paired_cases=paired.get("paired_cases"),
+                baseline_skipped=skip_baseline,
+            )
+        if agent_results:
+            best_agent = _pick_best_agent(agent_results)
+            if best_agent not in agent_results:
+                baseline_only = _evaluation_mode(agent_results) == "baseline_only"
+                # Canonical agent payloads carry the baseline-only score as "baseline".
+                score_field = "baseline" if baseline_only else "with_skill"
+                canonical_agents = {
+                    name: _build_agent(
+                        name,
+                        agent,
+                        metrics_for_condition(agent, "with_skill"),
+                        metrics_for_condition(agent, "without_skill"),
+                        agent.get("model") if isinstance(agent.get("model"), str) else None,
+                        _agent_score_policy(agent),
+                        baseline_only=baseline_only,
+                    )
+                    for name, agent in agent_results.items()
+                    if isinstance(agent, dict)
+                }
+                best_agent = _pick_canonical_best_agent(canonical_agents, score_field=score_field)
+                if not best_agent and len(agent_results) == 1:
+                    best_agent = next(iter(agent_results))
+            if best_agent in agent_results:
+                results["dataset_sufficiency"] = agent_results[best_agent]["dataset_sufficiency"]
+    selected_metrics = tuple(results.get("metrics", DEFAULT_METRICS))
+    from skillevaluator.tier3.harbor.run_budget import budget_incomplete_reason
+
+    if reason := budget_incomplete_reason(results["budget"]):
+        results["verdict"] = "incomplete"
+        results["summary"] = {"verdict": "incomplete", "verdict_reason": reason}
+    collected_attempt_policy = results.get("attempt_policy")
+    attempt_policy = dict(collected_attempt_policy) if isinstance(collected_attempt_policy, dict) else {}
+    selected_policy = results.get("score_policy") or attempt_policy.get("score_policy")
+    if not isinstance(selected_policy, str) or not selected_policy.strip():
+        selected_policy = score_policy_for_metrics(selected_metrics)
+    attempt_policy.update(
+        {
+            "max_attempts": n_attempts,
+            "pass_threshold": float(pass_threshold),
+            "stop_on_pass": bool(stop_on_pass),
+            "score_policy": selected_policy,
+            "score_definition": attempt_policy.get("score_definition")
+            or _score_definition_for_policy(selected_metrics, selected_policy),
+        }
+    )
+    results["attempt_policy"] = attempt_policy
+    _finalize_harbor_artifacts(
+        run_dir_value=run_dir,
+        keep_requested=keep_harbor_jobs,
+        result=results,
+    )
+    # A tolerated baseline's own launch errors are its timeouts, already on its
+    # baseline condition; every other launch error still fails the run.
+    errors = baseline_timeouts.unexplained_launch_errors(results, errors)
+    if errors:
+        _merge_launch_execution_errors(results, errors)
+    if prior_version is not None:
+        comparison = (
+            compare_versions(run_dir, Path(prior_version["source_run_dir"]), collected_result=results)
+            if prior_version["status"] == "available"
+            else prior_version
+        )
+        comparison["rejected_candidates"] = prior_version.get("rejected_candidates", [])
+        results["prior_version_comparison"] = comparison
+        run_config["prior_version_comparison"] = comparison
+    reporter.emit(ProgressEvent(stage="report", state="running"))
+    try:
+        (run_dir / "run_config.json").write_text(json.dumps(run_config, indent=2), encoding="utf-8")
+    except Exception:
+        reporter.emit(ProgressEvent(stage="report", state="failed", detail="run configuration write failed"))
+        _emit_run_finished("failed", "report artifacts could not be written")
+        raise
+
+    def _render_current_report() -> tuple[Path | None, str | None]:
+        try:
+            candidate = render_agent_eval_html_report(
+                skill_path,
+                run_dir,
+                env_mode=env_mode,
+                engine_result=results,
+                include_benchmark=True,
+            )
+            if candidate.is_file():
+                return candidate, None
+            return None, "HTML report was not generated: report file is missing"
+        except Exception as exc:
+            return None, f"HTML report was not generated: {exc}"
+
+    identity_before_report = {
+        key: results[key] for key in ("publication_target", "publication_target_conflict") if key in results
+    }
+    report_path, report_warning = _render_current_report()
+    if report_path is not None:
+        results["report_path"] = str(report_path)
+        if report_path.with_name("tier3-benchmark.md").is_file():
+            results["benchmark_path"] = str(report_path.with_name("tier3-benchmark.md"))
+
+    identity_after_report = _run_owned_publication_fields()
+    if identity_after_report != identity_before_report:
+        stale_report_path = report_path
+        results.pop("publication_target", None)
+        results.pop("publication_target_conflict", None)
+        results.update(identity_after_report)
+        results.pop("report_path", None)
+        results.pop("benchmark_path", None)
+        report_path, report_warning = _render_current_report()
+        if report_path is not None:
+            results["report_path"] = str(report_path)
+            if report_path.with_name("tier3-benchmark.md").is_file():
+                results["benchmark_path"] = str(report_path.with_name("tier3-benchmark.md"))
+        elif stale_report_path is not None:
+            try:
+                stale_report_path.resolve().relative_to(run_dir.resolve())
+                stale_report_path.unlink(missing_ok=True)
+                stale_report_path.with_name("tier3-benchmark.md").unlink(missing_ok=True)
+            except (OSError, RuntimeError, ValueError):
+                pass
+    if is_gke_vertex_workload_identity_active(env_mode, agents):
+        results.setdefault("security_notices", []).append(GKE_WORKLOAD_IDENTITY_WARNING_MESSAGE)
+    if report_warning:
+        results.setdefault("warnings", []).append(report_warning)
+        results["report_status"] = "degraded"
+    else:
+        results["report_status"] = "complete"
+    results["duration_seconds"] = round(time.monotonic() - started_at, 3)
+
+    try:
+        _write_final_result(result_path, results)
+    except Exception:
+        reporter.emit(ProgressEvent(stage="report", state="failed", detail="result write failed"))
+        _emit_run_finished("failed", "report artifacts could not be written")
+        raise
+    if report_warning:
+        reporter.emit(ProgressEvent(stage="report", state="degraded", detail=report_warning))
+    else:
+        reporter.emit(ProgressEvent(stage="report", state="complete", detail="result and HTML reports written"))
+
+    publish_latest_results(root, run_id)
+    return results
+
+
+def _apply_retention_outcome(
+    result: dict[str, Any],
+    *,
+    outcome: RetentionOutcome,
+    jobs_dir: Path,
+) -> None:
+    """Apply actual artifact filesystem truth to the returned result."""
+    result["harbor_jobs_dir"] = str(jobs_dir)
+    result["harbor_jobs_retained"] = jobs_dir.is_dir()
+    result["harbor_jobs_retention_reason"] = outcome.reason
+    if outcome.warning:
+        warning = f"Harbor artifact cleanup failed: {outcome.warning}"
+        warnings = result.setdefault("warnings", [])
+        if isinstance(warnings, list) and warning not in warnings:
+            warnings.append(warning)
+    run_config = result.get("run_config")
+    harbor_config = run_config.get("harbor") if isinstance(run_config, dict) else None
+    if isinstance(harbor_config, dict):
+        harbor_config["jobs_retained"] = jobs_dir.is_dir()
+
+
+def _finalize_harbor_artifacts(
+    *,
+    run_dir_value: object,
+    keep_requested: bool,
+    result: dict[str, Any] | None,
+) -> None:
+    """Finalize transient paths and persist corrected metadata when available."""
+    if not run_dir_value:
+        return
+    run_dir = Path(str(run_dir_value))
+    if not run_dir.is_dir():
+        return
+    jobs_dir = run_dir / "_harbor-jobs"
+    tasks_dir = run_dir / "_harbor-tasks"
+    hooks = _private_runtime_hooks()
+    capture = getattr(hooks, "collect_evidence", None)
+    if capture is not None:
+        capture(jobs_dir, result)
+    outcome = HarborArtifactLifecycle(
+        [jobs_dir, tasks_dir],
+        keep_requested=keep_requested,
+    ).finalize()
+    if result is None:
+        return
+
+    _apply_retention_outcome(result, outcome=outcome, jobs_dir=jobs_dir)
+    result_path_value = result.get("result_path")
+    result_path = Path(str(result_path_value)) if result_path_value else run_dir / "result.json"
+    if result_path.is_file():
+        _write_final_result(result_path, result)
+    run_config = result.get("run_config")
+    run_config_path = run_dir / "run_config.json"
+    if isinstance(run_config, dict) and run_config_path.is_file():
+        run_config_path.write_text(json.dumps(run_config, indent=2), encoding="utf-8")
+
+
+@wraps(_run_harbor_eval_impl)
+def run_harbor_eval(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Run Tier 3 with protected, coordinator-owned progress lifecycle."""
+    reporter = safe_progress_reporter(kwargs.get("progress_reporter"))
+    started_here = not reporter.is_active
+    lifecycle = _RunProgressLifecycle(
+        reporter,
+        inherited_active_stages=() if started_here else ("configuration",),
+    )
+    kwargs["progress_reporter"] = lifecycle
+    try:
+        lifecycle.set_secret_values(secret_values_from_environment(os.environ))
+        if started_here:
+            lifecycle.start(
+                Tier3RunPlan(
+                    skill_name="pending",
+                    environment=kwargs.get("env_mode", DEFAULT_ENV_MODE),
+                    agents=(),
+                    baseline=not kwargs.get("skip_baseline", False),
+                    with_skill=not kwargs.get("skip_with_skill", False),
+                    attempts=kwargs.get("n_attempts"),
+                    concurrency=kwargs.get("n_concurrent"),
+                    max_agents=kwargs.get("max_agents"),
+                    timeout_multiplier=kwargs.get("timeout_multiplier"),
+                )
+            )
+            lifecycle.emit(ProgressEvent(stage="configuration", state="running"))
+        result = _run_harbor_eval_impl(*args, **kwargs)
+        if "harbor_jobs_retention_reason" not in result:
+            _finalize_harbor_artifacts(
+                run_dir_value=result.get("run_dir") or lifecycle.output_dir,
+                keep_requested=bool(kwargs.get("keep_harbor_jobs", False)),
+                result=result,
+            )
+        lifecycle.finish_result(result)
+        return result
+    except BaseException as exc:
+        _finalize_harbor_artifacts(
+            run_dir_value=lifecycle.output_dir,
+            keep_requested=bool(kwargs.get("keep_harbor_jobs", False)),
+            result=None,
+        )
+        try:
+            lifecycle.fail_unfinished(interrupted=isinstance(exc, (KeyboardInterrupt, _HarborRunCancelledError)))
+        except BaseException:
+            logger.debug("Tier 3 progress terminalization failed", exc_info=True)
+        raise
+    finally:
+        if started_here:
+            lifecycle.close()
